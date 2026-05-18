@@ -35,7 +35,7 @@ The backend is a Cloudflare Worker managed by Wrangler. It owns the operational 
 
 - authenticates/identifies the requesting account
 - estimates maximum cost for the model request
-- reserves credit in the vault when configured
+- reserves credit in the GoodDollar credit layer / vault when configured
 - forwards the request to the AntSeed buyer proxy
 - verifies Celo vault transaction logs by `txHash` when `CELO_RPC_URL` and `CELO_VAULT_ADDRESS` are configured
 - resolves `getWhitelistedRoot(account)` when `CELO_GOODID_ADDRESS` is configured and writes an additional aggregate for the GoodID root wallet
@@ -43,7 +43,7 @@ The backend is a Cloudflare Worker managed by Wrangler. It owns the operational 
 - applies +10% regular credits and +20% streaming credits up to monthly stream-speed cap
 - settles actual cost in the vault
 
-### AntSeed integration
+### AntSeed integration and payment boundary
 
 The backend uses the local AntSeed buyer proxy OpenAI-compatible route:
 
@@ -52,6 +52,10 @@ POST /v1/chat/completions
 ```
 
 It can optionally set AntSeed pinning headers for peer/service selection. In production, `ANTSEED_BASE_URL` must be publicly reachable; a deployed Worker cannot reach a private `127.0.0.1` buyer running on the GoodClaw host.
+
+Current production-ish AntSeed payment is deposit-backed: usage ultimately deducts from the AntSeed deposits contract through buyer-signed EIP-712 reserve/settle authorization. The GoodDollar Worker is the auth/accounting/proxy layer in front of that buyer/deposits path. It should not be documented as a replacement for the AntSeed payment primitive.
+
+Future payment mechanisms can be added as an adapter/router layer above this boundary: sponsorships, org budgets, subscriptions, delegated allowances, direct GoodDollar balance spending, or multiple buyer accounts.
 
 ## Accounting model
 

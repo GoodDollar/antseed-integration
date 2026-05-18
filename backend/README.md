@@ -8,7 +8,7 @@ Cloudflare Worker for GoodDollar AntSeed credit/accounting and buyer proxy integ
 - KV namespace binding: `ANTSEED_KV`
 - Optional on-chain `AgentCreditVault` integration through `ethers` with `nodejs_compat`
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
-- GoodDollar backend payment proxy via OpenAI-compatible `POST /v1/chat/completions`: developer tools call this Worker with a signed `gd_live_...` API key, the Worker maps the key to a verified wallet/GoodID root, reserves/deducts user credits, and pays the AntSeed buyer/provider path upstream
+- GoodDollar backend payment proxy via OpenAI-compatible `POST /v1/chat/completions`: developer tools call this Worker with a signed `gd_live_...` API key, the Worker maps the key to a verified wallet/GoodID root, reserves/deducts GoodDollar credits, and forwards to the AntSeed buyer gateway. The current upstream payment path is the AntSeed deposits contract plus buyer-signed EIP-712 reserve/settle authorization.
 
 ## Persistent KV data
 
@@ -25,6 +25,7 @@ KV stores long-term user and request data:
 ## User guide
 
 For the complete end-user setup flow, see [`../docs/USER_GUIDE.md`](../docs/USER_GUIDE.md).
+For the payment-layer boundary, see [`../docs/PAYMENT_FLOW.md`](../docs/PAYMENT_FLOW.md).
 
 ## Endpoints
 
@@ -91,3 +92,9 @@ Important: a deployed Cloudflare Worker cannot call `127.0.0.1` on the GoodClaw 
 - Any deposit principal above the monthly stream cap receives the regular 110% credits.
 - Worker records are aggregated by wallet address and also by GoodID root address from `getWhitelistedRoot(account)`.
 - Example: a user streaming `$1/month` can receive at most `$1.20` credits for `$1` of monthly streamed/deposited principal; additional principal receives `$1.10` per `$1`.
+
+## Payment boundary
+
+Today, usage is funded from deposit-backed AntSeed buyer flow. The Worker verifies the user/API key and manages GoodDollar credits, then forwards the request to the configured buyer gateway. The buyer/deposits layer handles the buyer-signed EIP-712 authorization that reserves/settles against the AntSeed deposits contract.
+
+Future payment sources — sponsorships, team budgets, delegated allowances, subscriptions, or direct GoodDollar balance routing — should be added as adapters above this current deposit/EIP-712 layer.

@@ -22,12 +22,14 @@ This repository is intentionally separate from GoodDollar L2. It contains only:
 ```text
 contracts/            Foundry project with AgentCreditVault + CeloGdAntSeedVault
 backend/              Wrangler Cloudflare Worker for credits + Celo G$ ingestion + AntSeed calls
-docs/                 Architecture, operations notes, and user guide
+docs/                 Architecture, payment flow, operations notes, and user guide
 ```
 
 ## User guide
 
 See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the full user flow: buying AntSeed credits with G$, streaming G$ for bonus credits, and connecting local dev tools like VS Code/Continue, Claude Code-compatible proxies, Aider, or OpenAI SDK clients.
+
+See [`docs/PAYMENT_FLOW.md`](docs/PAYMENT_FLOW.md) for the current payment-layer boundary: GoodDollar auth/credits sit in front of the AntSeed buyer deposits contract and buyer-signed EIP-712 reserve/settle authorization.
 
 ## Flow
 
@@ -36,7 +38,8 @@ See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the full user flow: buying An
 3. The Worker verifies Celo vault logs, resolves the GoodID root with `getWhitelistedRoot(account)`, persists wallet-level and root-level user data in KV, and issues USDC-denominated AntSeed credits.
 4. Standard deposits receive +10% credits. Streaming users receive +20% on principal up to their monthly stream speed; amounts above that cap receive the regular +10%.
 5. The user creates a signed `gd_live_...` API key by signing a Worker nonce with the credit-owning wallet.
-6. Developer tools use the Worker as their OpenAI-compatible `/v1` base URL. The Worker authenticates the API key, reserves/settles AntSeed request costs, and forwards requests to the AntSeed buyer proxy (`/v1/chat/completions`).
+6. Developer tools use the Worker as their OpenAI-compatible `/v1` base URL. The Worker authenticates the API key, reserves/settles GoodDollar credits, and forwards requests to the AntSeed buyer proxy (`/v1/chat/completions`).
+7. The current AntSeed upstream payment path is deposit-backed: the buyer signs EIP-712 reserve/settle authorization and the AntSeed deposits contract deducts from the deposit balance. Future payment mechanisms should be added as adapters above this layer.
 
 ## Quick start
 

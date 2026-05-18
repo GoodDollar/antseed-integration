@@ -14,7 +14,8 @@ G$ on Celo -> CeloGdAntSeedVault -> Worker verifies tx -> credit balance -> AntS
 - The Worker verifies the vault transaction on Celo.
 - Your credits are recorded by wallet address and by your GoodID root wallet.
 - Your developer tool calls the Worker as an OpenAI-compatible AI endpoint.
-- The Worker reserves credits, forwards your prompt to AntSeed, then settles actual usage.
+- The Worker reserves GoodDollar credits, forwards your prompt to the AntSeed buyer gateway, then settles actual usage.
+- Today the upstream AntSeed payment path is deposit-backed: the buyer signs EIP-712 reserve/settle authorization and the AntSeed deposits contract deducts from the deposit balance.
 
 ## What you need
 
@@ -264,7 +265,9 @@ Model:     qwen3-235b-instruct
 API key:   $GOODDOLLAR_ANTSEED_API_KEY
 ```
 
-The backend maps the API key to the verified wallet/GoodID root, reserves credits, sends the request to AntSeed as the buyer/payer, settles the actual cost, and returns the model response.
+The backend maps the API key to the verified wallet/GoodID root, reserves GoodDollar credits, sends the request to the AntSeed buyer gateway, settles the actual cost in the GoodDollar credit layer, and returns the model response.
+
+Important payment boundary: today, the actual AntSeed network payment is still the buyer deposits contract flow. The buyer signs EIP-712 reserve/settle authorization and the AntSeed deposits contract deducts from the deposit balance. Future versions may add richer payment routing above this layer.
 
 ### Quick inference test
 
@@ -408,7 +411,8 @@ This Worker currently supports chat completions. If a tool requires `/v1/models`
 
 ## Safety and limitations
 
-- Credits are not USDC balances; they are accounting credits for AntSeed usage.
+- Credits are not USDC balances; they are GoodDollar-side accounting credits for AntSeed usage.
+- Current AntSeed payment is deposit/EIP-712 backed upstream; future payment mechanisms should be added as adapters above that layer.
 - `gd_live_...` API keys are created only after wallet signature verification. Store them like secrets and revoke them if lost.
 - `gd:0x...` / `x-gooddollar-account` selectors are local-dev-only when explicitly enabled by an operator and are not production-safe.
 - KV is durable but eventually consistent. On-chain vault events are the source of truth for deposits and stream updates.
