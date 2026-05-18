@@ -1,0 +1,22 @@
+name = "antseed-backend"
+main = "src/index.ts"
+compatibility_date = "2026-05-18"
+
+[vars]
+VAULT_ADDRESS = "${VAULT_ADDRESS}"
+
+[[kv_namespaces]]
+binding = "USER_DATA"
+preview_id = "${KV_PREVIEW_ID}"
+
+[[r2_buckets]]
+binding = "STORAGE"
+preview_name = "antseed-storage-preview"
+
+[env.production]
+kv_namespaces = [
+  { binding = "USER_DATA", id = "${KV_USER_DATA_ID}" }
+]
+
+[env.production.r2_buckets]
+  STORAGE = { binding = "STORAGE", bucket_name = "antseed-storage" }
