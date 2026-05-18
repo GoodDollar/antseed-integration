@@ -63,6 +63,37 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ ok: true, service: "gooddollar-antseed-integration", runtime: "cloudflare-worker", kvEnabled: true, vaultEnabled: vault.enabled });
   }
 
+  if (request.method === "GET" && url.pathname === "/config/status") {
+    return json({
+      ok: true,
+      service: "gooddollar-antseed-integration",
+      runtime: "cloudflare-worker",
+      openAiCompatible: {
+        basePath: "/v1",
+        chatCompletionsPath: "/v1/chat/completions",
+        accountSelectors: [
+          "x-gooddollar-account: 0x...",
+          "Authorization: Bearer gd:0x...",
+          "Authorization: Bearer account:0x...",
+          "JSON body field: account"
+        ]
+      },
+      antseed: {
+        model: cfg.ANTSEED_MODEL,
+        baseUrlConfigured: Boolean(env.ANTSEED_BASE_URL),
+        pinPeerConfigured: Boolean(env.ANTSEED_PIN_PEER),
+        pinServiceConfigured: Boolean(env.ANTSEED_PIN_SERVICE)
+      },
+      celo: {
+        rpcConfigured: Boolean(env.CELO_RPC_URL),
+        vaultConfigured: Boolean(env.CELO_VAULT_ADDRESS),
+        goodIdConfigured: Boolean(env.CELO_GOODID_ADDRESS)
+      },
+      kvEnabled: true,
+      vaultEnabled: vault.enabled
+    });
+  }
+
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
   if (request.method === "GET" && accountMatch) {
     const account = decodeURIComponent(accountMatch[1]);
@@ -166,8 +197,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
 
     const chatRequest = parsed.data;
-    const account = chatRequest.account ?? request.headers.get("x-gooddollar-account") ?? undefined;
-    if (!account) return json({ error: "account is required in body.account or x-gooddollar-account header" }, 400);
+    const account = accountFromRequest(request, chatRequest.account);
+    if (!account) return json({ error: "account is required in body.account, x-gooddollar-account, or Authorization: Bearer gd:0x..." }, 400);
     const rootAccount = await fetchGoodIdRoot(account, cfg);
     const maxCostMicroUsd = estimateMaxCostMicroUsd(cfg, chatRequest.messages, chatRequest.max_tokens);
     const reservation = await store.reserve(account, maxCostMicroUsd, rootAccount);
@@ -223,6 +254,25 @@ function cors(response: Response): Response {
   const headers = new Headers(response.headers);
   headers.set("access-control-allow-origin", "*");
   headers.set("access-control-allow-methods", "GET,POST,OPTIONS");
-  headers.set("access-control-allow-headers", "content-type,authorization");
+  headers.set("access-control-allow-headers", "content-type,authorization,x-api-key,x-gooddollar-account");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+export function accountFromRequest(request: Request, bodyAccount?: string): string | undefined {
+  if (bodyAccount?.trim()) return bodyAccount.trim();
+
+  const headerAccount = request.headers.get("x-gooddollar-account")?.trim();
+  if (headerAccount) return headerAccount;
+
+  const authAccount = accountFromToken(request.headers.get("authorization"));
+  if (authAccount) return authAccount;
+
+  return accountFromToken(request.headers.get("x-api-key"));
+}
+
+function accountFromToken(value: string | null): string | undefined {
+  if (!value) return undefined;
+  const token = value.replace(/^Bearer\s+/i, "").trim();
+  const match = token.match(/^(?:gd:|account:)?(0x[0-9a-fA-F]{40})$/);
+  return match?.[1];
 }

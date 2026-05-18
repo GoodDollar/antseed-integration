@@ -8,7 +8,7 @@ Cloudflare Worker for GoodDollar AntSeed credit/accounting and buyer proxy integ
 - KV namespace binding: `ANTSEED_KV`
 - Optional on-chain `AgentCreditVault` integration through `ethers` with `nodejs_compat`
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
-- AntSeed buyer proxy via OpenAI-compatible `POST /v1/chat/completions`
+- GoodDollar backend payment proxy via OpenAI-compatible `POST /v1/chat/completions`: developer tools call this Worker, the Worker reserves/deducts user credits, and the Worker pays the AntSeed buyer/provider path upstream
 
 ## Persistent KV data
 
@@ -29,13 +29,14 @@ For the complete end-user setup flow, see [`../docs/USER_GUIDE.md`](../docs/USER
 ## Endpoints
 
 - `GET /health`
+- `GET /config/status` — OpenAI-compatible proxy metadata and integration flags
 - `GET /v1/accounts/:account/credit`
 - `GET /v1/requests/:requestId`
 - `POST /v1/credits/quote`
 - `POST /v1/celo/events/record` — verifies and records Celo vault logs by `txHash`
 - `POST /v1/celo/deposits/manual` — local/test fallback for manual G$ credit entry
 - `POST /v1/celo/streams/update` — local/test fallback for stream state updates
-- `POST /v1/chat/completions`
+- `POST /v1/chat/completions` — OpenAI-compatible inference endpoint; accepts account selection via `Authorization: Bearer gd:0x...`, `Authorization: Bearer account:0x...`, `x-gooddollar-account`, or body `account`
 
 ## Setup
 
