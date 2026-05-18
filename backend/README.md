@@ -22,6 +22,10 @@ KV stores long-term user and request data:
 - `stream:<account>` — current Superfluid stream state
 - `stream-bonus-used:<account>:YYYY-MM` — monthly streaming bonus cap consumption
 
+## User guide
+
+For the complete end-user setup flow, see [`../docs/USER_GUIDE.md`](../docs/USER_GUIDE.md).
+
 ## Endpoints
 
 - `GET /health`

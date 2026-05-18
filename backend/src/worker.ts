@@ -8,7 +8,7 @@ import { actualCostMicroUsd, estimateMaxCostMicroUsd } from "./pricing.js";
 import { VaultClient } from "./vault-client.js";
 
 const ChatSchema = z.object({
-  account: z.string().min(1),
+  account: z.string().min(1).optional(),
   model: z.string().optional(),
   messages: z.array(z.object({
     role: z.enum(["system", "user", "assistant", "tool"]),
@@ -166,15 +166,18 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
 
     const chatRequest = parsed.data;
-    const rootAccount = await fetchGoodIdRoot(chatRequest.account, cfg);
+    const account = chatRequest.account ?? request.headers.get("x-gooddollar-account") ?? undefined;
+    if (!account) return json({ error: "account is required in body.account or x-gooddollar-account header" }, 400);
+    const rootAccount = await fetchGoodIdRoot(account, cfg);
     const maxCostMicroUsd = estimateMaxCostMicroUsd(cfg, chatRequest.messages, chatRequest.max_tokens);
-    const reservation = await store.reserve(chatRequest.account, maxCostMicroUsd, rootAccount);
+    const reservation = await store.reserve(account, maxCostMicroUsd, rootAccount);
+    const upstreamRequest = { ...chatRequest, account };
 
     try {
       const vaultReserveTxHash = await vault.reserve(reservation.requestId, reservation.account, maxCostMicroUsd, chatRequest.metadata);
       await store.markVaultReserved(reservation.requestId, vaultReserveTxHash);
 
-      const completion = await antseed.chatCompletion(chatRequest);
+      const completion = await antseed.chatCompletion(upstreamRequest);
       const receiptHash = await providerReceiptHash(completion);
       const cost = actualCostMicroUsd(cfg, completion.usage?.prompt_tokens, completion.usage?.completion_tokens);
       const vaultSettleTxHash = await vault.settle(reservation.requestId, cost, receiptHash);

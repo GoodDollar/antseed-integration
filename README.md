@@ -22,8 +22,12 @@ This repository is intentionally separate from GoodDollar L2. It contains only:
 ```text
 contracts/            Foundry project with AgentCreditVault + CeloGdAntSeedVault
 backend/              Wrangler Cloudflare Worker for credits + Celo G$ ingestion + AntSeed calls
-docs/                 Architecture and operations notes
+docs/                 Architecture, operations notes, and user guide
 ```
+
+## User guide
+
+See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the full user flow: buying AntSeed credits with G$, streaming G$ for bonus credits, and connecting local dev tools like VS Code/Continue, Claude Code-compatible proxies, Aider, or OpenAI SDK clients.
 
 ## Flow
 
