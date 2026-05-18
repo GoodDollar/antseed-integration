@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# env/secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# backend build/runtime
+backend/dist/
+backend/data/
+backend/*.tsbuildinfo
+npm-debug.log*
+
+# foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
+
+# misc
+.DS_Store
+coverage/
