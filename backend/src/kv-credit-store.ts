@@ -1,10 +1,15 @@
-import { CreditReservation, UserCreditProfile } from "./types.js";
+import { calculateCreditWithBonus, monthKey, monthlyStreamMicroUsd } from "./credit-bonus.js";
+import { CreditReservation, GdCreditEntry, StreamState, UserCreditProfile } from "./types.js";
 
 type KV = Pick<KVNamespace, "get" | "put">;
 
 const USER_PREFIX = "user:";
 const REQUEST_PREFIX = "request:";
 const USER_REQUESTS_PREFIX = "user-requests:";
+const GD_CREDIT_PREFIX = "gd-credit:";
+const USER_GD_CREDITS_PREFIX = "user-gd-credits:";
+const STREAM_PREFIX = "stream:";
+const STREAM_BONUS_USED_PREFIX = "stream-bonus-used:";
 
 export class KVCreditStore {
   constructor(private readonly kv: KV) {}
@@ -21,13 +26,20 @@ export class KVCreditStore {
       updatedAt: now
     };
 
+    const profile = await this.getUser(reservation.account);
+    if (BigInt(profile.creditBalanceMicroUsd) < maxCostMicroUsd) {
+      throw new Error(`insufficient credit balance for ${reservation.account}`);
+    }
+
     await this.putReservation(reservation);
     await this.addRequestToAccount(reservation.account, requestId);
-    await this.updateUser(reservation.account, (profile) => ({
-      ...profile,
+    await this.updateUser(reservation.account, (current) => ({
+      ...current,
       updatedAt: now,
-      totalRequests: profile.totalRequests + 1,
-      totalReservedMicroUsd: addDecimalStrings(profile.totalReservedMicroUsd, reservation.maxCostMicroUsd),
+      totalRequests: current.totalRequests + 1,
+      totalReservedMicroUsd: addDecimalStrings(current.totalReservedMicroUsd, reservation.maxCostMicroUsd),
+      reservedCreditMicroUsd: addDecimalStrings(current.reservedCreditMicroUsd, reservation.maxCostMicroUsd),
+      creditBalanceMicroUsd: subtractDecimalStrings(current.creditBalanceMicroUsd, reservation.maxCostMicroUsd),
       lastRequestId: requestId
     }));
 
@@ -59,10 +71,15 @@ export class KVCreditStore {
     reservation.updatedAt = now;
     await this.putReservation(reservation);
 
+    const refund = BigInt(reservation.maxCostMicroUsd) > actualCostMicroUsd
+      ? BigInt(reservation.maxCostMicroUsd) - actualCostMicroUsd
+      : 0n;
     await this.updateUser(reservation.account, (profile) => ({
       ...profile,
       updatedAt: now,
       totalSettledMicroUsd: addDecimalStrings(profile.totalSettledMicroUsd, reservation.actualCostMicroUsd ?? "0"),
+      reservedCreditMicroUsd: subtractDecimalStrings(profile.reservedCreditMicroUsd, reservation.maxCostMicroUsd),
+      creditBalanceMicroUsd: addDecimalStrings(profile.creditBalanceMicroUsd, refund.toString()),
       lastRequestId: requestId
     }));
 
@@ -72,11 +89,110 @@ export class KVCreditStore {
   async release(requestId: string, vaultReleaseTxHash?: string): Promise<CreditReservation> {
     const reservation = await this.requireReservation(requestId);
     if (reservation.status !== "reserved") throw new Error(`request ${requestId} is not reserved`);
+    const now = new Date().toISOString();
     reservation.status = "released";
     reservation.vaultReleaseTxHash = vaultReleaseTxHash;
-    reservation.updatedAt = new Date().toISOString();
+    reservation.updatedAt = now;
     await this.putReservation(reservation);
+    await this.updateUser(reservation.account, (profile) => ({
+      ...profile,
+      updatedAt: now,
+      reservedCreditMicroUsd: subtractDecimalStrings(profile.reservedCreditMicroUsd, reservation.maxCostMicroUsd),
+      creditBalanceMicroUsd: addDecimalStrings(profile.creditBalanceMicroUsd, reservation.maxCostMicroUsd)
+    }));
     return reservation;
+  }
+
+  async updateStream(
+    account: string,
+    flowRateWeiPerSecond: bigint,
+    gdMicroUsdPerToken: bigint,
+    monthlyGdAmountWei?: bigint,
+    txHash?: string,
+    logIndex?: number
+  ): Promise<StreamState> {
+    const normalized = normalizeAccount(account);
+    const monthlyGd = monthlyGdAmountWei ?? flowRateWeiPerSecond * BigInt(30 * 24 * 60 * 60);
+    const monthlyUsd = monthlyStreamMicroUsd(flowRateWeiPerSecond, gdMicroUsdPerToken);
+    const now = new Date().toISOString();
+    const state: StreamState = {
+      account: normalized,
+      flowRateWeiPerSecond: flowRateWeiPerSecond.toString(),
+      monthlyGdAmountWei: monthlyGd.toString(),
+      monthlyMicroUsd: monthlyUsd.toString(),
+      txHash,
+      logIndex,
+      updatedAt: now
+    };
+    await this.putJson(`${STREAM_PREFIX}${normalized}`, state);
+    await this.updateUser(normalized, (profile) => ({
+      ...profile,
+      updatedAt: now,
+      streamFlowRateWeiPerSecond: state.flowRateWeiPerSecond,
+      streamMonthlyMicroUsd: state.monthlyMicroUsd
+    }));
+    return state;
+  }
+
+  async recordGdCredit(input: {
+    account: string;
+    source: GdCreditEntry["source"];
+    gdAmountWei: bigint;
+    principalMicroUsd: bigint;
+    txHash?: string;
+    logIndex?: number;
+    date?: Date;
+  }): Promise<GdCreditEntry> {
+    const account = normalizeAccount(input.account);
+    const month = monthKey(input.date ?? new Date());
+    const usedKey = `${STREAM_BONUS_USED_PREFIX}${account}:${month}`;
+    const profile = await this.getUser(account);
+    const used = BigInt((await this.kv.get(usedKey)) ?? "0");
+    const bonus = calculateCreditWithBonus({
+      principalMicroUsd: input.principalMicroUsd,
+      monthlyStreamCapMicroUsd: BigInt(profile.streamMonthlyMicroUsd),
+      streamingBonusUsedMicroUsd: used
+    });
+
+    const now = new Date().toISOString();
+    const entry: GdCreditEntry = {
+      id: crypto.randomUUID(),
+      account,
+      source: input.source,
+      gdAmountWei: input.gdAmountWei.toString(),
+      principalMicroUsd: bonus.principalMicroUsd.toString(),
+      regularBonusMicroUsd: bonus.regularBonusMicroUsd.toString(),
+      streamingBonusMicroUsd: bonus.streamingBonusMicroUsd.toString(),
+      totalCreditMicroUsd: bonus.totalCreditMicroUsd.toString(),
+      streamingBonusPrincipalAppliedMicroUsd: bonus.streamingBonusPrincipalAppliedMicroUsd.toString(),
+      month,
+      txHash: input.txHash,
+      logIndex: input.logIndex,
+      createdAt: now
+    };
+
+    await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
+    await this.addGdCreditToAccount(account, entry.id);
+    await this.kv.put(usedKey, (used + bonus.streamingBonusPrincipalAppliedMicroUsd).toString());
+    await this.updateUser(account, (current) => ({
+      ...current,
+      updatedAt: now,
+      totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
+      totalGdPrincipalMicroUsd: addDecimalStrings(current.totalGdPrincipalMicroUsd, entry.principalMicroUsd),
+      totalGdCreditsIssuedMicroUsd: addDecimalStrings(current.totalGdCreditsIssuedMicroUsd, entry.totalCreditMicroUsd),
+      totalRegularBonusMicroUsd: addDecimalStrings(current.totalRegularBonusMicroUsd, entry.regularBonusMicroUsd),
+      totalStreamingBonusMicroUsd: addDecimalStrings(current.totalStreamingBonusMicroUsd, entry.streamingBonusMicroUsd),
+      creditBalanceMicroUsd: addDecimalStrings(current.creditBalanceMicroUsd, entry.totalCreditMicroUsd)
+    }));
+
+    return entry;
+  }
+
+  async getGdCredits(account: string): Promise<GdCreditEntry[]> {
+    const normalized = normalizeAccount(account);
+    const ids = (await this.getJson<string[]>(`${USER_GD_CREDITS_PREFIX}${normalized}`)) ?? [];
+    const entries = await Promise.all(ids.map((id) => this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`)));
+    return entries.filter((item): item is GdCreditEntry => Boolean(item));
   }
 
   async getReservation(requestId: string): Promise<CreditReservation | undefined> {
@@ -85,7 +201,8 @@ export class KVCreditStore {
 
   async getUser(account: string): Promise<UserCreditProfile> {
     const normalized = normalizeAccount(account);
-    return (await this.getJson<UserCreditProfile>(`${USER_PREFIX}${normalized}`)) ?? newUserProfile(normalized);
+    const saved = await this.getJson<Partial<UserCreditProfile>>(`${USER_PREFIX}${normalized}`);
+    return normalizeProfile(saved, normalized);
   }
 
   async getUserRequests(account: string): Promise<CreditReservation[]> {
@@ -112,6 +229,13 @@ export class KVCreditStore {
     await this.putJson(key, ids.slice(-500));
   }
 
+  private async addGdCreditToAccount(account: string, entryId: string): Promise<void> {
+    const key = `${USER_GD_CREDITS_PREFIX}${account}`;
+    const ids = (await this.getJson<string[]>(key)) ?? [];
+    if (!ids.includes(entryId)) ids.push(entryId);
+    await this.putJson(key, ids.slice(-500));
+  }
+
   private async updateUser(account: string, mutate: (profile: UserCreditProfile) => UserCreditProfile): Promise<void> {
     const current = await this.getUser(account);
     await this.putJson(`${USER_PREFIX}${current.account}`, mutate(current));
@@ -127,15 +251,25 @@ export class KVCreditStore {
   }
 }
 
-function newUserProfile(account: string): UserCreditProfile {
-  const now = new Date().toISOString();
+function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account: string): UserCreditProfile {
+  const createdAt = saved?.createdAt ?? new Date().toISOString();
   return {
     account,
-    createdAt: now,
-    updatedAt: now,
-    totalRequests: 0,
-    totalReservedMicroUsd: "0",
-    totalSettledMicroUsd: "0"
+    createdAt,
+    updatedAt: saved?.updatedAt ?? createdAt,
+    totalRequests: saved?.totalRequests ?? 0,
+    totalReservedMicroUsd: saved?.totalReservedMicroUsd ?? "0",
+    totalSettledMicroUsd: saved?.totalSettledMicroUsd ?? "0",
+    creditBalanceMicroUsd: saved?.creditBalanceMicroUsd ?? "0",
+    reservedCreditMicroUsd: saved?.reservedCreditMicroUsd ?? "0",
+    totalGdDepositedWei: saved?.totalGdDepositedWei ?? "0",
+    totalGdPrincipalMicroUsd: saved?.totalGdPrincipalMicroUsd ?? "0",
+    totalGdCreditsIssuedMicroUsd: saved?.totalGdCreditsIssuedMicroUsd ?? "0",
+    totalRegularBonusMicroUsd: saved?.totalRegularBonusMicroUsd ?? "0",
+    totalStreamingBonusMicroUsd: saved?.totalStreamingBonusMicroUsd ?? "0",
+    streamFlowRateWeiPerSecond: saved?.streamFlowRateWeiPerSecond ?? "0",
+    streamMonthlyMicroUsd: saved?.streamMonthlyMicroUsd ?? "0",
+    lastRequestId: saved?.lastRequestId
   };
 }
 
@@ -145,4 +279,9 @@ function normalizeAccount(account: string): string {
 
 function addDecimalStrings(a: string, b: string): string {
   return (BigInt(a) + BigInt(b)).toString();
+}
+
+function subtractDecimalStrings(a: string, b: string): string {
+  const result = BigInt(a) - BigInt(b);
+  return (result > 0n ? result : 0n).toString();
 }

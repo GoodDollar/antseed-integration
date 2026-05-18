@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { AntSeedClient, providerReceiptHash } from "./antseed-client.js";
+import { fetchCeloVaultEvents } from "./celo-events.js";
+import { gdWeiToMicroUsd } from "./credit-bonus.js";
 import { configFromEnv, Env } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { actualCostMicroUsd, estimateMaxCostMicroUsd } from "./pricing.js";
@@ -18,6 +20,21 @@ const ChatSchema = z.object({
 });
 
 const QuoteSchema = ChatSchema.pick({ messages: true, max_tokens: true });
+const CeloTxSchema = z.object({ txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/) });
+const ManualGdCreditSchema = z.object({
+  account: z.string().min(1),
+  gdAmountWei: z.string().regex(/^\d+$/),
+  source: z.enum(["erc677", "erc777", "erc20", "stream", "manual"]).default("manual"),
+  txHash: z.string().optional(),
+  logIndex: z.number().int().nonnegative().optional()
+});
+const StreamUpdateSchema = z.object({
+  account: z.string().min(1),
+  flowRateWeiPerSecond: z.string().regex(/^\d+$/),
+  monthlyGdAmountWei: z.string().regex(/^\d+$/).optional(),
+  txHash: z.string().optional(),
+  logIndex: z.number().int().nonnegative().optional()
+});
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -47,12 +64,13 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
   if (request.method === "GET" && accountMatch) {
     const account = decodeURIComponent(accountMatch[1]);
-    const [profile, requests, vaultBalances] = await Promise.all([
+    const [profile, requests, gdCredits, vaultBalances] = await Promise.all([
       store.getUser(account),
       store.getUserRequests(account),
+      store.getGdCredits(account),
       vault.balances(account)
     ]);
-    return json({ account: profile.account, profile, vault: vaultBalances, requests });
+    return json({ account: profile.account, profile, vault: vaultBalances, requests, gdCredits });
   }
 
   const requestMatch = url.pathname.match(/^\/v1\/requests\/([^/]+)$/);
@@ -68,6 +86,69 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
     const maxCostMicroUsd = estimateMaxCostMicroUsd(cfg, parsed.data.messages, parsed.data.max_tokens);
     return json({ maxCostMicroUsd: maxCostMicroUsd.toString() });
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/celo/events/record") {
+    const body = await parseJson(request);
+    const parsed = CeloTxSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+
+    const events = await fetchCeloVaultEvents(parsed.data.txHash, cfg);
+    const recorded = [];
+    for (const event of events) {
+      if (event.kind === "deposit") {
+        recorded.push(await store.recordGdCredit({
+          account: event.account,
+          source: "erc677",
+          gdAmountWei: event.gdAmountWei,
+          principalMicroUsd: event.principalMicroUsd,
+          txHash: event.txHash,
+          logIndex: event.logIndex
+        }));
+      } else {
+        recorded.push(await store.updateStream(
+          event.account,
+          event.flowRateWeiPerSecond,
+          cfg.GD_MICRO_USD_PER_TOKEN,
+          event.monthlyGdAmountWei,
+          event.txHash,
+          event.logIndex
+        ));
+      }
+    }
+    return json({ txHash: parsed.data.txHash, events: recorded });
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/celo/deposits/manual") {
+    const body = await parseJson(request);
+    const parsed = ManualGdCreditSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const gdAmountWei = BigInt(parsed.data.gdAmountWei);
+    const principalMicroUsd = gdWeiToMicroUsd(gdAmountWei, cfg.GD_MICRO_USD_PER_TOKEN);
+    const entry = await store.recordGdCredit({
+      account: parsed.data.account,
+      source: parsed.data.source,
+      gdAmountWei,
+      principalMicroUsd,
+      txHash: parsed.data.txHash,
+      logIndex: parsed.data.logIndex
+    });
+    return json(entry);
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/celo/streams/update") {
+    const body = await parseJson(request);
+    const parsed = StreamUpdateSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const state = await store.updateStream(
+      parsed.data.account,
+      BigInt(parsed.data.flowRateWeiPerSecond),
+      cfg.GD_MICRO_USD_PER_TOKEN,
+      parsed.data.monthlyGdAmountWei ? BigInt(parsed.data.monthlyGdAmountWei) : undefined,
+      parsed.data.txHash,
+      parsed.data.logIndex
+    );
+    return json(state);
   }
 
   if (request.method === "POST" && url.pathname === "/v1/chat/completions") {

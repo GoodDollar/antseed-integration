@@ -18,6 +18,12 @@ class MemoryKV {
 
 test("KV store persists user profile and request lifecycle", async () => {
   const store = new KVCreditStore(new MemoryKV() as never);
+  await store.recordGdCredit({
+    account: "0xABC",
+    source: "manual",
+    gdAmountWei: 10_000_000_000_000_000n,
+    principalMicroUsd: 10_000n
+  });
   const reservation = await store.reserve("0xABC", 2500n);
 
   assert.equal(reservation.account, "0xabc");
@@ -36,7 +42,59 @@ test("KV store persists user profile and request lifecycle", async () => {
   assert.equal(user.totalRequests, 1);
   assert.equal(user.totalReservedMicroUsd, "2500");
   assert.equal(user.totalSettledMicroUsd, "1500");
+  assert.equal(user.reservedCreditMicroUsd, "0");
+  assert.equal(user.creditBalanceMicroUsd, "9500");
 
   const requests = await store.getUserRequests("0xABC");
   assert.equal(requests.length, 1);
+});
+
+test("KV store rejects AntSeed reservations without enough G$ credit", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await assert.rejects(() => store.reserve("0xABC", 1n), /insufficient credit balance/);
+});
+
+test("KV store releases reserved credit back to available balance", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.recordGdCredit({ account: "0xABC", source: "manual", gdAmountWei: 10n, principalMicroUsd: 1000n });
+  const reservation = await store.reserve("0xABC", 500n);
+  await store.release(reservation.requestId, "0xrelease");
+  const user = await store.getUser("0xABC");
+  assert.equal(user.creditBalanceMicroUsd, "1100");
+  assert.equal(user.reservedCreditMicroUsd, "0");
+});
+
+test("KV store persists stream cap and G$ credit bonuses", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.updateStream("0xABC", 385802469136n, 1_000_000n, undefined, "0xstream", 1);
+
+  const first = await store.recordGdCredit({
+    account: "0xABC",
+    source: "erc677",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    principalMicroUsd: 1_000_000n,
+    txHash: "0xdeposit1",
+    logIndex: 2
+  });
+  assert.equal(first.totalCreditMicroUsd, "1200000");
+  assert.equal(first.streamingBonusMicroUsd, "100000");
+
+  const second = await store.recordGdCredit({
+    account: "0xABC",
+    source: "erc777",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    principalMicroUsd: 1_000_000n,
+    txHash: "0xdeposit2",
+    logIndex: 3
+  });
+  assert.equal(second.totalCreditMicroUsd, "1100000");
+  assert.equal(second.streamingBonusMicroUsd, "0");
+
+  const user = await store.getUser("0xABC");
+  assert.equal(user.creditBalanceMicroUsd, "2300000");
+  assert.equal(user.totalGdCreditsIssuedMicroUsd, "2300000");
+  assert.equal(user.totalStreamingBonusMicroUsd, "100000");
+
+  const credits = await store.getGdCredits("0xABC");
+  assert.equal(credits.length, 2);
 });

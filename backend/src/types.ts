@@ -33,7 +33,42 @@ export type UserCreditProfile = {
   totalRequests: number;
   totalReservedMicroUsd: string;
   totalSettledMicroUsd: string;
+  creditBalanceMicroUsd: string;
+  reservedCreditMicroUsd: string;
+  totalGdDepositedWei: string;
+  totalGdPrincipalMicroUsd: string;
+  totalGdCreditsIssuedMicroUsd: string;
+  totalRegularBonusMicroUsd: string;
+  totalStreamingBonusMicroUsd: string;
+  streamFlowRateWeiPerSecond: string;
+  streamMonthlyMicroUsd: string;
   lastRequestId?: string;
+};
+
+export type GdCreditEntry = {
+  id: string;
+  account: string;
+  source: "erc677" | "erc777" | "erc20" | "stream" | "manual";
+  gdAmountWei: string;
+  principalMicroUsd: string;
+  regularBonusMicroUsd: string;
+  streamingBonusMicroUsd: string;
+  totalCreditMicroUsd: string;
+  streamingBonusPrincipalAppliedMicroUsd: string;
+  month: string;
+  txHash?: string;
+  logIndex?: number;
+  createdAt: string;
+};
+
+export type StreamState = {
+  account: string;
+  flowRateWeiPerSecond: string;
+  monthlyGdAmountWei: string;
+  monthlyMicroUsd: string;
+  txHash?: string;
+  logIndex?: number;
+  updatedAt: string;
 };
 
 export type AntSeedChatCompletion = {

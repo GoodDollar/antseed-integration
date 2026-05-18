@@ -5,8 +5,9 @@ Standalone AntSeed integration for GoodDollar agents.
 This repository is intentionally separate from GoodDollar L2. It contains only:
 
 - an on-chain credit vault contract for prepaid/reserved AI compute credits
+- a Celo G$ vault that accepts ERC677/ERC667, ERC777, and Superfluid stream callbacks
 - a Cloudflare Worker backend credit/accounting service
-- KV-backed long-term persistence for user/request data
+- KV-backed long-term persistence for user/request/G$ credit data
 - an AntSeed buyer/proxy integration using the OpenAI-compatible API exposed by an AntSeed buyer gateway
 
 ## What is deliberately excluded
@@ -19,19 +20,18 @@ This repository is intentionally separate from GoodDollar L2. It contains only:
 ## Repository layout
 
 ```text
-contracts/            Foundry project with AgentCreditVault
-backend/              Wrangler Cloudflare Worker for credits + AntSeed calls
+contracts/            Foundry project with AgentCreditVault + CeloGdAntSeedVault
+backend/              Wrangler Cloudflare Worker for credits + Celo G$ ingestion + AntSeed calls
 docs/                 Architecture and operations notes
 ```
 
 ## Flow
 
-1. User or sponsor deposits ERC-20 funds into `AgentCreditVault` for an account.
-2. Backend receives an AI request and estimates a maximum compute cost.
-3. Backend reserves credit in the vault for `requestId`.
-4. Backend forwards the request to AntSeed buyer proxy (`/v1/chat/completions`).
-5. Backend settles the final cost and releases any unused reservation.
-6. Events provide an audit trail for deposits, reservations, settlement, refunds, and withdrawals.
+1. A GoodID-verified user deposits G$ into `CeloGdAntSeedVault` on Celo, either with ERC677/ERC667 `transferAndCall`, ERC777 `tokensReceived`, or classic ERC-20 `deposit`.
+2. A GoodID-verified user can also stream G$ to the vault through Superfluid; the vault reacts to SuperApp stream callbacks and emits stream-cap events.
+3. The Worker verifies Celo vault logs, persists user data in KV, and issues USDC-denominated AntSeed credits.
+4. Standard deposits receive +10% credits. Streaming users receive +20% on principal up to their monthly stream speed; amounts above that cap receive the regular +10%.
+5. The Worker reserves/settles AntSeed request costs and forwards requests to the AntSeed buyer proxy (`/v1/chat/completions`).
 
 ## Quick start
 

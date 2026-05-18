@@ -12,6 +12,9 @@ export interface Env {
   DEFAULT_MAX_OUTPUT_TOKENS?: string;
   MIN_RESERVE_MICRO_USD?: string;
   CREDIT_TOKEN_DECIMALS?: string;
+  GD_MICRO_USD_PER_TOKEN?: string;
+  CELO_RPC_URL?: string;
+  CELO_VAULT_ADDRESS?: string;
 
   RPC_URL?: string;
   VAULT_ADDRESS?: string;
@@ -29,6 +32,9 @@ export type RuntimeConfig = {
   DEFAULT_MAX_OUTPUT_TOKENS: number;
   MIN_RESERVE_MICRO_USD: bigint;
   CREDIT_TOKEN_DECIMALS: number;
+  GD_MICRO_USD_PER_TOKEN: bigint;
+  CELO_RPC_URL?: string;
+  CELO_VAULT_ADDRESS?: string;
   RPC_URL?: string;
   VAULT_ADDRESS?: string;
   OPERATOR_PRIVATE_KEY?: string;
@@ -46,6 +52,9 @@ export function configFromEnv(env: Env): RuntimeConfig {
     DEFAULT_MAX_OUTPUT_TOKENS: numberEnv(env.DEFAULT_MAX_OUTPUT_TOKENS, 1024),
     MIN_RESERVE_MICRO_USD: bigintEnv(env.MIN_RESERVE_MICRO_USD, 1_000n),
     CREDIT_TOKEN_DECIMALS: numberEnv(env.CREDIT_TOKEN_DECIMALS, 6),
+    GD_MICRO_USD_PER_TOKEN: bigintEnv(env.GD_MICRO_USD_PER_TOKEN, 1_000_000n),
+    CELO_RPC_URL: env.CELO_RPC_URL,
+    CELO_VAULT_ADDRESS: env.CELO_VAULT_ADDRESS,
     RPC_URL: env.RPC_URL,
     VAULT_ADDRESS: env.VAULT_ADDRESS,
     OPERATOR_PRIVATE_KEY: env.OPERATOR_PRIVATE_KEY
