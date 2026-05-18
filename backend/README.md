@@ -8,7 +8,7 @@ Cloudflare Worker for GoodDollar AntSeed credit/accounting and buyer proxy integ
 - KV namespace binding: `ANTSEED_KV`
 - Optional on-chain `AgentCreditVault` integration through `ethers` with `nodejs_compat`
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
-- GoodDollar backend payment proxy via OpenAI-compatible `POST /v1/chat/completions`: developer tools call this Worker, the Worker reserves/deducts user credits, and the Worker pays the AntSeed buyer/provider path upstream
+- GoodDollar backend payment proxy via OpenAI-compatible `POST /v1/chat/completions`: developer tools call this Worker with a signed `gd_live_...` API key, the Worker maps the key to a verified wallet/GoodID root, reserves/deducts user credits, and pays the AntSeed buyer/provider path upstream
 
 ## Persistent KV data
 
@@ -29,14 +29,18 @@ For the complete end-user setup flow, see [`../docs/USER_GUIDE.md`](../docs/USER
 ## Endpoints
 
 - `GET /health`
-- `GET /config/status` — OpenAI-compatible proxy metadata and integration flags
+- `GET /config/status` — OpenAI-compatible proxy metadata, signed-auth mode, and integration flags
+- `POST /v1/auth/nonce` — creates a SIWE-style message for the wallet to sign
+- `POST /v1/auth/api-keys` — verifies the wallet signature and issues a `gd_live_...` API key; KV stores only the token hash
+- `GET /v1/auth/api-keys` — lists API keys for the authenticated wallet/root
+- `DELETE /v1/auth/api-keys/:id` — revokes an API key for the authenticated wallet/root
 - `GET /v1/accounts/:account/credit`
 - `GET /v1/requests/:requestId`
 - `POST /v1/credits/quote`
 - `POST /v1/celo/events/record` — verifies and records Celo vault logs by `txHash`
 - `POST /v1/celo/deposits/manual` — local/test fallback for manual G$ credit entry
 - `POST /v1/celo/streams/update` — local/test fallback for stream state updates
-- `POST /v1/chat/completions` — OpenAI-compatible inference endpoint; accepts account selection via `Authorization: Bearer gd:0x...`, `Authorization: Bearer account:0x...`, `x-gooddollar-account`, or body `account`
+- `POST /v1/chat/completions` — OpenAI-compatible inference endpoint; production auth uses `Authorization: Bearer gd_live_...` or `x-api-key: gd_live_...`. Local/dev-only account selectors (`gd:0x...`, `x-gooddollar-account`, body `account`) require `ALLOW_UNVERIFIED_ACCOUNT_SELECTOR=true`.
 
 ## Setup
 
@@ -72,6 +76,10 @@ wrangler secret put ANTSEED_PIN_SERVICE
 wrangler secret put CELO_RPC_URL
 wrangler secret put CELO_VAULT_ADDRESS
 wrangler secret put CELO_GOODID_ADDRESS
+# Optional auth tuning:
+# wrangler secret put AUTH_NONCE_TTL_SECONDS
+# wrangler secret put API_KEY_TTL_SECONDS
+# wrangler secret put ALLOW_UNVERIFIED_ACCOUNT_SELECTOR  # local/dev only, keep false in production
 ```
 
 Important: a deployed Cloudflare Worker cannot call `127.0.0.1` on the GoodClaw host. `ANTSEED_BASE_URL` must point to a publicly reachable AntSeed buyer gateway for production.

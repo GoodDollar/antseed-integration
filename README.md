@@ -35,7 +35,8 @@ See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the full user flow: buying An
 2. A GoodID-verified user can also stream G$ to the vault through Superfluid; the vault reacts to SuperApp stream callbacks and emits stream-cap events.
 3. The Worker verifies Celo vault logs, resolves the GoodID root with `getWhitelistedRoot(account)`, persists wallet-level and root-level user data in KV, and issues USDC-denominated AntSeed credits.
 4. Standard deposits receive +10% credits. Streaming users receive +20% on principal up to their monthly stream speed; amounts above that cap receive the regular +10%.
-5. The Worker reserves/settles AntSeed request costs and forwards requests to the AntSeed buyer proxy (`/v1/chat/completions`).
+5. The user creates a signed `gd_live_...` API key by signing a Worker nonce with the credit-owning wallet.
+6. Developer tools use the Worker as their OpenAI-compatible `/v1` base URL. The Worker authenticates the API key, reserves/settles AntSeed request costs, and forwards requests to the AntSeed buyer proxy (`/v1/chat/completions`).
 
 ## Quick start
 

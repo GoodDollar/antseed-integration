@@ -18,3 +18,9 @@ GD_MICRO_USD_PER_TOKEN=1000000
 # OPERATOR_PRIVATE_KEY=0x...
 # ANTSEED_PIN_PEER=
 # ANTSEED_PIN_SERVICE=
+
+# Auth defaults
+AUTH_NONCE_TTL_SECONDS=600
+# API_KEY_TTL_SECONDS=2592000
+# Local/dev only. Keep false in production; true enables gd:0x... account selectors without wallet signature proof.
+ALLOW_UNVERIFIED_ACCOUNT_SELECTOR=false

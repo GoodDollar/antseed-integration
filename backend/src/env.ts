@@ -16,6 +16,9 @@ export interface Env {
   CELO_RPC_URL?: string;
   CELO_VAULT_ADDRESS?: string;
   CELO_GOODID_ADDRESS?: string;
+  AUTH_NONCE_TTL_SECONDS?: string;
+  API_KEY_TTL_SECONDS?: string;
+  ALLOW_UNVERIFIED_ACCOUNT_SELECTOR?: string;
 
   RPC_URL?: string;
   VAULT_ADDRESS?: string;
@@ -37,6 +40,9 @@ export type RuntimeConfig = {
   CELO_RPC_URL?: string;
   CELO_VAULT_ADDRESS?: string;
   CELO_GOODID_ADDRESS?: string;
+  AUTH_NONCE_TTL_SECONDS: number;
+  API_KEY_TTL_SECONDS?: number;
+  ALLOW_UNVERIFIED_ACCOUNT_SELECTOR: boolean;
   RPC_URL?: string;
   VAULT_ADDRESS?: string;
   OPERATOR_PRIVATE_KEY?: string;
@@ -58,6 +64,9 @@ export function configFromEnv(env: Env): RuntimeConfig {
     CELO_RPC_URL: env.CELO_RPC_URL,
     CELO_VAULT_ADDRESS: env.CELO_VAULT_ADDRESS,
     CELO_GOODID_ADDRESS: env.CELO_GOODID_ADDRESS,
+    AUTH_NONCE_TTL_SECONDS: numberEnv(env.AUTH_NONCE_TTL_SECONDS, 600),
+    API_KEY_TTL_SECONDS: optionalNumberEnv(env.API_KEY_TTL_SECONDS),
+    ALLOW_UNVERIFIED_ACCOUNT_SELECTOR: booleanEnv(env.ALLOW_UNVERIFIED_ACCOUNT_SELECTOR, false),
     RPC_URL: env.RPC_URL,
     VAULT_ADDRESS: env.VAULT_ADDRESS,
     OPERATOR_PRIVATE_KEY: env.OPERATOR_PRIVATE_KEY
@@ -69,6 +78,16 @@ function numberEnv(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) throw new Error(`invalid numeric env value: ${value}`);
   return parsed;
+}
+
+function optionalNumberEnv(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  return numberEnv(value, 0);
+}
+
+function booleanEnv(value: string | undefined, fallback: boolean): boolean {
+  if (!value) return fallback;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
 function bigintEnv(value: string | undefined, fallback: bigint): bigint {

@@ -46,6 +46,8 @@ test("fetches GoodID root with eth_call for root aggregation", async () => {
       MIN_RESERVE_MICRO_USD: 1n,
       CREDIT_TOKEN_DECIMALS: 6,
       GD_MICRO_USD_PER_TOKEN: 1_000_000n,
+      AUTH_NONCE_TTL_SECONDS: 600,
+      ALLOW_UNVERIFIED_ACCOUNT_SELECTOR: false,
       CELO_RPC_URL: "https://celo.example",
       CELO_GOODID_ADDRESS: "0x0000000000000000000000000000000000000abc"
     });

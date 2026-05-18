@@ -26,6 +26,8 @@ export GOODDOLLAR_ACCOUNT="0xYOUR_GOODID_WALLET"
 export GOODDOLLAR_ANTSEED_MODEL="qwen3-235b-instruct"
 ```
 
+You will also create a GoodDollar AntSeed API key by signing a wallet message. Developer tools use that API key; they do not use your wallet private key.
+
 Check that the API is alive:
 
 ```bash
@@ -179,7 +181,74 @@ The response includes:
 - current stream cap,
 - available credit balance.
 
-## Step 5 — Connect local developer tools to AntSeed
+## Step 5 — Create a signed GoodDollar AntSeed API key
+
+The backend must verify that the caller controls the wallet whose credits will be spent. It does this once, when creating an API key:
+
+```text
+wallet signs nonce -> backend verifies signature -> backend issues gd_live_... API key -> dev tools use that API key
+```
+
+### 5.1 Request a nonce/message
+
+```bash
+curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/auth/nonce" \
+  -H "content-type: application/json" \
+  -d '{"account":"0xYOUR_GOODID_WALLET"}'
+```
+
+Response:
+
+```json
+{
+  "account": "0xyour...wallet",
+  "nonce": "...",
+  "message": "...message to sign...",
+  "expiresAt": "2026-05-18T...Z"
+}
+```
+
+### 5.2 Sign the returned `message`
+
+Sign the exact returned message with the wallet that owns the credits. In production this should be done through the GoodDollar UI / WalletConnect / browser wallet flow.
+
+Do **not** paste private keys into random developer tools. The developer tool only needs the final `gd_live_...` API key, never your wallet key or seed phrase.
+
+### 5.3 Exchange signature for an API key
+
+```bash
+curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/auth/api-keys" \
+  -H "content-type: application/json" \
+  -d '{
+    "account":"0xYOUR_GOODID_WALLET",
+    "nonce":"NONCE_FROM_STEP_5_1",
+    "signature":"0xSIGNATURE_FROM_WALLET",
+    "label":"Laptop VS Code"
+  }'
+```
+
+Response:
+
+```json
+{
+  "token": "gd_live_...",
+  "apiKey": {
+    "id": "...",
+    "account": "0xyour...wallet",
+    "rootAccount": "0xgoodid...root",
+    "tokenPrefix": "gd_live_...abcd",
+    "status": "active"
+  }
+}
+```
+
+Save the `token` once. The backend stores only a hash of it.
+
+```bash
+export GOODDOLLAR_ANTSEED_API_KEY="gd_live_..."
+```
+
+## Step 6 — Connect local developer tools to AntSeed
 
 The Worker exposes an OpenAI-compatible chat-completions endpoint:
 
@@ -192,26 +261,17 @@ Use these values in tools that support OpenAI-compatible providers:
 ```bash
 Base URL:  $GOODDOLLAR_ANTSEED_API/v1
 Model:     qwen3-235b-instruct
-API key:   gd:0xYOUR_GOODID_WALLET
+API key:   $GOODDOLLAR_ANTSEED_API_KEY
 ```
 
-The `gd:0x...` API key is an **account selector**, not a private key and not a wallet signature. It lets standard tools identify which GoodDollar credit balance to charge through the normal `Authorization: Bearer ...` header.
-
-The Worker accepts any of these account selectors:
-
-```text
-Authorization: Bearer gd:0xYOUR_GOODID_WALLET
-Authorization: Bearer account:0xYOUR_GOODID_WALLET
-x-gooddollar-account: 0xYOUR_GOODID_WALLET
-JSON body field: "account": "0xYOUR_GOODID_WALLET"
-```
+The backend maps the API key to the verified wallet/GoodID root, reserves credits, sends the request to AntSeed as the buyer/payer, settles the actual cost, and returns the model response.
 
 ### Quick inference test
 
 ```bash
 curl "$GOODDOLLAR_ANTSEED_API/v1/chat/completions" \
   -H "content-type: application/json" \
-  -H "authorization: Bearer gd:$GOODDOLLAR_ACCOUNT" \
+  -H "authorization: Bearer $GOODDOLLAR_ANTSEED_API_KEY" \
   -d '{
     "model": "qwen3-235b-instruct",
     "messages": [
@@ -221,13 +281,7 @@ curl "$GOODDOLLAR_ANTSEED_API/v1/chat/completions" \
   }'
 ```
 
-If your tool supports custom headers, you can also set:
-
-```text
-x-gooddollar-account: 0xYOUR_GOODID_WALLET
-```
-
-But the `gd:0x...` API-key pattern is usually easier because most tools already support an OpenAI API key field.
+For local-only testing, operators may enable `ALLOW_UNVERIFIED_ACCOUNT_SELECTOR=true`, which accepts `gd:0x...` / `x-gooddollar-account` selectors. That mode is not production-safe because it does not prove wallet ownership.
 
 ## VS Code setup
 
@@ -243,7 +297,7 @@ In `~/.continue/config.json`, add an OpenAI-compatible model:
       "provider": "openai",
       "model": "qwen3-235b-instruct",
       "apiBase": "https://YOUR_GOODDOLLAR_ANTSEED_WORKER/v1",
-      "apiKey": "gd:0xYOUR_GOODID_WALLET"
+      "apiKey": "gd_live_YOUR_SIGNED_API_KEY"
     }
   ]
 }
@@ -258,21 +312,17 @@ Use the tool’s OpenAI-compatible provider settings:
 ```text
 Provider:  OpenAI Compatible
 Base URL:  https://YOUR_GOODDOLLAR_ANTSEED_WORKER/v1
-API key:   gd:0xYOUR_GOODID_WALLET
+API key:   gd_live_YOUR_SIGNED_API_KEY
 Model:     qwen3-235b-instruct
 ```
 
-If the tool has a separate “custom headers” field, you may instead set:
-
-```text
-x-gooddollar-account: 0xYOUR_GOODID_WALLET
-```
+Use the signed API key field for production. `x-gooddollar-account` is only for operator-enabled local/dev testing.
 
 ## Aider setup
 
 ```bash
 export OPENAI_API_BASE="$GOODDOLLAR_ANTSEED_API/v1"
-export OPENAI_API_KEY="gd:$GOODDOLLAR_ACCOUNT"
+export OPENAI_API_KEY="$GOODDOLLAR_ANTSEED_API_KEY"
 aider --model openai/qwen3-235b-instruct
 ```
 
@@ -282,7 +332,7 @@ aider --model openai/qwen3-235b-instruct
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  apiKey: "gd:0xYOUR_GOODID_WALLET",
+  apiKey: "gd_live_YOUR_SIGNED_API_KEY",
   baseURL: "https://YOUR_GOODDOLLAR_ANTSEED_WORKER/v1"
 });
 
@@ -303,14 +353,14 @@ So for Claude Code specifically, do **not** clone this integration repo for “l
 
 1. **Use a GoodDollar AntSeed Anthropic-compatible gateway** if the operator exposes one.
    - Configure Claude Code to point at that gateway.
-   - The gateway should translate Anthropic Messages requests to the Worker’s OpenAI-compatible chat-completions endpoint and charge credits using `gd:0xYOUR_GOODID_WALLET` or `x-gooddollar-account`.
+   - The gateway should translate Anthropic Messages requests to the Worker’s OpenAI-compatible chat-completions endpoint and charge credits using `Authorization: Bearer gd_live_...`.
 
 2. **Use an OpenAI-compatible coding agent instead** for direct access today.
-   - Continue, Cline, Roo Code, Aider, OpenClaw, and many local agents can use the Worker directly with `Base URL = .../v1` and `API key = gd:0x...`.
+   - Continue, Cline, Roo Code, Aider, OpenClaw, and many local agents can use the Worker directly with `Base URL = .../v1` and `API key = gd_live_...`.
 
 3. **Run a local compatibility proxy** only if you already have one.
    - Upstream target: `POST $GOODDOLLAR_ANTSEED_API/v1/chat/completions`
-   - Upstream auth header: `Authorization: Bearer gd:0xYOUR_GOODID_WALLET`
+   - Upstream auth header: `Authorization: Bearer gd_live_YOUR_SIGNED_API_KEY`
    - Upstream model: `qwen3-235b-instruct`
 
 Until a first-class `/v1/messages` compatibility endpoint exists, native Claude Code direct configuration is not the primary path.
@@ -340,16 +390,16 @@ If you see an insufficient credit error, deposit or stream more G$ and record th
 
 ### Tool cannot set custom headers
 
-Use the API key pattern:
+Use the signed API key in the normal API-key field:
 
 ```text
-gd:0xYOUR_GOODID_WALLET
+gd_live_YOUR_SIGNED_API_KEY
 ```
 
 Most OpenAI-compatible tools will send that as:
 
 ```text
-Authorization: Bearer gd:0xYOUR_GOODID_WALLET
+Authorization: Bearer gd_live_YOUR_SIGNED_API_KEY
 ```
 
 ### Tool wants a model list endpoint
@@ -359,7 +409,8 @@ This Worker currently supports chat completions. If a tool requires `/v1/models`
 ## Safety and limitations
 
 - Credits are not USDC balances; they are accounting credits for AntSeed usage.
-- `gd:0x...` identifies the account to charge. It is not a wallet signature and should be replaced by signed auth or real API keys before a broad public launch.
+- `gd_live_...` API keys are created only after wallet signature verification. Store them like secrets and revoke them if lost.
+- `gd:0x...` / `x-gooddollar-account` selectors are local-dev-only when explicitly enabled by an operator and are not production-safe.
 - KV is durable but eventually consistent. On-chain vault events are the source of truth for deposits and stream updates.
 - A deployed Cloudflare Worker cannot reach `127.0.0.1`; production `ANTSEED_BASE_URL` must be publicly reachable.
 - Never put wallet private keys or seed phrases into developer-tool model settings.
