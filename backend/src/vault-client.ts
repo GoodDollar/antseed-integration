@@ -1,5 +1,5 @@
 import { ZeroHash, ethers, id } from "ethers";
-import { Config } from "./config.js";
+import { RuntimeConfig } from "./env.js";
 
 const ABI = [
   "function availableBalance(address account) view returns (uint256)",
@@ -21,7 +21,7 @@ export class VaultClient {
   readonly enabled: boolean;
   private contract?: ethers.Contract;
 
-  constructor(private readonly cfg: Config) {
+  constructor(private readonly cfg: RuntimeConfig) {
     this.enabled = Boolean(cfg.RPC_URL && cfg.VAULT_ADDRESS && cfg.OPERATOR_PRIVATE_KEY);
     if (this.enabled) {
       const provider = new ethers.JsonRpcProvider(cfg.RPC_URL);

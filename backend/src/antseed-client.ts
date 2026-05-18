@@ -1,9 +1,8 @@
-import { createHash } from "node:crypto";
-import { Config } from "./config.js";
+import { RuntimeConfig } from "./env.js";
 import { AntSeedChatCompletion, ChatCompletionRequest } from "./types.js";
 
 export class AntSeedClient {
-  constructor(private readonly cfg: Config) {}
+  constructor(private readonly cfg: RuntimeConfig) {}
 
   async chatCompletion(req: ChatCompletionRequest): Promise<AntSeedChatCompletion> {
     const controller = new AbortController();
@@ -38,6 +37,12 @@ export class AntSeedClient {
   }
 }
 
-export function providerReceiptHash(response: AntSeedChatCompletion): string {
-  return `0x${createHash("sha256").update(JSON.stringify(response)).digest("hex")}`;
+export async function providerReceiptHash(response: AntSeedChatCompletion): Promise<string> {
+  return sha256Hex(JSON.stringify(response));
+}
+
+export async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return `0x${[...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
 }

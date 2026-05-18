@@ -1,28 +1,26 @@
 {
-  "name": "@gooddollar/antseed-integration-backend",
-  "version": "0.1.0",
+  "name": "@gooddollar/antseed-integration-worker",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Credit accounting and AntSeed buyer integration service for GoodDollar agents",
+  "description": "Cloudflare Worker for GoodDollar AntSeed credit accounting and buyer integration",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
+    "dev": "wrangler dev",
+    "build": "wrangler deploy --dry-run --outdir dist/worker",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "npm run typecheck"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
     "ethers": "^6.13.5",
-    "express": "^4.21.2",
-    "pino": "^9.6.0",
-    "pino-http": "^10.4.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@types/express": "^5.0.0",
+    "@cloudflare/workers-types": "^4.20260518.0",
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "wrangler": "^4.18.0"
   }
 }

@@ -20,13 +20,13 @@ The vault never calls AntSeed. It only accounts for prepaid credits on-chain.
 
 ### Backend credit service
 
-The backend owns the operational flow:
+The backend is a Cloudflare Worker managed by Wrangler. It owns the operational flow:
 
 - authenticates/identifies the requesting account
 - estimates maximum cost for the model request
 - reserves credit in the vault when configured
 - forwards the request to the AntSeed buyer proxy
-- records local request state
+- records durable user/request state in Cloudflare KV
 - settles actual cost in the vault
 
 ### AntSeed integration
@@ -37,7 +37,7 @@ The backend uses the local AntSeed buyer proxy OpenAI-compatible route:
 POST /v1/chat/completions
 ```
 
-It can optionally set AntSeed pinning headers for peer/service selection.
+It can optionally set AntSeed pinning headers for peer/service selection. In production, `ANTSEED_BASE_URL` must be publicly reachable; a deployed Worker cannot reach a private `127.0.0.1` buyer running on the GoodClaw host.
 
 ## Accounting model
 
@@ -52,3 +52,14 @@ It can optionally set AntSeed pinning headers for peer/service selection.
 - no GoodDollar L2 block processing
 - no wallet UI
 - no model hosting logic
+
+
+## Cloudflare KV persistence
+
+The Worker binds `ANTSEED_KV` and persists:
+
+- `user:<account>` aggregate credit/request profile
+- `user-requests:<account>` bounded recent request ID list
+- `request:<requestId>` full reservation lifecycle including vault tx hashes and provider receipt hash
+
+KV is used for long-term user data as requested. Strict high-concurrency balance enforcement should still be delegated to the on-chain vault; KV is eventually consistent.

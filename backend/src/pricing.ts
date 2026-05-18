@@ -1,4 +1,4 @@
-import { Config } from "./config.js";
+import { RuntimeConfig } from "./env.js";
 import { ChatMessage } from "./types.js";
 
 export function estimateTokens(messages: ChatMessage[]): number {
@@ -8,7 +8,7 @@ export function estimateTokens(messages: ChatMessage[]): number {
 }
 
 export function estimateMaxCostMicroUsd(
-  cfg: Pick<Config,
+  cfg: Pick<RuntimeConfig,
     | "PRICE_MICRO_USD_PER_1K_INPUT_TOKENS"
     | "PRICE_MICRO_USD_PER_1K_OUTPUT_TOKENS"
     | "DEFAULT_MAX_OUTPUT_TOKENS"
@@ -26,7 +26,7 @@ export function estimateMaxCostMicroUsd(
 }
 
 export function actualCostMicroUsd(
-  cfg: Pick<Config, "PRICE_MICRO_USD_PER_1K_INPUT_TOKENS" | "PRICE_MICRO_USD_PER_1K_OUTPUT_TOKENS" | "MIN_RESERVE_MICRO_USD">,
+  cfg: Pick<RuntimeConfig, "PRICE_MICRO_USD_PER_1K_INPUT_TOKENS" | "PRICE_MICRO_USD_PER_1K_OUTPUT_TOKENS" | "MIN_RESERVE_MICRO_USD">,
   promptTokens = 0,
   completionTokens = 0
 ): bigint {

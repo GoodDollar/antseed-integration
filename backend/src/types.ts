@@ -15,12 +15,25 @@ export type ChatCompletionRequest = {
 export type CreditReservation = {
   requestId: string;
   account: string;
-  maxCostMicroUsd: bigint;
+  maxCostMicroUsd: string;
   status: "reserved" | "settled" | "released";
-  actualCostMicroUsd?: bigint;
+  actualCostMicroUsd?: string;
   providerReceiptHash?: string;
+  vaultReserveTxHash?: string;
+  vaultSettleTxHash?: string;
+  vaultReleaseTxHash?: string;
   createdAt: string;
   updatedAt: string;
+};
+
+export type UserCreditProfile = {
+  account: string;
+  createdAt: string;
+  updatedAt: string;
+  totalRequests: number;
+  totalReservedMicroUsd: string;
+  totalSettledMicroUsd: string;
+  lastRequestId?: string;
 };
 
 export type AntSeedChatCompletion = {
