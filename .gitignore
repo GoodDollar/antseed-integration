@@ -25,3 +25,4 @@ contracts/lib/
 .DS_Store
 coverage/
 node_modules
+node_modules/
