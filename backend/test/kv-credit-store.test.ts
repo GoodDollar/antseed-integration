@@ -64,9 +64,34 @@ test("KV store releases reserved credit back to available balance", async () => 
   assert.equal(user.reservedCreditMicroUsd, "0");
 });
 
+test("KV store keeps additional GoodID-root aggregate across connected wallets", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.updateStream("0xAAA", "0xROOT", 385802469136n, 1_000_000n);
+  const entry = await store.recordGdCredit({
+    account: "0xBBB",
+    rootAccount: "0xROOT",
+    source: "erc677",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    principalMicroUsd: 1_000_000n
+  });
+
+  assert.equal(entry.rootAccount, "0xroot");
+  assert.equal(entry.totalCreditMicroUsd, "1200000");
+
+  const walletProfile = await store.getUser("0xBBB");
+  const rootProfile = await store.getUser("0xROOT");
+  assert.equal(walletProfile.rootAccount, "0xroot");
+  assert.equal(walletProfile.creditBalanceMicroUsd, "1200000");
+  assert.equal(rootProfile.creditBalanceMicroUsd, "1200000");
+
+  const rootCredits = await store.getGdCredits("0xROOT");
+  assert.equal(rootCredits.length, 1);
+  assert.equal(rootCredits[0].account, "0xbbb");
+});
+
 test("KV store persists stream cap and G$ credit bonuses", async () => {
   const store = new KVCreditStore(new MemoryKV() as never);
-  await store.updateStream("0xABC", 385802469136n, 1_000_000n, undefined, "0xstream", 1);
+  await store.updateStream("0xABC", undefined, 385802469136n, 1_000_000n, undefined, "0xstream", 1);
 
   const first = await store.recordGdCredit({
     account: "0xABC",

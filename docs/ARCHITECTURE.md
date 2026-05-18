@@ -38,6 +38,7 @@ The backend is a Cloudflare Worker managed by Wrangler. It owns the operational 
 - reserves credit in the vault when configured
 - forwards the request to the AntSeed buyer proxy
 - verifies Celo vault transaction logs by `txHash` when `CELO_RPC_URL` and `CELO_VAULT_ADDRESS` are configured
+- resolves `getWhitelistedRoot(account)` when `CELO_GOODID_ADDRESS` is configured and writes an additional aggregate for the GoodID root wallet
 - records durable user/request/G$ credit state in Cloudflare KV
 - applies +10% regular credits and +20% streaming credits up to monthly stream-speed cap
 - settles actual cost in the vault
@@ -75,7 +76,7 @@ It can optionally set AntSeed pinning headers for peer/service selection. In pro
 
 The Worker binds `ANTSEED_KV` and persists:
 
-- `user:<account>` aggregate credit/request/G$ profile
+- `user:<account>` aggregate credit/request/G$ profile, written for both the sending wallet and the GoodID root wallet when they differ
 - `user-requests:<account>` bounded recent request ID list
 - `request:<requestId>` full reservation lifecycle including vault tx hashes and provider receipt hash
 - `user-gd-credits:<account>` bounded recent G$ credit entry list

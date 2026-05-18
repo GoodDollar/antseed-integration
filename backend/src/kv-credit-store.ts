@@ -14,26 +14,28 @@ const STREAM_BONUS_USED_PREFIX = "stream-bonus-used:";
 export class KVCreditStore {
   constructor(private readonly kv: KV) {}
 
-  async reserve(account: string, maxCostMicroUsd: bigint): Promise<CreditReservation> {
+  async reserve(account: string, maxCostMicroUsd: bigint, rootAccount?: string): Promise<CreditReservation> {
     const requestId = crypto.randomUUID();
     const now = new Date().toISOString();
     const reservation: CreditReservation = {
       requestId,
       account: normalizeAccount(account),
+      rootAccount: normalizeAccount(rootAccount ?? account),
       maxCostMicroUsd: maxCostMicroUsd.toString(),
       status: "reserved",
       createdAt: now,
       updatedAt: now
     };
 
-    const profile = await this.getUser(reservation.account);
+    const profile = await this.getUser(reservation.rootAccount!);
     if (BigInt(profile.creditBalanceMicroUsd) < maxCostMicroUsd) {
       throw new Error(`insufficient credit balance for ${reservation.account}`);
     }
 
     await this.putReservation(reservation);
     await this.addRequestToAccount(reservation.account, requestId);
-    await this.updateUser(reservation.account, (current) => ({
+    await this.addRequestToAccount(reservation.rootAccount!, requestId);
+    await this.updateUser(reservation.account, reservation.rootAccount, (current) => ({
       ...current,
       updatedAt: now,
       totalRequests: current.totalRequests + 1,
@@ -74,7 +76,7 @@ export class KVCreditStore {
     const refund = BigInt(reservation.maxCostMicroUsd) > actualCostMicroUsd
       ? BigInt(reservation.maxCostMicroUsd) - actualCostMicroUsd
       : 0n;
-    await this.updateUser(reservation.account, (profile) => ({
+    await this.updateUser(reservation.account, reservation.rootAccount, (profile) => ({
       ...profile,
       updatedAt: now,
       totalSettledMicroUsd: addDecimalStrings(profile.totalSettledMicroUsd, reservation.actualCostMicroUsd ?? "0"),
@@ -94,7 +96,7 @@ export class KVCreditStore {
     reservation.vaultReleaseTxHash = vaultReleaseTxHash;
     reservation.updatedAt = now;
     await this.putReservation(reservation);
-    await this.updateUser(reservation.account, (profile) => ({
+    await this.updateUser(reservation.account, reservation.rootAccount, (profile) => ({
       ...profile,
       updatedAt: now,
       reservedCreditMicroUsd: subtractDecimalStrings(profile.reservedCreditMicroUsd, reservation.maxCostMicroUsd),
@@ -105,6 +107,7 @@ export class KVCreditStore {
 
   async updateStream(
     account: string,
+    rootAccount: string | undefined,
     flowRateWeiPerSecond: bigint,
     gdMicroUsdPerToken: bigint,
     monthlyGdAmountWei?: bigint,
@@ -112,11 +115,13 @@ export class KVCreditStore {
     logIndex?: number
   ): Promise<StreamState> {
     const normalized = normalizeAccount(account);
+    const normalizedRoot = normalizeAccount(rootAccount ?? account);
     const monthlyGd = monthlyGdAmountWei ?? flowRateWeiPerSecond * BigInt(30 * 24 * 60 * 60);
     const monthlyUsd = monthlyStreamMicroUsd(flowRateWeiPerSecond, gdMicroUsdPerToken);
     const now = new Date().toISOString();
     const state: StreamState = {
       account: normalized,
+      rootAccount: normalizedRoot,
       flowRateWeiPerSecond: flowRateWeiPerSecond.toString(),
       monthlyGdAmountWei: monthlyGd.toString(),
       monthlyMicroUsd: monthlyUsd.toString(),
@@ -125,7 +130,8 @@ export class KVCreditStore {
       updatedAt: now
     };
     await this.putJson(`${STREAM_PREFIX}${normalized}`, state);
-    await this.updateUser(normalized, (profile) => ({
+    await this.putJson(`${STREAM_PREFIX}${normalizedRoot}`, state);
+    await this.updateUser(normalized, normalizedRoot, (profile) => ({
       ...profile,
       updatedAt: now,
       streamFlowRateWeiPerSecond: state.flowRateWeiPerSecond,
@@ -136,6 +142,7 @@ export class KVCreditStore {
 
   async recordGdCredit(input: {
     account: string;
+    rootAccount?: string;
     source: GdCreditEntry["source"];
     gdAmountWei: bigint;
     principalMicroUsd: bigint;
@@ -144,9 +151,10 @@ export class KVCreditStore {
     date?: Date;
   }): Promise<GdCreditEntry> {
     const account = normalizeAccount(input.account);
+    const rootAccount = normalizeAccount(input.rootAccount ?? input.account);
     const month = monthKey(input.date ?? new Date());
-    const usedKey = `${STREAM_BONUS_USED_PREFIX}${account}:${month}`;
-    const profile = await this.getUser(account);
+    const usedKey = `${STREAM_BONUS_USED_PREFIX}${rootAccount}:${month}`;
+    const profile = await this.getUser(rootAccount);
     const used = BigInt((await this.kv.get(usedKey)) ?? "0");
     const bonus = calculateCreditWithBonus({
       principalMicroUsd: input.principalMicroUsd,
@@ -158,6 +166,7 @@ export class KVCreditStore {
     const entry: GdCreditEntry = {
       id: crypto.randomUUID(),
       account,
+      rootAccount,
       source: input.source,
       gdAmountWei: input.gdAmountWei.toString(),
       principalMicroUsd: bonus.principalMicroUsd.toString(),
@@ -173,8 +182,9 @@ export class KVCreditStore {
 
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
     await this.addGdCreditToAccount(account, entry.id);
+    await this.addGdCreditToAccount(rootAccount, entry.id);
     await this.kv.put(usedKey, (used + bonus.streamingBonusPrincipalAppliedMicroUsd).toString());
-    await this.updateUser(account, (current) => ({
+    await this.updateUser(account, rootAccount, (current) => ({
       ...current,
       updatedAt: now,
       totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
@@ -236,9 +246,18 @@ export class KVCreditStore {
     await this.putJson(key, ids.slice(-500));
   }
 
-  private async updateUser(account: string, mutate: (profile: UserCreditProfile) => UserCreditProfile): Promise<void> {
-    const current = await this.getUser(account);
-    await this.putJson(`${USER_PREFIX}${current.account}`, mutate(current));
+  private async updateUser(account: string, rootAccount: string | undefined, mutate: (profile: UserCreditProfile) => UserCreditProfile): Promise<void> {
+    const normalized = normalizeAccount(account);
+    const normalizedRoot = normalizeAccount(rootAccount ?? account);
+    const current = await this.getUser(normalized);
+    const next = mutate({ ...current, rootAccount: normalizedRoot });
+    await this.putJson(`${USER_PREFIX}${normalized}`, next);
+
+    if (normalizedRoot !== normalized) {
+      const rootCurrent = await this.getUser(normalizedRoot);
+      const rootNext = mutate({ ...rootCurrent, account: normalizedRoot, rootAccount: normalizedRoot });
+      await this.putJson(`${USER_PREFIX}${normalizedRoot}`, rootNext);
+    }
   }
 
   private async getJson<T>(key: string): Promise<T | undefined> {
@@ -255,6 +274,7 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
   const createdAt = saved?.createdAt ?? new Date().toISOString();
   return {
     account,
+    rootAccount: saved?.rootAccount ?? account,
     createdAt,
     updatedAt: saved?.updatedAt ?? createdAt,
     totalRequests: saved?.totalRequests ?? 0,

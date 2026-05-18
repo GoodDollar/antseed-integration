@@ -29,7 +29,7 @@ docs/                 Architecture and operations notes
 
 1. A GoodID-verified user deposits G$ into `CeloGdAntSeedVault` on Celo, either with ERC677/ERC667 `transferAndCall`, ERC777 `tokensReceived`, or classic ERC-20 `deposit`.
 2. A GoodID-verified user can also stream G$ to the vault through Superfluid; the vault reacts to SuperApp stream callbacks and emits stream-cap events.
-3. The Worker verifies Celo vault logs, persists user data in KV, and issues USDC-denominated AntSeed credits.
+3. The Worker verifies Celo vault logs, resolves the GoodID root with `getWhitelistedRoot(account)`, persists wallet-level and root-level user data in KV, and issues USDC-denominated AntSeed credits.
 4. Standard deposits receive +10% credits. Streaming users receive +20% on principal up to their monthly stream speed; amounts above that cap receive the regular +10%.
 5. The Worker reserves/settles AntSeed request costs and forwards requests to the AntSeed buyer proxy (`/v1/chat/completions`).
 

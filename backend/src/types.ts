@@ -15,6 +15,7 @@ export type ChatCompletionRequest = {
 export type CreditReservation = {
   requestId: string;
   account: string;
+  rootAccount?: string;
   maxCostMicroUsd: string;
   status: "reserved" | "settled" | "released";
   actualCostMicroUsd?: string;
@@ -28,6 +29,7 @@ export type CreditReservation = {
 
 export type UserCreditProfile = {
   account: string;
+  rootAccount: string;
   createdAt: string;
   updatedAt: string;
   totalRequests: number;
@@ -48,6 +50,7 @@ export type UserCreditProfile = {
 export type GdCreditEntry = {
   id: string;
   account: string;
+  rootAccount: string;
   source: "erc677" | "erc777" | "erc20" | "stream" | "manual";
   gdAmountWei: string;
   principalMicroUsd: string;
@@ -63,6 +66,7 @@ export type GdCreditEntry = {
 
 export type StreamState = {
   account: string;
+  rootAccount: string;
   flowRateWeiPerSecond: string;
   monthlyGdAmountWei: string;
   monthlyMicroUsd: string;

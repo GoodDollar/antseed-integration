@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { encodeVaultEventLog, parseCeloVaultLogs } from "../src/celo-events.js";
+import { Interface } from "ethers";
+import { encodeVaultEventLog, fetchGoodIdRoot, parseCeloVaultLogs } from "../src/celo-events.js";
 
 const vault = "0x0000000000000000000000000000000000000abc";
 const account = "0x0000000000000000000000000000000000000def";
@@ -17,6 +18,40 @@ test("parses verified Celo vault GdDeposited logs into credit principal", () => 
     assert.equal(events[0].gdAmountWei, 2_000_000_000_000_000_000n);
     assert.equal(events[0].principalMicroUsd, 2_000_000n);
     assert.equal(events[0].logIndex, 7);
+  }
+});
+
+test("fetches GoodID root with eth_call for root aggregation", async () => {
+  const goodId = new Interface(["function getWhitelistedRoot(address) view returns (address)"]);
+  const root = "0x0000000000000000000000000000000000000aaa";
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    assert.equal(body.method, "eth_call");
+    return Response.json({
+      jsonrpc: "2.0",
+      id: body.id,
+      result: goodId.encodeFunctionResult("getWhitelistedRoot", [root])
+    });
+  }) as typeof fetch;
+
+  try {
+    const fetchedRoot = await fetchGoodIdRoot(account, {
+      ANTSEED_BASE_URL: "http://localhost",
+      ANTSEED_MODEL: "test",
+      ANTSEED_TIMEOUT_MS: 1000,
+      PRICE_MICRO_USD_PER_1K_INPUT_TOKENS: 1n,
+      PRICE_MICRO_USD_PER_1K_OUTPUT_TOKENS: 1n,
+      DEFAULT_MAX_OUTPUT_TOKENS: 1,
+      MIN_RESERVE_MICRO_USD: 1n,
+      CREDIT_TOKEN_DECIMALS: 6,
+      GD_MICRO_USD_PER_TOKEN: 1_000_000n,
+      CELO_RPC_URL: "https://celo.example",
+      CELO_GOODID_ADDRESS: "0x0000000000000000000000000000000000000abc"
+    });
+    assert.equal(fetchedRoot, root);
+  } finally {
+    globalThis.fetch = previousFetch;
   }
 });
 

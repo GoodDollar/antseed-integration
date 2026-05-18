@@ -14,7 +14,7 @@ Cloudflare Worker for GoodDollar AntSeed credit/accounting and buyer proxy integ
 
 KV stores long-term user and request data:
 
-- `user:<account>` — aggregate user credit profile, G$ credits, and stream cap
+- `user:<account>` — aggregate user credit profile, G$ credits, and stream cap; written for both wallet and GoodID root when different
 - `user-requests:<account>` — recent AntSeed request IDs for the account
 - `request:<requestId>` — reservation lifecycle, provider receipt, and vault tx hashes
 - `user-gd-credits:<account>` — recent G$ credit-entry IDs
@@ -66,6 +66,7 @@ wrangler secret put ANTSEED_PIN_PEER
 wrangler secret put ANTSEED_PIN_SERVICE
 wrangler secret put CELO_RPC_URL
 wrangler secret put CELO_VAULT_ADDRESS
+wrangler secret put CELO_GOODID_ADDRESS
 ```
 
 Important: a deployed Cloudflare Worker cannot call `127.0.0.1` on the GoodClaw host. `ANTSEED_BASE_URL` must point to a publicly reachable AntSeed buyer gateway for production.
@@ -75,4 +76,5 @@ Important: a deployed Cloudflare Worker cannot call `127.0.0.1` on the GoodClaw 
 - Non-streaming G$ deposits receive 110% USDC-denominated AntSeed credits.
 - Active streamers receive 120% credits only up to their monthly stream-speed cap.
 - Any deposit principal above the monthly stream cap receives the regular 110% credits.
+- Worker records are aggregated by wallet address and also by GoodID root address from `getWhitelistedRoot(account)`.
 - Example: a user streaming `$1/month` can receive at most `$1.20` credits for `$1` of monthly streamed/deposited principal; additional principal receives `$1.10` per `$1`.

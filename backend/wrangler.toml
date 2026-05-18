@@ -19,7 +19,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = "1024"
 MIN_RESERVE_MICRO_USD = "1000"
 CREDIT_TOKEN_DECIMALS = "6"
 GD_MICRO_USD_PER_TOKEN = "1000000"
-# CELO_RPC_URL and CELO_VAULT_ADDRESS should be set for verified tx-log ingestion.
+# CELO_RPC_URL, CELO_VAULT_ADDRESS, and CELO_GOODID_ADDRESS should be set for verified tx-log ingestion and GoodID-root aggregation.
 
 [[kv_namespaces]]
 binding = "ANTSEED_KV"

@@ -140,6 +140,36 @@ contract CeloGdAntSeedVault {
         _recordTokenCallbackDeposit(from, operator, amount, userData);
     }
 
+    function beforeAgreementCreated(
+        address,
+        address,
+        bytes32,
+        bytes calldata,
+        bytes calldata ctx
+    ) external view onlySuperfluidHost returns (bytes memory cbdata) {
+        return ctx;
+    }
+
+    function beforeAgreementUpdated(
+        address,
+        address,
+        bytes32,
+        bytes calldata,
+        bytes calldata ctx
+    ) external view onlySuperfluidHost returns (bytes memory cbdata) {
+        return ctx;
+    }
+
+    function beforeAgreementTerminated(
+        address,
+        address,
+        bytes32,
+        bytes calldata,
+        bytes calldata ctx
+    ) external view onlySuperfluidHost returns (bytes memory cbdata) {
+        return ctx;
+    }
+
     function afterAgreementCreated(
         address superToken,
         address agreementClass,

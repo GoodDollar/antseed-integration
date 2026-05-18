@@ -68,6 +68,11 @@ contract MockGoodID {
         roots[account] = value ? account : address(0);
     }
 
+    function setRoot(address account, address root) external {
+        whitelisted[account] = root != address(0);
+        roots[account] = root;
+    }
+
     function isWhitelisted(address account) external view returns (bool) {
         return whitelisted[account];
     }
@@ -86,6 +91,56 @@ contract MockCFA {
 
     function getFlow(address, address sender, address) external view returns (uint256, int96, uint256, uint256) {
         return (block.timestamp, flowRates[sender], 0, 0);
+    }
+}
+
+contract MockSuperfluidHost {
+    MockCFA public cfa;
+    address public registeredApp;
+    uint256 public registeredConfigWord;
+
+    constructor(MockCFA cfa_) {
+        cfa = cfa_;
+    }
+
+    function registerApp(uint256 configWord) external {
+        registeredApp = msg.sender;
+        registeredConfigWord = configWord;
+    }
+
+    function createFlow(CeloGdAntSeedVault vault, address superToken, address sender, int96 flowRate, bytes calldata ctx)
+        external
+        returns (bytes memory)
+    {
+        cfa.setFlow(sender, flowRate);
+        bytes memory cbdata = vault.beforeAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        return vault.afterAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
+    }
+
+    function updateFlow(CeloGdAntSeedVault vault, address superToken, address sender, int96 flowRate, bytes calldata ctx)
+        external
+        returns (bytes memory)
+    {
+        cfa.setFlow(sender, flowRate);
+        bytes memory cbdata = vault.beforeAgreementUpdated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        return vault.afterAgreementUpdated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
+    }
+
+    function terminateFlow(CeloGdAntSeedVault vault, address superToken, address sender, bytes calldata ctx)
+        external
+        returns (bytes memory)
+    {
+        cfa.setFlow(sender, 0);
+        bytes memory cbdata = vault.beforeAgreementTerminated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        return vault.afterAgreementTerminated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
+    }
+
+    function createFlowWrongReceiver(CeloGdAntSeedVault vault, address superToken, address sender, address receiver, int96 flowRate)
+        external
+        returns (bytes memory)
+    {
+        cfa.setFlow(sender, flowRate);
+        return vault.afterAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, receiver), "", "");
     }
 }
 
@@ -130,7 +185,7 @@ contract CeloGdAntSeedVaultTest {
     MockGdToken superToken;
     MockGoodID goodId;
     MockCFA cfa;
-    HostProxy host;
+    MockSuperfluidHost host;
     CeloGdAntSeedVault vault;
     UserProxy user;
 
@@ -139,7 +194,7 @@ contract CeloGdAntSeedVaultTest {
         superToken = new MockGdToken();
         goodId = new MockGoodID();
         cfa = new MockCFA();
-        host = new HostProxy();
+        host = new MockSuperfluidHost(cfa);
         vault = new CeloGdAntSeedVault(address(token), address(superToken), address(goodId), address(host), address(cfa));
         user = new UserProxy(token, vault);
         goodId.setWhitelisted(address(user), true);
@@ -176,30 +231,116 @@ contract CeloGdAntSeedVaultTest {
         require(!ok, "unverified deposit rejected");
     }
 
-    function testSuperfluidCallbacksRecordMonthlyStreamForVerifiedUser() public {
+    function testGoodIdRootAlsoVerifiesConnectedWallet() public {
         setUp();
+        address root = address(0xA11CE);
+        goodId.setRoot(address(user), root);
+        user.transferAndCall(5 ether);
+        require(vault.totalDepositedGd(address(user)) == 5 ether, "root verified deposit recorded");
+    }
+
+    function testRegisterSuperAppCallsConfiguredHost() public {
+        setUp();
+        vault.registerSuperApp(12345);
+        require(host.registeredApp() == address(vault), "registered app");
+        require(host.registeredConfigWord() == 12345, "config word");
+    }
+
+    function testOnlySuperfluidHostCanCallCallbacks() public {
+        setUp();
+        (bool ok,) = address(vault).call(abi.encodeWithSignature(
+            "afterAgreementCreated(address,address,bytes32,bytes,bytes,bytes)",
+            address(superToken),
+            address(cfa),
+            bytes32(0),
+            abi.encode(address(user), address(vault)),
+            "",
+            ""
+        ));
+        require(!ok, "non-host callback rejected");
+    }
+
+    function testSuperAppCreateUpdateTerminateStreamLifecycleAndPreservesCtx() public {
+        setUp();
+        bytes memory ctx = hex"123456";
         int96 flowRate = 38580246913580; // ~100 G$ / 30 days at 18 decimals
-        cfa.setFlow(address(user), flowRate);
-        host.created(vault, address(superToken), address(cfa), address(user));
+        bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), flowRate, ctx);
+        require(keccak256(returnedCtx) == keccak256(ctx), "create ctx preserved");
         require(vault.streamFlowRate(address(user)) == flowRate, "flow recorded");
         require(vault.streamMonthlyGdAmount(address(user)) == uint256(uint96(flowRate)) * 30 days, "monthly amount recorded");
+
+        int96 updatedFlowRate = flowRate * 2;
+        returnedCtx = host.updateFlow(vault, address(superToken), address(user), updatedFlowRate, ctx);
+        require(keccak256(returnedCtx) == keccak256(ctx), "update ctx preserved");
+        require(vault.streamFlowRate(address(user)) == updatedFlowRate, "updated flow recorded");
+
+        goodId.setWhitelisted(address(user), false);
+        returnedCtx = host.terminateFlow(vault, address(superToken), address(user), ctx);
+        require(keccak256(returnedCtx) == keccak256(ctx), "termination ctx preserved");
+        require(vault.streamFlowRate(address(user)) == 0, "termination cleared flow");
+        require(vault.streamMonthlyGdAmount(address(user)) == 0, "termination cleared monthly amount");
+    }
+
+    function testSuperAppRejectsWrongTokenAgreementReceiverAndNegativeFlow() public {
+        setUp();
+        (bool ok,) = address(host).call(abi.encodeWithSignature(
+            "createFlow(address,address,address,int96,bytes)",
+            address(vault),
+            address(token),
+            address(user),
+            int96(1),
+            ""
+        ));
+        require(!ok, "wrong token rejected");
+
+        MockCFA otherCfa = new MockCFA();
+        vault.setSuperfluidConfig(address(host), address(otherCfa));
+        (ok,) = address(host).call(abi.encodeWithSignature(
+            "createFlow(address,address,address,int96,bytes)",
+            address(vault),
+            address(superToken),
+            address(user),
+            int96(1),
+            ""
+        ));
+        require(!ok, "wrong agreement rejected");
+
+        vault.setSuperfluidConfig(address(host), address(cfa));
+        (ok,) = address(host).call(abi.encodeWithSignature(
+            "createFlowWrongReceiver(address,address,address,address,int96)",
+            address(vault),
+            address(superToken),
+            address(user),
+            address(0xBEEF),
+            int96(1)
+        ));
+        require(!ok, "wrong receiver rejected");
+
+        (ok,) = address(host).call(abi.encodeWithSignature(
+            "createFlow(address,address,address,int96,bytes)",
+            address(vault),
+            address(superToken),
+            address(user),
+            int96(-1),
+            ""
+        ));
+        require(!ok, "negative flow rejected");
     }
 
     function testSuperfluidCreateRequiresGoodIDButTerminationCanClear() public {
         setUp();
-        cfa.setFlow(address(user), 10);
         goodId.setWhitelisted(address(user), false);
         (bool ok,) = address(host).call(abi.encodeWithSignature(
-            "created(address,address,address,address)",
+            "createFlow(address,address,address,int96,bytes)",
             address(vault),
             address(superToken),
-            address(cfa),
-            address(user)
+            address(user),
+            int96(10),
+            ""
         ));
         require(!ok, "unverified stream create rejected");
 
-        cfa.setFlow(address(user), 0);
-        host.terminated(vault, address(superToken), address(cfa), address(user));
+        host.terminateFlow(vault, address(superToken), address(user), "");
         require(vault.streamFlowRate(address(user)) == 0, "termination allowed");
     }
 }

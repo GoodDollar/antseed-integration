@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { AntSeedClient, providerReceiptHash } from "./antseed-client.js";
-import { fetchCeloVaultEvents } from "./celo-events.js";
+import { fetchCeloVaultEvents, fetchGoodIdRoot } from "./celo-events.js";
 import { gdWeiToMicroUsd } from "./credit-bonus.js";
 import { configFromEnv, Env } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
@@ -23,6 +23,7 @@ const QuoteSchema = ChatSchema.pick({ messages: true, max_tokens: true });
 const CeloTxSchema = z.object({ txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/) });
 const ManualGdCreditSchema = z.object({
   account: z.string().min(1),
+  rootAccount: z.string().min(1).optional(),
   gdAmountWei: z.string().regex(/^\d+$/),
   source: z.enum(["erc677", "erc777", "erc20", "stream", "manual"]).default("manual"),
   txHash: z.string().optional(),
@@ -30,6 +31,7 @@ const ManualGdCreditSchema = z.object({
 });
 const StreamUpdateSchema = z.object({
   account: z.string().min(1),
+  rootAccount: z.string().min(1).optional(),
   flowRateWeiPerSecond: z.string().regex(/^\d+$/),
   monthlyGdAmountWei: z.string().regex(/^\d+$/).optional(),
   txHash: z.string().optional(),
@@ -96,9 +98,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const events = await fetchCeloVaultEvents(parsed.data.txHash, cfg);
     const recorded = [];
     for (const event of events) {
+      const rootAccount = await fetchGoodIdRoot(event.account, cfg);
       if (event.kind === "deposit") {
         recorded.push(await store.recordGdCredit({
           account: event.account,
+          rootAccount,
           source: "erc677",
           gdAmountWei: event.gdAmountWei,
           principalMicroUsd: event.principalMicroUsd,
@@ -108,6 +112,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       } else {
         recorded.push(await store.updateStream(
           event.account,
+          rootAccount,
           event.flowRateWeiPerSecond,
           cfg.GD_MICRO_USD_PER_TOKEN,
           event.monthlyGdAmountWei,
@@ -125,8 +130,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
     const gdAmountWei = BigInt(parsed.data.gdAmountWei);
     const principalMicroUsd = gdWeiToMicroUsd(gdAmountWei, cfg.GD_MICRO_USD_PER_TOKEN);
+    const rootAccount = parsed.data.rootAccount ?? await fetchGoodIdRoot(parsed.data.account, cfg);
     const entry = await store.recordGdCredit({
       account: parsed.data.account,
+      rootAccount,
       source: parsed.data.source,
       gdAmountWei,
       principalMicroUsd,
@@ -140,8 +147,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const body = await parseJson(request);
     const parsed = StreamUpdateSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const rootAccount = parsed.data.rootAccount ?? await fetchGoodIdRoot(parsed.data.account, cfg);
     const state = await store.updateStream(
       parsed.data.account,
+      rootAccount,
       BigInt(parsed.data.flowRateWeiPerSecond),
       cfg.GD_MICRO_USD_PER_TOKEN,
       parsed.data.monthlyGdAmountWei ? BigInt(parsed.data.monthlyGdAmountWei) : undefined,
@@ -157,8 +166,9 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
 
     const chatRequest = parsed.data;
+    const rootAccount = await fetchGoodIdRoot(chatRequest.account, cfg);
     const maxCostMicroUsd = estimateMaxCostMicroUsd(cfg, chatRequest.messages, chatRequest.max_tokens);
-    const reservation = await store.reserve(chatRequest.account, maxCostMicroUsd);
+    const reservation = await store.reserve(chatRequest.account, maxCostMicroUsd, rootAccount);
 
     try {
       const vaultReserveTxHash = await vault.reserve(reservation.requestId, reservation.account, maxCostMicroUsd, chatRequest.metadata);

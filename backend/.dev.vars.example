@@ -10,6 +10,7 @@ CREDIT_TOKEN_DECIMALS=6
 GD_MICRO_USD_PER_TOKEN=1000000
 # CELO_RPC_URL=https://forno.celo.org
 # CELO_VAULT_ADDRESS=0x...
+# CELO_GOODID_ADDRESS=0x...
 
 # Optional on-chain AntSeed credit vault integration
 # RPC_URL=http://127.0.0.1:8545

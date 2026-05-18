@@ -1,10 +1,14 @@
-import { Interface, LogDescription, getAddress } from "ethers";
+import { Interface, LogDescription, getAddress, isAddress } from "ethers";
 import { RuntimeConfig } from "./env.js";
 import { gdWeiToMicroUsd } from "./credit-bonus.js";
 
 const VAULT_EVENTS = new Interface([
   "event GdDeposited(address indexed account,address indexed payer,uint256 gdAmount,bytes data)",
   "event StreamUpdated(address indexed account,int96 flowRate,uint256 monthlyGdAmountWei)"
+]);
+
+const GOODID_ABI = new Interface([
+  "function getWhitelistedRoot(address account) view returns (address)"
 ]);
 
 export type ParsedCeloVaultEvent =
@@ -25,6 +29,18 @@ export type ParsedCeloVaultEvent =
       txHash: string;
       logIndex: number;
     };
+
+export async function fetchGoodIdRoot(account: string, cfg: RuntimeConfig): Promise<string> {
+  if (!cfg.CELO_RPC_URL || !cfg.CELO_GOODID_ADDRESS) return normalizeAccount(account);
+  const data = GOODID_ABI.encodeFunctionData("getWhitelistedRoot", [account]);
+  const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: cfg.CELO_GOODID_ADDRESS, data }, "latest"]);
+  if (!result || result === "0x") return normalizeAccount(account);
+  const [root] = GOODID_ABI.decodeFunctionResult("getWhitelistedRoot", result);
+  const rootString = String(root);
+  return isAddress(rootString) && rootString !== "0x0000000000000000000000000000000000000000"
+    ? normalizeAccount(rootString)
+    : normalizeAccount(account);
+}
 
 export async function fetchCeloVaultEvents(txHash: string, cfg: RuntimeConfig): Promise<ParsedCeloVaultEvent[]> {
   if (!cfg.CELO_RPC_URL) throw new Error("CELO_RPC_URL is required to verify Celo vault events");
@@ -97,6 +113,10 @@ type RpcLog = {
   transactionHash: string;
   logIndex: string | number;
 };
+
+function normalizeAccount(account: string): string {
+  return getAddress(account).toLowerCase();
+}
 
 async function rpc<T>(url: string, method: string, params: unknown[]): Promise<T> {
   const res = await fetch(url, {
