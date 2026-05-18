@@ -4,7 +4,7 @@ Cloudflare Worker for GoodDollar AntSeed credit/accounting and buyer proxy integ
 
 ## Runtime
 
-- Wrangler Cloudflare Worker (`src/worker.ts`)
+- Wrangler Cloudflare Worker (`src/worker.ts`) only; all backend/API logic belongs in this Worker runtime, with no standalone Node HTTP server entrypoint
 - KV namespace binding: `ANTSEED_KV`
 - Optional on-chain `AgentCreditVault` integration through `ethers` with `nodejs_compat`
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates

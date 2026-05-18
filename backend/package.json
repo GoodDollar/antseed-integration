@@ -10,7 +10,8 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "lint": "npm run typecheck"
+    "check:worker-only": "node scripts/check-worker-only.mjs",
+    "lint": "npm run typecheck && npm run check:worker-only"
   },
   "dependencies": {
     "ethers": "^6.13.5",

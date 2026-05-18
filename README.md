@@ -6,7 +6,7 @@ This repository is intentionally separate from GoodDollar L2. It contains only:
 
 - an on-chain credit vault contract for prepaid/reserved AI compute credits
 - a Celo G$ vault that accepts ERC677/ERC667, ERC777, and Superfluid stream callbacks
-- a Cloudflare Worker backend credit/accounting service
+- a Cloudflare Worker/Wrangler backend credit/accounting service; all API/backend logic belongs in the Worker runtime, with no standalone Node HTTP server
 - KV-backed long-term persistence for user/request/G$ credit data
 - an AntSeed buyer/proxy integration using the OpenAI-compatible API exposed by an AntSeed buyer gateway
 
