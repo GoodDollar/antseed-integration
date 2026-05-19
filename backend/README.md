@@ -6,9 +6,10 @@ Cloudflare Worker for GoodDollar AntSeed credit/accounting and buyer proxy integ
 
 - Wrangler Cloudflare Worker (`src/worker.ts`) only; all backend/API logic belongs in this Worker runtime, with no standalone Node HTTP server entrypoint
 - KV namespace binding: `ANTSEED_KV`
-- Optional on-chain `AgentCreditVault` integration through `ethers` with `nodejs_compat`
+- Optional on-chain `AgentCreditVault` integration through `ethers` with `nodejs_compat` for account-level reservation/settlement accounting only; it is not the AntSeed payment rail
+- Optional backend-controlled Base USDC funding vault (`BaseUsdcAntSeedVault`) that approves AntSeed's deposits contract and calls `deposit(backendBuyer, amount)` before forwarding paid requests
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
-- GoodDollar backend payment proxy via OpenAI-compatible `POST /v1/chat/completions`: developer tools call this Worker with a signed `gd_live_...` API key, the Worker maps the key to a verified wallet/GoodID root, reserves/deducts GoodDollar credits, and forwards to the AntSeed buyer gateway. The current upstream payment path is the AntSeed deposits contract plus buyer-signed EIP-712 reserve/settle authorization.
+- GoodDollar backend payment proxy via OpenAI-compatible `POST /v1/chat/completions`: developer tools call this Worker with a signed `gd_live_...` API key, the Worker maps the key to a verified wallet/GoodID root, reserves/deducts GoodDollar credits, ensures the backend AntSeed buyer has enough USDC deposit capacity, and forwards to the AntSeed buyer gateway. The current upstream payment path is the AntSeed deposits contract plus buyer-signed EIP-712 reserve/settle authorization.
 
 ## Persistent KV data
 
@@ -74,6 +75,10 @@ wrangler secret put VAULT_ADDRESS
 wrangler secret put OPERATOR_PRIVATE_KEY
 wrangler secret put ANTSEED_PIN_PEER
 wrangler secret put ANTSEED_PIN_SERVICE
+wrangler secret put ANTSEED_FUNDING_RPC_URL
+wrangler secret put ANTSEED_FUNDING_VAULT_ADDRESS
+wrangler secret put ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY
+wrangler secret put ANTSEED_MIN_BUYER_DEPOSIT_MICRO_USD
 wrangler secret put CELO_RPC_URL
 wrangler secret put CELO_VAULT_ADDRESS
 wrangler secret put CELO_GOODID_ADDRESS
@@ -95,6 +100,13 @@ Important: a deployed Cloudflare Worker cannot call `127.0.0.1` on the GoodClaw 
 
 ## Payment boundary
 
-Today, usage is funded from deposit-backed AntSeed buyer flow. The Worker verifies the user/API key and manages GoodDollar credits, then forwards the request to the configured buyer gateway. The buyer/deposits layer handles the buyer-signed EIP-712 authorization that reserves/settles against the AntSeed deposits contract.
+`AgentCreditVault` does not approve or pay AntSeed. It only reserves/settles account credits when enabled.
+
+The concrete AntSeed funding path is:
+
+1. `src/worker.ts` calls `AntSeedFundingVaultClient.ensureBuyerBalance(maxCostMicroUsd)` before forwarding to the buyer gateway.
+2. `src/antseed-funding-vault.ts` calls `BaseUsdcAntSeedVault.fundAntSeedDeposit(topUp)` when the backend AntSeed buyer deposit is below the required request reserve.
+3. `contracts/src/BaseUsdcAntSeedVault.sol` executes `_safeApprove(antSeedDeposits, amount)` and `antSeedDeposits.deposit(antSeedBuyer, amount)`, moving Base USDC from the backend-controlled vault into AntSeed's deposits contract for the backend buyer address.
+4. The configured AntSeed buyer gateway then handles buyer-signed EIP-712 authorization and seller settlement from that backend buyer deposit.
 
 Future payment sources — sponsorships, team budgets, delegated allowances, subscriptions, or direct GoodDollar balance routing — should be added as adapters above this current deposit/EIP-712 layer.

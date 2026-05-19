@@ -62,7 +62,7 @@ test("config status documents signed API-key backend proxy flow", async () => {
   assert.equal(res.status, 200);
   const body = await res.json() as {
     openAiCompatible: { chatCompletionsPath: string; auth: string; accountSelectors: string[]; devOnlyAccountSelectorsEnabled: boolean };
-    antseed: { model: string; baseUrlConfigured: boolean };
+    antseed: { model: string; baseUrlConfigured: boolean; fundingVaultEnabled: boolean; fundingModel: string };
   };
   assert.equal(body.openAiCompatible.chatCompletionsPath, "/v1/chat/completions");
   assert.equal(body.openAiCompatible.accountSelectors.includes("Authorization: Bearer gd_live_..."), true);
@@ -70,6 +70,8 @@ test("config status documents signed API-key backend proxy flow", async () => {
   assert.match(body.openAiCompatible.auth, /signed wallet/);
   assert.equal(body.antseed.model, "qwen3-235b-instruct");
   assert.equal(body.antseed.baseUrlConfigured, true);
+  assert.equal(body.antseed.fundingVaultEnabled, false);
+  assert.match(body.antseed.fundingModel, /backend-controlled Base USDC vault/);
 });
 
 test("wallet signature issues API key and imposter signature is rejected", async () => {
@@ -171,11 +173,13 @@ test("chat completions reserve GoodDollar credits, call AntSeed through backend,
     }), testEnv, {} as ExecutionContext);
 
     assert.equal(chatRes.status, 200);
-    const chat = await chatRes.json() as { choices: unknown[]; credit: { settledMicroUsd: string; vaultEnabled: boolean } };
+    const chat = await chatRes.json() as { choices: unknown[]; credit: { settledMicroUsd: string; vaultEnabled: boolean; antseedFunding: { enabled: boolean; requiredMicroUsd: string } } };
     assert.equal(antseedCalled, true);
     assert.equal(chat.choices.length, 1);
     assert.equal(chat.credit.settledMicroUsd, "35");
     assert.equal(chat.credit.vaultEnabled, false);
+    assert.equal(chat.credit.antseedFunding.enabled, false);
+    assert.equal(chat.credit.antseedFunding.requiredMicroUsd, "1000");
 
     const profileRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${wallet.address}/credit`), testEnv, {} as ExecutionContext);
     const profile = await profileRes.json() as { profile: { totalRequests: number; totalSettledMicroUsd: string; creditBalanceMicroUsd: string } };

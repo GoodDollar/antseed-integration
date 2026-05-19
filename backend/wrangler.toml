@@ -4,9 +4,12 @@ compatibility_date = "2026-05-18"
 compatibility_flags = ["nodejs_compat"]
 
 # Production values should be set with wrangler secret for sensitive fields:
-#   wrangler secret put RPC_URL
-#   wrangler secret put VAULT_ADDRESS
-#   wrangler secret put OPERATOR_PRIVATE_KEY
+#   wrangler secret put RPC_URL                      # optional AgentCreditVault accounting only
+#   wrangler secret put VAULT_ADDRESS                # optional AgentCreditVault accounting only
+#   wrangler secret put OPERATOR_PRIVATE_KEY         # optional AgentCreditVault accounting only
+#   wrangler secret put ANTSEED_FUNDING_RPC_URL
+#   wrangler secret put ANTSEED_FUNDING_VAULT_ADDRESS
+#   wrangler secret put ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY
 #   wrangler secret put ANTSEED_PIN_PEER
 #   wrangler secret put ANTSEED_PIN_SERVICE
 [vars]

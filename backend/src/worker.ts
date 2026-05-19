@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { AntSeedClient, providerReceiptHash } from "./antseed-client.js";
+import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
 import { AuthStore, bearerToken } from "./auth-store.js";
 import { fetchCeloVaultEvents, fetchGoodIdRoot } from "./celo-events.js";
 import { gdWeiToMicroUsd } from "./credit-bonus.js";
@@ -69,6 +70,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const store = new KVCreditStore(env.ANTSEED_KV);
   const authStore = new AuthStore(env.ANTSEED_KV);
   const antseed = new AntSeedClient(cfg);
+  const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
   const vault = new VaultClient(cfg);
 
   if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
@@ -102,7 +104,9 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         model: cfg.ANTSEED_MODEL,
         baseUrlConfigured: Boolean(env.ANTSEED_BASE_URL),
         pinPeerConfigured: Boolean(env.ANTSEED_PIN_PEER),
-        pinServiceConfigured: Boolean(env.ANTSEED_PIN_SERVICE)
+        pinServiceConfigured: Boolean(env.ANTSEED_PIN_SERVICE),
+        fundingVaultEnabled: antseedFundingVault.enabled,
+        fundingModel: "backend-controlled Base USDC vault funds one backend AntSeed buyer deposit; user G$ credits remain internal accounting"
       },
       celo: {
         rpcConfigured: Boolean(env.CELO_RPC_URL),
@@ -292,6 +296,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       const vaultReserveTxHash = await vault.reserve(reservation.requestId, reservation.account, maxCostMicroUsd, chatRequest.metadata);
       await store.markVaultReserved(reservation.requestId, vaultReserveTxHash);
 
+      const antseedFunding = await antseedFundingVault.ensureBuyerBalance(maxCostMicroUsd);
       const completion = await antseed.chatCompletion(upstreamRequest);
       const receiptHash = await providerReceiptHash(completion);
       const cost = actualCostMicroUsd(cfg, completion.usage?.prompt_tokens, completion.usage?.completion_tokens);
@@ -305,6 +310,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           reservedMicroUsd: maxCostMicroUsd.toString(),
           settledMicroUsd: cost.toString(),
           providerReceiptHash: receiptHash,
+          antseedFunding,
           vaultEnabled: vault.enabled,
           vaultReserveTxHash,
           vaultSettleTxHash
