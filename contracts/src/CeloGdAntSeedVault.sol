@@ -18,6 +18,10 @@ interface IConstantFlowAgreementV1Like {
         returns (uint256 timestamp, int96 flowRate, uint256 deposit, uint256 owedDeposit);
 }
 
+interface IReservePriceOracleLike {
+    function gdMicroUsdPerToken() external view returns (uint256);
+}
+
 /// @title CeloGdAntSeedVault
 /// @notice Celo-side G$ vault for AntSeed credits. No bridge logic is included.
 /// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
@@ -33,6 +37,8 @@ contract CeloGdAntSeedVault {
     error WrongReceiver();
     error NegativeFlowRate();
     error TransferFailed();
+    error FirstDepositBelowMinimum();
+    error StreamRateBelowMinimum();
 
     IERC20Like public immutable gdToken;
     address public immutable gdSuperToken;
@@ -40,6 +46,10 @@ contract CeloGdAntSeedVault {
     address public goodIdVerifier;
     address public superfluidHost;
     address public cfaV1;
+    address public reservePriceOracle;
+    uint256 public minFirstDepositMicroUsd = 1_000_000;
+    uint256 public minMonthlyStreamMicroUsd = 1_000_000;
+    uint256 public fallbackGdMicroUsdPerToken = 1_000_000;
 
     mapping(address => uint256) public totalDepositedGd;
     mapping(address => int96) public streamFlowRate;
@@ -48,6 +58,8 @@ contract CeloGdAntSeedVault {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event GoodIDVerifierUpdated(address indexed verifier);
     event SuperfluidConfigUpdated(address indexed host, address indexed cfaV1);
+    event ReservePriceOracleUpdated(address indexed reservePriceOracle);
+    event MinimumsUpdated(uint256 minFirstDepositMicroUsd, uint256 minMonthlyStreamMicroUsd, uint256 fallbackGdMicroUsdPerToken);
     event GdDeposited(address indexed account, address indexed payer, uint256 gdAmount, bytes data);
     event StreamUpdated(address indexed account, int96 flowRate, uint256 monthlyGdAmountWei);
 
@@ -98,6 +110,19 @@ contract CeloGdAntSeedVault {
         emit SuperfluidConfigUpdated(host, agreement);
     }
 
+    function setReserveConfig(address reservePriceOracle_, uint256 fallbackGdMicroUsdPerToken_) external onlyOwner {
+        reservePriceOracle = reservePriceOracle_;
+        if (fallbackGdMicroUsdPerToken_ > 0) fallbackGdMicroUsdPerToken = fallbackGdMicroUsdPerToken_;
+        emit ReservePriceOracleUpdated(reservePriceOracle_);
+        emit MinimumsUpdated(minFirstDepositMicroUsd, minMonthlyStreamMicroUsd, fallbackGdMicroUsdPerToken);
+    }
+
+    function setMinimumUsdThresholds(uint256 minFirstDepositMicroUsd_, uint256 minMonthlyStreamMicroUsd_) external onlyOwner {
+        minFirstDepositMicroUsd = minFirstDepositMicroUsd_;
+        minMonthlyStreamMicroUsd = minMonthlyStreamMicroUsd_;
+        emit MinimumsUpdated(minFirstDepositMicroUsd, minMonthlyStreamMicroUsd, fallbackGdMicroUsdPerToken);
+    }
+
     /// @notice Optional registration helper for deployments that want the vault registered as a SuperApp.
     /// @dev The config word is intentionally supplied by deployment scripts because Superfluid app level
     ///      and callback noop bitmap are network/version specific.
@@ -110,6 +135,7 @@ contract CeloGdAntSeedVault {
     function deposit(uint256 amount, bytes calldata data) external returns (uint256) {
         if (amount == 0) revert ZeroAmount();
         _requireVerified(msg.sender);
+        if (totalDepositedGd[msg.sender] == 0 && _gdWeiToMicroUsd(amount) < minFirstDepositMicroUsd) revert FirstDepositBelowMinimum();
         totalDepositedGd[msg.sender] += amount;
         _safeTransferFrom(msg.sender, address(this), amount);
         emit GdDeposited(msg.sender, msg.sender, amount, data);
@@ -220,6 +246,7 @@ contract CeloGdAntSeedVault {
     function _recordTokenCallbackDeposit(address account, address payer, uint256 amount, bytes calldata data) private {
         if (amount == 0) revert ZeroAmount();
         _requireVerified(account);
+        if (totalDepositedGd[account] == 0 && _gdWeiToMicroUsd(amount) < minFirstDepositMicroUsd) revert FirstDepositBelowMinimum();
         totalDepositedGd[account] += amount;
         emit GdDeposited(account, payer, amount, data);
     }
@@ -237,6 +264,7 @@ contract CeloGdAntSeedVault {
 
         streamFlowRate[sender] = flowRate;
         uint256 monthlyAmount = uint256(uint96(flowRate)) * 30 days;
+        if (monthlyAmount > 0 && _gdWeiToMicroUsd(monthlyAmount) < minMonthlyStreamMicroUsd) revert StreamRateBelowMinimum();
         streamMonthlyGdAmount[sender] = monthlyAmount;
         emit StreamUpdated(sender, flowRate, monthlyAmount);
     }
@@ -248,5 +276,21 @@ contract CeloGdAntSeedVault {
     function _safeTransferFrom(address from, address to, uint256 amount) private {
         (bool ok, bytes memory data) = address(gdToken).call(abi.encodeWithSelector(IERC20Like.transferFrom.selector, from, to, amount));
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
+    }
+
+    function _gdWeiToMicroUsd(uint256 gdAmountWei) private view returns (uint256) {
+        return (gdAmountWei * _gdMicroUsdPerToken()) / 1e18;
+    }
+
+    function _gdMicroUsdPerToken() private view returns (uint256) {
+        address oracle = reservePriceOracle;
+        if (oracle != address(0)) {
+            (bool ok, bytes memory data) = oracle.staticcall(abi.encodeWithSelector(IReservePriceOracleLike.gdMicroUsdPerToken.selector));
+            if (ok && data.length >= 32) {
+                uint256 price = abi.decode(data, (uint256));
+                if (price > 0) return price;
+            }
+        }
+        return fallbackGdMicroUsdPerToken;
     }
 }

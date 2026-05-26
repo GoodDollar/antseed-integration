@@ -231,6 +231,17 @@ contract CeloGdAntSeedVaultTest {
         require(!ok, "unverified deposit rejected");
     }
 
+    function testRejectsFirstDepositBelowOneUsdAndAllowsLaterSmallTopUps() public {
+        setUp();
+        user.approveVault(2 ether);
+        (bool ok,) = address(user).call(abi.encodeWithSignature("deposit(uint256)", 0.5 ether));
+        require(!ok, "first deposit below minimum rejected");
+
+        user.deposit(1 ether);
+        user.deposit(0.25 ether);
+        require(vault.totalDepositedGd(address(user)) == 1.25 ether, "subsequent top up allowed");
+    }
+
     function testGoodIdRootAlsoVerifiesConnectedWallet() public {
         setUp();
         address root = address(0xA11CE);
@@ -342,5 +353,18 @@ contract CeloGdAntSeedVaultTest {
 
         host.terminateFlow(vault, address(superToken), address(user), "");
         require(vault.streamFlowRate(address(user)) == 0, "termination allowed");
+    }
+
+    function testRejectsMonthlyStreamBelowOneUsd() public {
+        setUp();
+        (bool ok,) = address(host).call(abi.encodeWithSignature(
+            "createFlow(address,address,address,int96,bytes)",
+            address(vault),
+            address(superToken),
+            address(user),
+            int96(1),
+            ""
+        ));
+        require(!ok, "monthly stream below minimum rejected");
     }
 }
