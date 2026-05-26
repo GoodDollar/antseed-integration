@@ -19,11 +19,13 @@ contract AntseedBuyerOperator {
     address public owner;
     address public pendingOwner;
     bool private locked;
+    mapping(bytes32 => bool) public usedDepositIds;
 
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event BuyerOperatorAccepted(address indexed buyer, uint256 nonce);
     event BuyerDepositFunded(address indexed buyer, uint256 amount);
+    event BuyerDepositFundedWithId(address indexed buyer, uint256 amount, string id);
     event BuyerDepositWithdrawn(address indexed buyer, address indexed recipient, uint256 amount);
     event BuyerOperatorTransferred(address indexed buyer, address indexed newOperator);
     event ChannelCloseRequested(bytes32 indexed channelId, address indexed buyer, address indexed caller);
@@ -37,6 +39,7 @@ contract AntseedBuyerOperator {
     error NotDepositsOperator();
     error TransferFailed();
     error ApproveFailed();
+    error DuplicateDepositId();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -92,6 +95,18 @@ contract AntseedBuyerOperator {
 
         _deposits().deposit(buyer, amount);
         emit BuyerDepositFunded(buyer, amount);
+    }
+
+    function depositForWithId(address buyer, uint256 amount, string calldata id) external nonReentrant onlyOwner {
+        if (buyer == address(0)) revert InvalidAddress();
+        if (amount == 0) revert InvalidAmount();
+        bytes32 idHash = keccak256(bytes(id));
+        if (usedDepositIds[idHash]) revert DuplicateDepositId();
+        usedDepositIds[idHash] = true;
+        _requireDepositsOperator(buyer);
+
+        _deposits().deposit(buyer, amount);
+        emit BuyerDepositFundedWithId(buyer, amount, id);
     }
 
     function withdrawDepositedFor(address buyer, uint256 amount, address recipient) external nonReentrant onlyOwner {

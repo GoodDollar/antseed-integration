@@ -177,6 +177,7 @@ export class KVCreditStore {
       month,
       txHash: input.txHash,
       logIndex: input.logIndex,
+      fundingStatus: "pending",
       createdAt: now
     };
 
@@ -192,10 +193,51 @@ export class KVCreditStore {
       totalGdCreditsIssuedMicroUsd: addDecimalStrings(current.totalGdCreditsIssuedMicroUsd, entry.totalCreditMicroUsd),
       totalRegularBonusMicroUsd: addDecimalStrings(current.totalRegularBonusMicroUsd, entry.regularBonusMicroUsd),
       totalStreamingBonusMicroUsd: addDecimalStrings(current.totalStreamingBonusMicroUsd, entry.streamingBonusMicroUsd),
+      totalOutstandingFundingMicroUsd: addDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd),
       creditBalanceMicroUsd: addDecimalStrings(current.creditBalanceMicroUsd, entry.totalCreditMicroUsd)
     }));
 
     return entry;
+  }
+
+  async markFundingResult(entryId: string, result: { funded: boolean; txHash?: string; error?: string }): Promise<GdCreditEntry> {
+    const key = `${GD_CREDIT_PREFIX}${entryId}`;
+    const entry = await this.getJson<GdCreditEntry>(key);
+    if (!entry) throw new Error(`unknown gd credit ${entryId}`);
+    if (entry.fundingStatus === "funded" || entry.fundingStatus === "failed") return entry;
+
+    entry.fundingStatus = result.funded ? "funded" : "failed";
+    entry.fundingTxHash = result.txHash;
+    entry.fundingError = result.error;
+    await this.putJson(key, entry);
+
+    if (result.funded) {
+      const now = new Date().toISOString();
+      await this.updateUser(entry.account, entry.rootAccount, (current) => ({
+        ...current,
+        updatedAt: now,
+        totalOutstandingFundingMicroUsd: subtractDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd)
+      }));
+    }
+    return entry;
+  }
+
+  async withdrawPrincipal(account: string, amountMicroUsd: bigint): Promise<UserCreditProfile> {
+    const normalized = normalizeAccount(account);
+    if (amountMicroUsd <= 0n) throw new Error("amount must be positive");
+    const profile = await this.getUser(normalized);
+    const maxWithdrawable = BigInt(profile.totalGdPrincipalMicroUsd) - BigInt(profile.totalWithdrawnPrincipalMicroUsd);
+    if (amountMicroUsd > maxWithdrawable) throw new Error("insufficient deposited principal");
+    if (amountMicroUsd > BigInt(profile.creditBalanceMicroUsd)) throw new Error("insufficient credit balance");
+    const now = new Date().toISOString();
+    const updated: UserCreditProfile = {
+      ...profile,
+      updatedAt: now,
+      totalWithdrawnPrincipalMicroUsd: addDecimalStrings(profile.totalWithdrawnPrincipalMicroUsd, amountMicroUsd.toString()),
+      creditBalanceMicroUsd: subtractDecimalStrings(profile.creditBalanceMicroUsd, amountMicroUsd.toString())
+    };
+    await this.putJson(`${USER_PREFIX}${normalized}`, updated);
+    return updated;
   }
 
   async getGdCredits(account: string): Promise<GdCreditEntry[]> {
@@ -287,6 +329,8 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalGdCreditsIssuedMicroUsd: saved?.totalGdCreditsIssuedMicroUsd ?? "0",
     totalRegularBonusMicroUsd: saved?.totalRegularBonusMicroUsd ?? "0",
     totalStreamingBonusMicroUsd: saved?.totalStreamingBonusMicroUsd ?? "0",
+    totalOutstandingFundingMicroUsd: saved?.totalOutstandingFundingMicroUsd ?? "0",
+    totalWithdrawnPrincipalMicroUsd: saved?.totalWithdrawnPrincipalMicroUsd ?? "0",
     streamFlowRateWeiPerSecond: saved?.streamFlowRateWeiPerSecond ?? "0",
     streamMonthlyMicroUsd: saved?.streamMonthlyMicroUsd ?? "0",
     lastRequestId: saved?.lastRequestId

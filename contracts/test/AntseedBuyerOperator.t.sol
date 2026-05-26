@@ -185,6 +185,23 @@ contract AntseedBuyerOperatorTest {
         require(usdc.balanceOf(address(deposits)) == 12_345_678, "deposits funded");
     }
 
+    function testDepositForWithIdPreventsDuplicates() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        operator.acceptBuyerOperator(buyer, 1, "");
+
+        operator.depositForWithId(buyer, 1_000_000, "tx:1");
+        require(deposits.available(buyer) == 1_000_000, "funded once");
+
+        bool ok;
+        try operator.depositForWithId(buyer, 1_000_000, "tx:1") {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "duplicate id rejected");
+    }
+
     function testWithdrawDepositedForSendsRecipient() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);

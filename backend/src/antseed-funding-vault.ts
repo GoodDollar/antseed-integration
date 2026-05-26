@@ -2,7 +2,10 @@ import { ethers } from "ethers";
 import { RuntimeConfig } from "./env.js";
 
 const FUNDING_VAULT_ABI = [
-  "function depositFor(address buyer, uint256 amount)"
+  "function depositFor(address buyer, uint256 amount)",
+  "function depositForWithId(address buyer, uint256 amount, string id)",
+  "function withdrawDepositedFor(address buyer, uint256 amount, address recipient)",
+  "function requestClose(bytes32 channelId)"
 ] as const;
 
 export type AntSeedFundingResult = {
@@ -10,6 +13,7 @@ export type AntSeedFundingResult = {
   buyer: string;
   amountMicroUsd: string;
   txHash?: string;
+  error?: string;
 };
 
 export class AntSeedFundingVaultClient {
@@ -39,5 +43,31 @@ export class AntSeedFundingVaultClient {
       amountMicroUsd: amountMicroUsd.toString(),
       txHash: receipt?.hash
     };
+  }
+
+  async depositForBuyerWithId(buyer: string, amountMicroUsd: bigint, id: string): Promise<AntSeedFundingResult> {
+    if (!this.contract) return { enabled: false, buyer, amountMicroUsd: amountMicroUsd.toString() };
+    const tx = await this.contract.depositForWithId(buyer, amountMicroUsd, id);
+    const receipt = await tx.wait();
+    return {
+      enabled: true,
+      buyer,
+      amountMicroUsd: amountMicroUsd.toString(),
+      txHash: receipt?.hash
+    };
+  }
+
+  async withdrawDepositedFor(buyer: string, amountMicroUsd: bigint, recipient: string): Promise<{ enabled: boolean; txHash?: string }> {
+    if (!this.contract) return { enabled: false };
+    const tx = await this.contract.withdrawDepositedFor(buyer, amountMicroUsd, recipient);
+    const receipt = await tx.wait();
+    return { enabled: true, txHash: receipt?.hash };
+  }
+
+  async requestClose(channelId: string): Promise<{ enabled: boolean; txHash?: string }> {
+    if (!this.contract) return { enabled: false };
+    const tx = await this.contract.requestClose(channelId);
+    const receipt = await tx.wait();
+    return { enabled: true, txHash: receipt?.hash };
   }
 }

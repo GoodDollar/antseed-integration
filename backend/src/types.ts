@@ -33,6 +33,8 @@ export type UserCreditProfile = {
   totalGdCreditsIssuedMicroUsd: string;
   totalRegularBonusMicroUsd: string;
   totalStreamingBonusMicroUsd: string;
+  totalOutstandingFundingMicroUsd: string;
+  totalWithdrawnPrincipalMicroUsd: string;
   streamFlowRateWeiPerSecond: string;
   streamMonthlyMicroUsd: string;
   lastRequestId?: string;
@@ -52,6 +54,9 @@ export type GdCreditEntry = {
   month: string;
   txHash?: string;
   logIndex?: number;
+  fundingStatus?: "pending" | "funded" | "failed";
+  fundingTxHash?: string;
+  fundingError?: string;
   createdAt: string;
 };
 

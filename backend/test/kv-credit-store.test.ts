@@ -44,6 +44,7 @@ test("KV store persists user profile and request lifecycle", async () => {
   assert.equal(user.totalSettledMicroUsd, "1500");
   assert.equal(user.reservedCreditMicroUsd, "0");
   assert.equal(user.creditBalanceMicroUsd, "9500");
+  assert.equal(user.totalOutstandingFundingMicroUsd, "11000");
 
   const requests = await store.getUserRequests("0xABC");
   assert.equal(requests.length, 1);
@@ -62,6 +63,7 @@ test("KV store releases reserved credit back to available balance", async () => 
   const user = await store.getUser("0xABC");
   assert.equal(user.creditBalanceMicroUsd, "1100");
   assert.equal(user.reservedCreditMicroUsd, "0");
+  assert.equal(user.totalOutstandingFundingMicroUsd, "1100");
 });
 
 test("KV store keeps additional GoodID-root aggregate across connected wallets", async () => {
@@ -103,6 +105,7 @@ test("KV store persists stream cap and G$ credit bonuses", async () => {
   });
   assert.equal(first.totalCreditMicroUsd, "1200000");
   assert.equal(first.streamingBonusMicroUsd, "100000");
+  assert.equal(first.fundingStatus, "pending");
 
   const second = await store.recordGdCredit({
     account: "0xABC",
@@ -119,7 +122,28 @@ test("KV store persists stream cap and G$ credit bonuses", async () => {
   assert.equal(user.creditBalanceMicroUsd, "2300000");
   assert.equal(user.totalGdCreditsIssuedMicroUsd, "2300000");
   assert.equal(user.totalStreamingBonusMicroUsd, "100000");
+  assert.equal(user.totalOutstandingFundingMicroUsd, "2300000");
 
   const credits = await store.getGdCredits("0xABC");
   assert.equal(credits.length, 2);
+});
+
+test("KV store can mark funding success and enforce principal-only withdrawals", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const entry = await store.recordGdCredit({
+    account: "0xABC",
+    source: "manual",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    principalMicroUsd: 1_000_000n
+  });
+  await store.markFundingResult(entry.id, { funded: true, txHash: "0xfund" });
+  const funded = (await store.getGdCredits("0xABC"))[0];
+  assert.equal(funded.fundingStatus, "funded");
+  assert.equal(funded.fundingTxHash, "0xfund");
+
+  const profile = await store.getUser("0xABC");
+  assert.equal(profile.totalOutstandingFundingMicroUsd, "0");
+
+  await store.withdrawPrincipal("0xABC", 1_000_000n);
+  await assert.rejects(() => store.withdrawPrincipal("0xABC", 1n), /insufficient deposited principal/);
 });

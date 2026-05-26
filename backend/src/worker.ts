@@ -22,6 +22,13 @@ const StreamUpdateSchema = z.object({
   txHash: z.string().optional(),
   logIndex: z.number().int().nonnegative().optional()
 });
+const WithdrawSchema = z.object({
+  amountMicroUsd: z.string().regex(/^\d+$/),
+  recipient: z.string().min(1).optional()
+});
+const CloseChannelSchema = z.object({
+  channelId: z.string().regex(/^0x[0-9a-fA-F]{64}$/)
+});
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -103,8 +110,16 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           txHash: event.txHash,
           logIndex: event.logIndex
         });
-        const bridge = await antseedFundingVault.depositForBuyer(event.account, BigInt(entry.totalCreditMicroUsd));
-        recorded.push({ ...entry, bridge });
+        const depositId = `${event.txHash}:${event.logIndex}`;
+        try {
+          const bridge = await antseedFundingVault.depositForBuyerWithId(event.account, BigInt(entry.totalCreditMicroUsd), depositId);
+          const updated = await store.markFundingResult(entry.id, { funded: true, txHash: bridge.txHash });
+          recorded.push({ ...updated, bridge, depositId });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "deposit funding failed";
+          const updated = await store.markFundingResult(entry.id, { funded: false, error: message });
+          recorded.push({ ...updated, bridge: { enabled: antseedFundingVault.enabled, buyer: event.account, amountMicroUsd: entry.totalCreditMicroUsd, error: message }, depositId });
+        }
       } else {
         recorded.push(await store.updateStream(
           event.account,
@@ -136,8 +151,27 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       txHash: parsed.data.txHash,
       logIndex: parsed.data.logIndex
     });
-    const bridge = await antseedFundingVault.depositForBuyer(parsed.data.account, BigInt(entry.totalCreditMicroUsd));
-    return json({ ...entry, bridge });
+    const depositId = parsed.data.txHash && parsed.data.logIndex !== undefined
+      ? `${parsed.data.txHash}:${parsed.data.logIndex}`
+      : `manual:${Date.now()}`;
+    try {
+      const bridge = await antseedFundingVault.depositForBuyerWithId(parsed.data.account, BigInt(entry.totalCreditMicroUsd), depositId);
+      const updated = await store.markFundingResult(entry.id, { funded: true, txHash: bridge.txHash });
+      return json({ ...updated, bridge, depositId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "deposit funding failed";
+      const updated = await store.markFundingResult(entry.id, { funded: false, error: message });
+      return json({
+        ...updated,
+        depositId,
+        bridge: {
+          enabled: antseedFundingVault.enabled,
+          buyer: parsed.data.account,
+          amountMicroUsd: entry.totalCreditMicroUsd,
+          error: message
+        }
+      });
+    }
   }
 
   if (request.method === "POST" && url.pathname === "/v1/celo/streams/update") {
@@ -155,6 +189,43 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       parsed.data.logIndex
     );
     return json(state);
+  }
+
+  const outstandingMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/outstanding$/);
+  if (request.method === "GET" && outstandingMatch) {
+    const account = decodeURIComponent(outstandingMatch[1]);
+    const [profile, gdCredits] = await Promise.all([
+      store.getUser(account),
+      store.getGdCredits(account)
+    ]);
+    const failedFundingCredits = gdCredits.filter((entry) => entry.fundingStatus === "failed" || entry.fundingStatus === "pending");
+    return json({
+      account: profile.account,
+      outstandingFundingMicroUsd: profile.totalOutstandingFundingMicroUsd,
+      outstandingStreamBonusMicroUsd: "0",
+      failedFundingCredits
+    });
+  }
+
+  const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);
+  if (request.method === "POST" && withdrawMatch) {
+    const account = decodeURIComponent(withdrawMatch[1]);
+    const body = await parseJson(request);
+    const parsed = WithdrawSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const amount = BigInt(parsed.data.amountMicroUsd);
+    const recipient = parsed.data.recipient ?? account;
+    const profile = await store.withdrawPrincipal(account, amount);
+    const bridge = await antseedFundingVault.withdrawDepositedFor(account, amount, recipient);
+    return json({ account: profile.account, amountMicroUsd: amount.toString(), recipient, bridge });
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/channels/close") {
+    const body = await parseJson(request);
+    const parsed = CloseChannelSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const bridge = await antseedFundingVault.requestClose(parsed.data.channelId);
+    return json({ channelId: parsed.data.channelId, bridge });
   }
 
   return json({ error: "not found" }, 404);
