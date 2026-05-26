@@ -21,6 +21,7 @@ class MemoryKV {
 function env(overrides: Partial<Env> = {}): Env {
   return {
     ANTSEED_KV: new MemoryKV() as never,
+    CELO_EVENTS_API_KEY: "test-api-key",
     ...overrides
   } as Env;
 }
@@ -56,10 +57,11 @@ test("manual Celo credit records and attempts buyer-operator deposit for same us
 
   try {
     const account = "0x0000000000000000000000000000000000000abc";
+    const txHash = "0x" + "12".repeat(32);
     const res = await worker.fetch(new Request("https://worker.test/v1/celo/deposits/manual", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ account, gdAmountWei: "1000000000000000000", source: "manual" })
+      headers: { "content-type": "application/json", "x-api-key": "test-api-key" },
+      body: JSON.stringify({ account, gdAmountWei: "1000000000000000000", source: "manual", txHash, logIndex: 1 })
     }), env(), {} as ExecutionContext);
 
     assert.equal(res.status, 200);
@@ -70,6 +72,61 @@ test("manual Celo credit records and attempts buyer-operator deposit for same us
     assert.equal(body.bridge.amountMicroUsd, body.totalCreditMicroUsd);
     assert.equal(capturedBuyer, account);
     assert.equal(capturedAmount?.toString(), body.totalCreditMicroUsd);
+  } finally {
+    AntSeedFundingVaultClient.prototype.depositForBuyer = original;
+  }
+});
+
+test("manual Celo deposit endpoint requires API key auth", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const txHash = "0x" + "34".repeat(32);
+  const res = await worker.fetch(new Request("https://worker.test/v1/celo/deposits/manual", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ account, gdAmountWei: "1000000000000000000", source: "manual", txHash, logIndex: 1 })
+  }), env(), {} as ExecutionContext);
+  assert.equal(res.status, 401);
+});
+
+test("manual Celo deposit retries do not duplicate bridge deposits", async () => {
+  const original = AntSeedFundingVaultClient.prototype.depositForBuyer;
+  let bridgeCalls = 0;
+
+  AntSeedFundingVaultClient.prototype.depositForBuyer = async function (buyer: string, amountMicroUsd: bigint) {
+    bridgeCalls += 1;
+    return {
+      enabled: true,
+      buyer,
+      amountMicroUsd: amountMicroUsd.toString(),
+      txHash: "0x" + bridgeCalls.toString(16).padStart(64, "0")
+    };
+  };
+
+  try {
+    const workerEnv = env();
+    const account = "0x0000000000000000000000000000000000000abc";
+    const txHash = "0x" + "56".repeat(32);
+    const requestBody = JSON.stringify({ account, gdAmountWei: "1000000000000000000", source: "manual", txHash, logIndex: 9 });
+    const headers = { "content-type": "application/json", "x-api-key": "test-api-key" };
+
+    const first = await worker.fetch(new Request("https://worker.test/v1/celo/deposits/manual", {
+      method: "POST",
+      headers,
+      body: requestBody
+    }), workerEnv, {} as ExecutionContext);
+    assert.equal(first.status, 200);
+
+    const second = await worker.fetch(new Request("https://worker.test/v1/celo/deposits/manual", {
+      method: "POST",
+      headers,
+      body: requestBody
+    }), workerEnv, {} as ExecutionContext);
+    assert.equal(second.status, 200);
+    assert.equal(bridgeCalls, 1);
+
+    const secondBody = await second.json() as { bridge: { skipped?: boolean; reason?: string } };
+    assert.equal(secondBody.bridge.skipped, true);
+    assert.equal(secondBody.bridge.reason, "duplicate-event");
   } finally {
     AntSeedFundingVaultClient.prototype.depositForBuyer = original;
   }

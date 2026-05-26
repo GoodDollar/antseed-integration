@@ -52,6 +52,8 @@ export type GdCreditEntry = {
   month: string;
   txHash?: string;
   logIndex?: number;
+  bridgeDepositTxHash?: string;
+  bridgeDepositedAt?: string;
   createdAt: string;
 };
 

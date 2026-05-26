@@ -120,6 +120,7 @@ After the transaction is mined, record it with the Worker:
 ```bash
 curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/celo/events/record" \
   -H "content-type: application/json" \
+  -H "x-api-key: $GOODDOLLAR_CELO_EVENTS_API_KEY" \
   -d '{"txHash":"0xYOUR_CELO_TX_HASH"}'
 ```
 
@@ -162,6 +163,7 @@ When the stream is created or updated, the vault emits `StreamUpdated(account, f
 ```bash
 curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/celo/events/record" \
   -H "content-type: application/json" \
+  -H "x-api-key: $GOODDOLLAR_CELO_EVENTS_API_KEY" \
   -d '{"txHash":"0xYOUR_STREAM_TX_HASH"}'
 ```
 

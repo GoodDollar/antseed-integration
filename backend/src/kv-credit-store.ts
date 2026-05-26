@@ -7,6 +7,7 @@ const USER_PREFIX = "user:";
 const REQUEST_PREFIX = "request:";
 const USER_REQUESTS_PREFIX = "user-requests:";
 const GD_CREDIT_PREFIX = "gd-credit:";
+const GD_CREDIT_EVENT_PREFIX = "gd-credit-event:";
 const USER_GD_CREDITS_PREFIX = "user-gd-credits:";
 const STREAM_PREFIX = "stream:";
 const STREAM_BONUS_USED_PREFIX = "stream-bonus-used:";
@@ -152,6 +153,14 @@ export class KVCreditStore {
   }): Promise<GdCreditEntry> {
     const account = normalizeAccount(input.account);
     const rootAccount = normalizeAccount(input.rootAccount ?? input.account);
+    const eventKey = eventCreditKey(input.txHash, input.logIndex);
+    if (eventKey) {
+      const existingId = await this.kv.get(`${GD_CREDIT_EVENT_PREFIX}${eventKey}`);
+      if (existingId) {
+        const existing = await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${existingId}`);
+        if (existing) return existing;
+      }
+    }
     const month = monthKey(input.date ?? new Date());
     const usedKey = `${STREAM_BONUS_USED_PREFIX}${rootAccount}:${month}`;
     const profile = await this.getUser(rootAccount);
@@ -181,6 +190,7 @@ export class KVCreditStore {
     };
 
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
+    if (eventKey) await this.kv.put(`${GD_CREDIT_EVENT_PREFIX}${eventKey}`, entry.id);
     await this.addGdCreditToAccount(account, entry.id);
     await this.addGdCreditToAccount(rootAccount, entry.id);
     await this.kv.put(usedKey, (used + bonus.streamingBonusPrincipalAppliedMicroUsd).toString());
@@ -195,6 +205,24 @@ export class KVCreditStore {
       creditBalanceMicroUsd: addDecimalStrings(current.creditBalanceMicroUsd, entry.totalCreditMicroUsd)
     }));
 
+    return entry;
+  }
+
+  async getGdCreditByEvent(txHash: string, logIndex: number): Promise<GdCreditEntry | undefined> {
+    const key = eventCreditKey(txHash, logIndex);
+    if (!key) return undefined;
+    const id = await this.kv.get(`${GD_CREDIT_EVENT_PREFIX}${key}`);
+    if (!id) return undefined;
+    return this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`);
+  }
+
+  async markGdCreditBridged(entryId: string, bridgeDepositTxHash?: string): Promise<GdCreditEntry | undefined> {
+    const key = `${GD_CREDIT_PREFIX}${entryId}`;
+    const entry = await this.getJson<GdCreditEntry>(key);
+    if (!entry) return undefined;
+    entry.bridgeDepositTxHash = bridgeDepositTxHash;
+    entry.bridgeDepositedAt = new Date().toISOString();
+    await this.putJson(key, entry);
     return entry;
   }
 
@@ -304,4 +332,9 @@ function addDecimalStrings(a: string, b: string): string {
 function subtractDecimalStrings(a: string, b: string): string {
   const result = BigInt(a) - BigInt(b);
   return (result > 0n ? result : 0n).toString();
+}
+
+function eventCreditKey(txHash: string | undefined, logIndex: number | undefined): string | undefined {
+  if (!txHash || logIndex === undefined) return undefined;
+  return `${txHash.toLowerCase()}:${logIndex}`;
 }

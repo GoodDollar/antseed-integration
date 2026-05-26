@@ -8,6 +8,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - KV namespace binding: `ANTSEED_KV`
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
 - Optional Base `AntseedBuyerOperator` bridge client that calls `depositFor(buyer, amount)`
+- Shared-secret auth (`CELO_EVENTS_API_KEY`) required for Celo ingestion endpoints that can trigger bridge spending
 
 ## Endpoints
 
@@ -18,6 +19,8 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/celo/events/record`
 - `POST /v1/celo/deposits/manual`
 - `POST /v1/celo/streams/update`
+
+`POST /v1/celo/events/record` and `POST /v1/celo/deposits/manual` require `x-api-key` (or `Authorization: Bearer`) that matches `CELO_EVENTS_API_KEY`.
 
 ## Setup
 

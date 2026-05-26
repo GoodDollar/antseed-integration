@@ -123,3 +123,28 @@ test("KV store persists stream cap and G$ credit bonuses", async () => {
   const credits = await store.getGdCredits("0xABC");
   assert.equal(credits.length, 2);
 });
+
+test("KV store deduplicates credits by txHash and logIndex", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const txHash = "0x" + "ab".repeat(32);
+  const first = await store.recordGdCredit({
+    account: "0xABC",
+    source: "erc677",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    principalMicroUsd: 1_000_000n,
+    txHash,
+    logIndex: 3
+  });
+  const second = await store.recordGdCredit({
+    account: "0xABC",
+    source: "erc677",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    principalMicroUsd: 1_000_000n,
+    txHash,
+    logIndex: 3
+  });
+
+  assert.equal(second.id, first.id);
+  const user = await store.getUser("0xABC");
+  assert.equal(user.totalGdCreditsIssuedMicroUsd, first.totalCreditMicroUsd);
+});

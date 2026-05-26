@@ -9,6 +9,7 @@ export interface Env {
   CELO_RPC_URL?: string;
   CELO_VAULT_ADDRESS?: string;
   CELO_GOODID_ADDRESS?: string;
+  CELO_EVENTS_API_KEY?: string;
 }
 
 export type RuntimeConfig = {
@@ -19,6 +20,7 @@ export type RuntimeConfig = {
   CELO_RPC_URL?: string;
   CELO_VAULT_ADDRESS?: string;
   CELO_GOODID_ADDRESS?: string;
+  CELO_EVENTS_API_KEY?: string;
 };
 
 export function configFromEnv(env: Env): RuntimeConfig {
@@ -29,7 +31,8 @@ export function configFromEnv(env: Env): RuntimeConfig {
     GD_MICRO_USD_PER_TOKEN: bigintEnv(env.GD_MICRO_USD_PER_TOKEN, 1_000_000n),
     CELO_RPC_URL: env.CELO_RPC_URL,
     CELO_VAULT_ADDRESS: env.CELO_VAULT_ADDRESS,
-    CELO_GOODID_ADDRESS: env.CELO_GOODID_ADDRESS
+    CELO_GOODID_ADDRESS: env.CELO_GOODID_ADDRESS,
+    CELO_EVENTS_API_KEY: env.CELO_EVENTS_API_KEY
   };
 }
 
