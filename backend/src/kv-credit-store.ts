@@ -151,6 +151,20 @@ export class KVCreditStore {
     logIndex?: number;
     date?: Date;
   }): Promise<GdCreditEntry> {
+    const { entry } = await this.recordGdCreditWithMeta(input);
+    return entry;
+  }
+
+  async recordGdCreditWithMeta(input: {
+    account: string;
+    rootAccount?: string;
+    source: GdCreditEntry["source"];
+    gdAmountWei: bigint;
+    principalMicroUsd: bigint;
+    txHash?: string;
+    logIndex?: number;
+    date?: Date;
+  }): Promise<{ entry: GdCreditEntry; isDuplicate: boolean }> {
     const account = normalizeAccount(input.account);
     const rootAccount = normalizeAccount(input.rootAccount ?? input.account);
     const eventKey = eventCreditKey(input.txHash, input.logIndex);
@@ -158,7 +172,7 @@ export class KVCreditStore {
       const existingId = await this.kv.get(`${GD_CREDIT_EVENT_PREFIX}${eventKey}`);
       if (existingId) {
         const existing = await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${existingId}`);
-        if (existing) return existing;
+        if (existing) return { entry: existing, isDuplicate: true };
       }
     }
     const month = monthKey(input.date ?? new Date());
@@ -205,7 +219,7 @@ export class KVCreditStore {
       creditBalanceMicroUsd: addDecimalStrings(current.creditBalanceMicroUsd, entry.totalCreditMicroUsd)
     }));
 
-    return entry;
+    return { entry, isDuplicate: false };
   }
 
   async getGdCreditByEvent(txHash: string, logIndex: number): Promise<GdCreditEntry | undefined> {
@@ -220,10 +234,13 @@ export class KVCreditStore {
     const key = `${GD_CREDIT_PREFIX}${entryId}`;
     const entry = await this.getJson<GdCreditEntry>(key);
     if (!entry) return undefined;
-    entry.bridgeDepositTxHash = bridgeDepositTxHash;
-    entry.bridgeDepositedAt = new Date().toISOString();
-    await this.putJson(key, entry);
-    return entry;
+    const updated: GdCreditEntry = {
+      ...entry,
+      bridgeDepositTxHash,
+      bridgeDepositedAt: new Date().toISOString()
+    };
+    await this.putJson(key, updated);
+    return updated;
   }
 
   async getGdCredits(account: string): Promise<GdCreditEntry[]> {

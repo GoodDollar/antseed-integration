@@ -97,22 +97,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
       if (event.kind === "deposit") {
-        const existing = await store.getGdCreditByEvent(event.txHash, event.logIndex);
-        if (existing?.bridgeDepositedAt) {
-          recorded.push({
-            ...existing,
-            bridge: {
-              enabled: antseedFundingVault.enabled,
-              buyer: event.account,
-              amountMicroUsd: existing.totalCreditMicroUsd,
-              txHash: existing.bridgeDepositTxHash,
-              skipped: true,
-              reason: "duplicate-event"
-            }
-          });
-          continue;
-        }
-        const entry = await store.recordGdCredit({
+        const { entry, isDuplicate } = await store.recordGdCreditWithMeta({
           account: event.account,
           rootAccount,
           source: "erc677",
@@ -121,6 +106,20 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           txHash: event.txHash,
           logIndex: event.logIndex
         });
+        if (isDuplicate) {
+          recorded.push({
+            ...entry,
+            bridge: {
+              enabled: antseedFundingVault.enabled,
+              buyer: event.account,
+              amountMicroUsd: entry.totalCreditMicroUsd,
+              txHash: entry.bridgeDepositTxHash,
+              skipped: true,
+              reason: "duplicate-event"
+            }
+          });
+          continue;
+        }
         const bridge = await bridgeCreditEntry(entry, event.account, antseedFundingVault, store);
         recorded.push({ ...entry, bridge });
       } else {
@@ -147,7 +146,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const gdAmountWei = BigInt(parsed.data.gdAmountWei);
     const principalMicroUsd = gdWeiToMicroUsd(gdAmountWei, cfg.GD_MICRO_USD_PER_TOKEN);
     const rootAccount = parsed.data.rootAccount ?? await fetchGoodIdRoot(parsed.data.account, cfg);
-    const entry = await store.recordGdCredit({
+    const { entry, isDuplicate } = await store.recordGdCreditWithMeta({
       account: parsed.data.account,
       rootAccount,
       source: parsed.data.source,
@@ -156,6 +155,19 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       txHash: parsed.data.txHash,
       logIndex: parsed.data.logIndex
     });
+    if (isDuplicate) {
+      return json({
+        ...entry,
+        bridge: {
+          enabled: antseedFundingVault.enabled,
+          buyer: parsed.data.account,
+          amountMicroUsd: entry.totalCreditMicroUsd,
+          txHash: entry.bridgeDepositTxHash,
+          skipped: true,
+          reason: "duplicate-event"
+        }
+      });
+    }
     const bridge = await bridgeCreditEntry(entry, parsed.data.account, antseedFundingVault, store);
     return json({ ...entry, bridge });
   }
@@ -201,7 +213,7 @@ function cors(response: Response): Response {
 function requireCeloEndpointAuth(request: Request, expectedApiKey: string | undefined): Response | undefined {
   if (!expectedApiKey) return json({ error: "celo endpoint auth not configured" }, 503);
   const providedApiKey = readApiKey(request);
-  if (!providedApiKey || providedApiKey !== expectedApiKey) return json({ error: "unauthorized" }, 401);
+  if (!providedApiKey || !constantTimeEqual(providedApiKey, expectedApiKey)) return json({ error: "unauthorized" }, 401);
   return undefined;
 }
 
@@ -213,6 +225,17 @@ function readApiKey(request: Request): string | undefined {
   const [scheme, token] = authorization.split(/\s+/);
   if (scheme?.toLowerCase() === "bearer" && token) return token;
   return undefined;
+}
+
+function constantTimeEqual(value: string, expected: string): boolean {
+  const maxLength = Math.max(value.length, expected.length);
+  let mismatch = value.length ^ expected.length;
+  for (let i = 0; i < maxLength; i += 1) {
+    const valueChar = i < value.length ? value.charCodeAt(i) : 0;
+    const expectedChar = i < expected.length ? expected.charCodeAt(i) : 0;
+    mismatch |= valueChar ^ expectedChar;
+  }
+  return mismatch === 0;
 }
 
 async function bridgeCreditEntry(

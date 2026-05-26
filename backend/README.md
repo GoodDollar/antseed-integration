@@ -21,6 +21,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/celo/streams/update`
 
 `POST /v1/celo/events/record` and `POST /v1/celo/deposits/manual` require `x-api-key` (or `Authorization: Bearer`) that matches `CELO_EVENTS_API_KEY`.
+`POST /v1/celo/deposits/manual` also requires `txHash` + `logIndex` so credits are idempotent across retries.
 
 ## Setup
 
