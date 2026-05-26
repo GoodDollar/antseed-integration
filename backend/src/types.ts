@@ -55,6 +55,7 @@ export type GdCreditEntry = {
   txHash?: string;
   logIndex?: number;
   fundingStatus?: "pending" | "funded" | "failed";
+  fundingId?: string;
   fundingTxHash?: string;
   fundingError?: string;
   createdAt: string;

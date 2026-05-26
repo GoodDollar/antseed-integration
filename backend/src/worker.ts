@@ -110,14 +110,14 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           txHash: event.txHash,
           logIndex: event.logIndex
         });
-        const depositId = `${event.txHash}:${event.logIndex}`;
+        const depositId = createDepositFundingId(event.txHash, event.logIndex, "event");
         try {
           const bridge = await antseedFundingVault.depositForBuyerWithId(event.account, BigInt(entry.totalCreditMicroUsd), depositId);
-          const updated = await store.markFundingResult(entry.id, { funded: true, txHash: bridge.txHash });
+          const updated = await store.markFundingResult(entry.id, { funded: true, id: depositId, txHash: bridge.txHash });
           recorded.push({ ...updated, bridge, depositId });
         } catch (error) {
           const message = error instanceof Error ? error.message : "deposit funding failed";
-          const updated = await store.markFundingResult(entry.id, { funded: false, error: message });
+          const updated = await store.markFundingResult(entry.id, { funded: false, id: depositId, error: message });
           recorded.push({ ...updated, bridge: { enabled: antseedFundingVault.enabled, buyer: event.account, amountMicroUsd: entry.totalCreditMicroUsd, error: message }, depositId });
         }
       } else {
@@ -151,16 +151,14 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       txHash: parsed.data.txHash,
       logIndex: parsed.data.logIndex
     });
-    const depositId = parsed.data.txHash && parsed.data.logIndex !== undefined
-      ? `${parsed.data.txHash}:${parsed.data.logIndex}`
-      : `manual:${Date.now()}`;
+    const depositId = createDepositFundingId(parsed.data.txHash, parsed.data.logIndex, "manual");
     try {
       const bridge = await antseedFundingVault.depositForBuyerWithId(parsed.data.account, BigInt(entry.totalCreditMicroUsd), depositId);
-      const updated = await store.markFundingResult(entry.id, { funded: true, txHash: bridge.txHash });
+      const updated = await store.markFundingResult(entry.id, { funded: true, id: depositId, txHash: bridge.txHash });
       return json({ ...updated, bridge, depositId });
     } catch (error) {
       const message = error instanceof Error ? error.message : "deposit funding failed";
-      const updated = await store.markFundingResult(entry.id, { funded: false, error: message });
+      const updated = await store.markFundingResult(entry.id, { funded: false, id: depositId, error: message });
       return json({
         ...updated,
         depositId,
@@ -198,12 +196,12 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       store.getUser(account),
       store.getGdCredits(account)
     ]);
-    const failedFundingCredits = gdCredits.filter((entry) => entry.fundingStatus === "failed" || entry.fundingStatus === "pending");
+    const outstandingFundingCredits = gdCredits.filter((entry) => entry.fundingStatus === "failed" || entry.fundingStatus === "pending");
     return json({
       account: profile.account,
       outstandingFundingMicroUsd: profile.totalOutstandingFundingMicroUsd,
       outstandingStreamBonusMicroUsd: "0",
-      failedFundingCredits
+      failedFundingCredits: outstandingFundingCredits
     });
   }
 
@@ -247,4 +245,9 @@ function cors(response: Response): Response {
   headers.set("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
   headers.set("access-control-allow-headers", "content-type,authorization,x-api-key,x-gooddollar-account");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function createDepositFundingId(txHash: string | undefined, logIndex: number | undefined, prefix: string): string {
+  if (txHash && logIndex !== undefined && logIndex !== null) return `${txHash}:${logIndex}`;
+  return `${prefix}:${Date.now()}`;
 }

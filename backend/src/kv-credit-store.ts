@@ -200,13 +200,14 @@ export class KVCreditStore {
     return entry;
   }
 
-  async markFundingResult(entryId: string, result: { funded: boolean; txHash?: string; error?: string }): Promise<GdCreditEntry> {
+  async markFundingResult(entryId: string, result: { funded: boolean; id?: string; txHash?: string; error?: string }): Promise<GdCreditEntry> {
     const key = `${GD_CREDIT_PREFIX}${entryId}`;
     const entry = await this.getJson<GdCreditEntry>(key);
     if (!entry) throw new Error(`unknown gd credit ${entryId}`);
     if (entry.fundingStatus === "funded" || entry.fundingStatus === "failed") return entry;
 
     entry.fundingStatus = result.funded ? "funded" : "failed";
+    entry.fundingId = result.id;
     entry.fundingTxHash = result.txHash;
     entry.fundingError = result.error;
     await this.putJson(key, entry);
@@ -226,9 +227,15 @@ export class KVCreditStore {
     const normalized = normalizeAccount(account);
     if (amountMicroUsd <= 0n) throw new Error("amount must be positive");
     const profile = await this.getUser(normalized);
-    const maxWithdrawable = BigInt(profile.totalGdPrincipalMicroUsd) - BigInt(profile.totalWithdrawnPrincipalMicroUsd);
-    if (amountMicroUsd > maxWithdrawable) throw new Error("insufficient deposited principal");
-    if (amountMicroUsd > BigInt(profile.creditBalanceMicroUsd)) throw new Error("insufficient credit balance");
+    const principal = BigInt(profile.totalGdPrincipalMicroUsd);
+    const withdrawn = BigInt(profile.totalWithdrawnPrincipalMicroUsd);
+    const maxWithdrawable = principal > withdrawn ? principal - withdrawn : 0n;
+    if (amountMicroUsd > maxWithdrawable) {
+      throw new Error(`insufficient deposited principal (max withdrawable: ${maxWithdrawable})`);
+    }
+    if (amountMicroUsd > BigInt(profile.creditBalanceMicroUsd)) {
+      throw new Error(`insufficient credit balance (available: ${profile.creditBalanceMicroUsd})`);
+    }
     const now = new Date().toISOString();
     const updated: UserCreditProfile = {
       ...profile,

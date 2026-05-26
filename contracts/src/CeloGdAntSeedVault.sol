@@ -27,6 +27,8 @@ interface IReservePriceOracleLike {
 /// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
 ///      and Superfluid SuperApp stream callbacks. Backend converts G$ events into USDC-denominated credits.
 contract CeloGdAntSeedVault {
+    uint256 private constant MIN_REASONABLE_GD_MICRO_USD_PER_TOKEN = 1;
+    uint256 private constant MAX_REASONABLE_GD_MICRO_USD_PER_TOKEN = 1_000_000_000;
     error NotOwner();
     error ZeroAddress();
     error ZeroAmount();
@@ -39,6 +41,7 @@ contract CeloGdAntSeedVault {
     error TransferFailed();
     error FirstDepositBelowMinimum();
     error StreamRateBelowMinimum();
+    error InvalidPriceConfig();
 
     IERC20Like public immutable gdToken;
     address public immutable gdSuperToken;
@@ -111,6 +114,7 @@ contract CeloGdAntSeedVault {
     }
 
     function setReserveConfig(address reservePriceOracle_, uint256 fallbackGdMicroUsdPerToken_) external onlyOwner {
+        if (reservePriceOracle_ == address(0) && fallbackGdMicroUsdPerToken_ == 0) revert InvalidPriceConfig();
         reservePriceOracle = reservePriceOracle_;
         if (fallbackGdMicroUsdPerToken_ > 0) fallbackGdMicroUsdPerToken = fallbackGdMicroUsdPerToken_;
         emit ReservePriceOracleUpdated(reservePriceOracle_);
@@ -288,7 +292,7 @@ contract CeloGdAntSeedVault {
             (bool ok, bytes memory data) = oracle.staticcall(abi.encodeWithSelector(IReservePriceOracleLike.gdMicroUsdPerToken.selector));
             if (ok && data.length >= 32) {
                 uint256 price = abi.decode(data, (uint256));
-                if (price > 0) return price;
+                if (price >= MIN_REASONABLE_GD_MICRO_USD_PER_TOKEN && price <= MAX_REASONABLE_GD_MICRO_USD_PER_TOKEN) return price;
             }
         }
         return fallbackGdMicroUsdPerToken;
