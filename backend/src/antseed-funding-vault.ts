@@ -2,24 +2,14 @@ import { ethers } from "ethers";
 import { RuntimeConfig } from "./env.js";
 
 const FUNDING_VAULT_ABI = [
-  "function balance() view returns (uint256)",
-  "function antSeedBuyerBalance() view returns (uint256 available, uint256 reserved, uint256 lastActivityAt)",
-  "function fundAntSeedDeposit(uint256 amount) returns (uint256 availableAfter)"
+  "function depositFor(address buyer, uint256 amount)"
 ] as const;
-
-export type AntSeedBuyerDepositBalance = {
-  available: string;
-  reserved: string;
-  lastActivityAt: string;
-};
 
 export type AntSeedFundingResult = {
   enabled: boolean;
-  requiredMicroUsd: string;
-  availableBefore?: string;
-  topUpMicroUsd?: string;
+  buyer: string;
+  amountMicroUsd: string;
   txHash?: string;
-  availableAfter?: string;
 };
 
 export class AntSeedFundingVaultClient {
@@ -39,46 +29,15 @@ export class AntSeedFundingVaultClient {
     }
   }
 
-  async buyerBalance(): Promise<AntSeedBuyerDepositBalance | undefined> {
-    if (!this.contract) return undefined;
-    const [available, reserved, lastActivityAt] = await this.contract.antSeedBuyerBalance();
-    return {
-      available: available.toString(),
-      reserved: reserved.toString(),
-      lastActivityAt: lastActivityAt.toString()
-    };
-  }
-
-  async ensureBuyerBalance(requiredMicroUsd: bigint): Promise<AntSeedFundingResult> {
-    if (!this.contract) return { enabled: false, requiredMicroUsd: requiredMicroUsd.toString() };
-
-    const [available] = await this.contract.antSeedBuyerBalance();
-    const availableBefore = BigInt(available.toString());
-    const target = requiredMicroUsd > this.cfg.ANTSEED_MIN_BUYER_DEPOSIT_MICRO_USD
-      ? requiredMicroUsd
-      : this.cfg.ANTSEED_MIN_BUYER_DEPOSIT_MICRO_USD;
-
-    if (availableBefore >= requiredMicroUsd) {
-      return {
-        enabled: true,
-        requiredMicroUsd: requiredMicroUsd.toString(),
-        availableBefore: availableBefore.toString(),
-        topUpMicroUsd: "0",
-        availableAfter: availableBefore.toString()
-      };
-    }
-
-    const topUp = target - availableBefore;
-    const tx = await this.contract.fundAntSeedDeposit(topUp);
+  async depositForBuyer(buyer: string, amountMicroUsd: bigint): Promise<AntSeedFundingResult> {
+    if (!this.contract) return { enabled: false, buyer, amountMicroUsd: amountMicroUsd.toString() };
+    const tx = await this.contract.depositFor(buyer, amountMicroUsd);
     const receipt = await tx.wait();
-    const [availableAfter] = await this.contract.antSeedBuyerBalance();
     return {
       enabled: true,
-      requiredMicroUsd: requiredMicroUsd.toString(),
-      availableBefore: availableBefore.toString(),
-      topUpMicroUsd: topUp.toString(),
-      txHash: receipt?.hash,
-      availableAfter: availableAfter.toString()
+      buyer,
+      amountMicroUsd: amountMicroUsd.toString(),
+      txHash: receipt?.hash
     };
   }
 }

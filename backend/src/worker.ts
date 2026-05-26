@@ -1,27 +1,10 @@
 import { z } from "zod";
-import { AntSeedClient, providerReceiptHash } from "./antseed-client.js";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
-import { AuthStore, bearerToken } from "./auth-store.js";
 import { fetchCeloVaultEvents, fetchGoodIdRoot } from "./celo-events.js";
 import { gdWeiToMicroUsd } from "./credit-bonus.js";
-import { configFromEnv, Env } from "./env.js";
+import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
-import { actualCostMicroUsd, estimateMaxCostMicroUsd } from "./pricing.js";
-import { VaultClient } from "./vault-client.js";
 
-const ChatSchema = z.object({
-  account: z.string().min(1).optional(),
-  model: z.string().optional(),
-  messages: z.array(z.object({
-    role: z.enum(["system", "user", "assistant", "tool"]),
-    content: z.string()
-  })).min(1),
-  max_tokens: z.number().int().positive().optional(),
-  temperature: z.number().min(0).max(2).optional(),
-  metadata: z.record(z.unknown()).optional()
-});
-
-const QuoteSchema = ChatSchema.pick({ messages: true, max_tokens: true });
 const CeloTxSchema = z.object({ txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/) });
 const ManualGdCreditSchema = z.object({
   account: z.string().min(1),
@@ -38,18 +21,6 @@ const StreamUpdateSchema = z.object({
   monthlyGdAmountWei: z.string().regex(/^\d+$/).optional(),
   txHash: z.string().optional(),
   logIndex: z.number().int().nonnegative().optional()
-});
-const AuthNonceSchema = z.object({
-  account: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-  chainId: z.number().int().positive().optional()
-});
-const AuthApiKeySchema = z.object({
-  account: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-  nonce: z.string().min(1),
-  signature: z.string().regex(/^0x[0-9a-fA-F]+$/),
-  label: z.string().min(1).max(120).optional(),
-  scopes: z.array(z.string().min(1)).optional(),
-  expiresInSeconds: z.number().int().positive().optional()
 });
 
 export default {
@@ -68,15 +39,12 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const url = new URL(request.url);
   const cfg = configFromEnv(env);
   const store = new KVCreditStore(env.ANTSEED_KV);
-  const authStore = new AuthStore(env.ANTSEED_KV);
-  const antseed = new AntSeedClient(cfg);
   const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
-  const vault = new VaultClient(cfg);
 
   if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
   if (request.method === "GET" && url.pathname === "/health") {
-    return json({ ok: true, service: "gooddollar-antseed-integration", runtime: "cloudflare-worker", kvEnabled: true, vaultEnabled: vault.enabled });
+    return json({ ok: true, service: "gooddollar-antseed-integration", runtime: "cloudflare-worker", kvEnabled: true, bridgeEnabled: antseedFundingVault.enabled });
   }
 
   if (request.method === "GET" && url.pathname === "/config/status") {
@@ -84,115 +52,29 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       ok: true,
       service: "gooddollar-antseed-integration",
       runtime: "cloudflare-worker",
-      openAiCompatible: {
-        basePath: "/v1",
-        chatCompletionsPath: "/v1/chat/completions",
-        auth: "signed wallet creates gd_live API key; API key is then used as bearer token",
-        accountSelectors: [
-          "Authorization: Bearer gd_live_...",
-          "x-api-key: gd_live_..."
-        ],
-        devOnlyAccountSelectorsEnabled: cfg.ALLOW_UNVERIFIED_ACCOUNT_SELECTOR,
-        devOnlyAccountSelectors: cfg.ALLOW_UNVERIFIED_ACCOUNT_SELECTOR ? [
-          "x-gooddollar-account: 0x...",
-          "Authorization: Bearer gd:0x...",
-          "Authorization: Bearer account:0x...",
-          "JSON body field: account"
-        ] : []
-      },
-      antseed: {
-        model: cfg.ANTSEED_MODEL,
-        baseUrlConfigured: Boolean(env.ANTSEED_BASE_URL),
-        pinPeerConfigured: Boolean(env.ANTSEED_PIN_PEER),
-        pinServiceConfigured: Boolean(env.ANTSEED_PIN_SERVICE),
-        fundingVaultEnabled: antseedFundingVault.enabled,
-        fundingModel: "backend-controlled Base USDC vault funds one backend AntSeed buyer deposit; user G$ credits remain internal accounting"
+      bridge: {
+        celoVaultEvents: true,
+        baseBuyerOperatorEnabled: antseedFundingVault.enabled,
+        mode: "celo-vault-to-base-buyer-operator"
       },
       celo: {
         rpcConfigured: Boolean(env.CELO_RPC_URL),
         vaultConfigured: Boolean(env.CELO_VAULT_ADDRESS),
         goodIdConfigured: Boolean(env.CELO_GOODID_ADDRESS)
       },
-      kvEnabled: true,
-      vaultEnabled: vault.enabled
+      kvEnabled: true
     });
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/auth/nonce") {
-    const body = await parseJson(request);
-    const parsed = AuthNonceSchema.safeParse(body);
-    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const nonce = await authStore.createNonce({
-      account: parsed.data.account,
-      domain: url.host,
-      uri: url.origin,
-      chainId: parsed.data.chainId,
-      ttlSeconds: cfg.AUTH_NONCE_TTL_SECONDS
-    });
-    return json({
-      account: nonce.account,
-      nonce: nonce.nonce,
-      message: nonce.message,
-      expiresAt: nonce.expiresAt
-    }, 201);
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/auth/api-keys") {
-    const body = await parseJson(request);
-    const parsed = AuthApiKeySchema.safeParse(body);
-    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    try {
-      await authStore.consumeNonceAndVerify({
-        account: parsed.data.account,
-        nonce: parsed.data.nonce,
-        signature: parsed.data.signature
-      });
-      const rootAccount = await fetchGoodIdRoot(parsed.data.account, cfg);
-      const created = await authStore.createApiKey({
-        account: parsed.data.account,
-        rootAccount,
-        label: parsed.data.label,
-        scopes: parsed.data.scopes,
-        ttlSeconds: parsed.data.expiresInSeconds ?? cfg.API_KEY_TTL_SECONDS
-      });
-      return json({
-        token: created.token,
-        apiKey: publicApiKey(created.record)
-      }, 201);
-    } catch (err) {
-      return json({ error: err instanceof Error ? err.message : "auth failed" }, 401);
-    }
-  }
-
-  if (request.method === "GET" && url.pathname === "/v1/auth/api-keys") {
-    const auth = await authenticateRequest(request, authStore, cfg, undefined);
-    if (!auth) return json({ error: "valid GoodDollar AntSeed API key required" }, 401);
-    const records = await authStore.listApiKeys(auth.rootAccount);
-    return json({ account: auth.account, rootAccount: auth.rootAccount, apiKeys: records.map(publicApiKey) });
-  }
-
-  const revokeMatch = url.pathname.match(/^\/v1\/auth\/api-keys\/([^/]+)$/);
-  if (request.method === "DELETE" && revokeMatch) {
-    const auth = await authenticateRequest(request, authStore, cfg, undefined);
-    if (!auth) return json({ error: "valid GoodDollar AntSeed API key required" }, 401);
-    try {
-      const revoked = await authStore.revokeApiKey(decodeURIComponent(revokeMatch[1]), auth.rootAccount);
-      return json({ apiKey: publicApiKey(revoked) });
-    } catch (err) {
-      return json({ error: err instanceof Error ? err.message : "revoke failed" }, 404);
-    }
   }
 
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
   if (request.method === "GET" && accountMatch) {
     const account = decodeURIComponent(accountMatch[1]);
-    const [profile, requests, gdCredits, vaultBalances] = await Promise.all([
+    const [profile, requests, gdCredits] = await Promise.all([
       store.getUser(account),
       store.getUserRequests(account),
-      store.getGdCredits(account),
-      vault.balances(account)
+      store.getGdCredits(account)
     ]);
-    return json({ account: profile.account, profile, vault: vaultBalances, requests, gdCredits });
+    return json({ account: profile.account, profile, requests, gdCredits });
   }
 
   const requestMatch = url.pathname.match(/^\/v1\/requests\/([^/]+)$/);
@@ -200,14 +82,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const reservation = await store.getReservation(decodeURIComponent(requestMatch[1]));
     if (!reservation) return json({ error: "request not found" }, 404);
     return json(reservation);
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/credits/quote") {
-    const body = await parseJson(request);
-    const parsed = QuoteSchema.safeParse(body);
-    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const maxCostMicroUsd = estimateMaxCostMicroUsd(cfg, parsed.data.messages, parsed.data.max_tokens);
-    return json({ maxCostMicroUsd: maxCostMicroUsd.toString() });
   }
 
   if (request.method === "POST" && url.pathname === "/v1/celo/events/record") {
@@ -220,7 +94,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
       if (event.kind === "deposit") {
-        recorded.push(await store.recordGdCredit({
+        const entry = await store.recordGdCredit({
           account: event.account,
           rootAccount,
           source: "erc677",
@@ -228,7 +102,9 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           principalMicroUsd: event.principalMicroUsd,
           txHash: event.txHash,
           logIndex: event.logIndex
-        }));
+        });
+        const bridge = await antseedFundingVault.depositForBuyer(event.account, BigInt(entry.totalCreditMicroUsd));
+        recorded.push({ ...entry, bridge });
       } else {
         recorded.push(await store.updateStream(
           event.account,
@@ -260,7 +136,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       txHash: parsed.data.txHash,
       logIndex: parsed.data.logIndex
     });
-    return json(entry);
+    const bridge = await antseedFundingVault.depositForBuyer(parsed.data.account, BigInt(entry.totalCreditMicroUsd));
+    return json({ ...entry, bridge });
   }
 
   if (request.method === "POST" && url.pathname === "/v1/celo/streams/update") {
@@ -278,53 +155,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       parsed.data.logIndex
     );
     return json(state);
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
-    const body = await parseJson(request);
-    const parsed = ChatSchema.safeParse(body);
-    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-
-    const chatRequest = parsed.data;
-    const auth = await authenticateRequest(request, authStore, cfg, chatRequest.account);
-    if (!auth) return json({ error: "valid GoodDollar AntSeed API key required" }, 401);
-    const maxCostMicroUsd = estimateMaxCostMicroUsd(cfg, chatRequest.messages, chatRequest.max_tokens);
-    const reservation = await store.reserve(auth.account, maxCostMicroUsd, auth.rootAccount);
-    const upstreamRequest = { ...chatRequest, account: auth.account };
-
-    try {
-      const vaultReserveTxHash = await vault.reserve(reservation.requestId, reservation.account, maxCostMicroUsd, chatRequest.metadata);
-      await store.markVaultReserved(reservation.requestId, vaultReserveTxHash);
-
-      const antseedFunding = await antseedFundingVault.ensureBuyerBalance(maxCostMicroUsd);
-      const completion = await antseed.chatCompletion(upstreamRequest);
-      const receiptHash = await providerReceiptHash(completion);
-      const cost = actualCostMicroUsd(cfg, completion.usage?.prompt_tokens, completion.usage?.completion_tokens);
-      const vaultSettleTxHash = await vault.settle(reservation.requestId, cost, receiptHash);
-      await store.settle(reservation.requestId, cost, receiptHash, vaultSettleTxHash);
-
-      return json({
-        ...completion,
-        credit: {
-          requestId: reservation.requestId,
-          reservedMicroUsd: maxCostMicroUsd.toString(),
-          settledMicroUsd: cost.toString(),
-          providerReceiptHash: receiptHash,
-          antseedFunding,
-          vaultEnabled: vault.enabled,
-          vaultReserveTxHash,
-          vaultSettleTxHash
-        }
-      });
-    } catch (err) {
-      let vaultReleaseTxHash: string | undefined;
-      try {
-        vaultReleaseTxHash = await vault.release(reservation.requestId);
-      } finally {
-        await store.release(reservation.requestId, vaultReleaseTxHash);
-      }
-      throw err;
-    }
   }
 
   return json({ error: "not found" }, 404);
@@ -346,66 +176,4 @@ function cors(response: Response): Response {
   headers.set("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
   headers.set("access-control-allow-headers", "content-type,authorization,x-api-key,x-gooddollar-account");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
-}
-
-type RequestAuth = {
-  account: string;
-  rootAccount: string;
-  apiKeyId?: string;
-  mode: "api-key" | "dev-selector";
-};
-
-async function authenticateRequest(request: Request, authStore: AuthStore, cfg: ReturnType<typeof configFromEnv>, bodyAccount?: string): Promise<RequestAuth | undefined> {
-  const token = bearerToken(request);
-  if (token) {
-    const verified = await authStore.verifyApiKey(token);
-    if (verified) {
-      return {
-        account: verified.record.account,
-        rootAccount: verified.record.rootAccount,
-        apiKeyId: verified.record.id,
-        mode: "api-key"
-      };
-    }
-  }
-
-  if (!cfg.ALLOW_UNVERIFIED_ACCOUNT_SELECTOR) return undefined;
-  const account = accountSelectorFromRequest(request, bodyAccount);
-  if (!account) return undefined;
-  return { account, rootAccount: await fetchGoodIdRoot(account, cfg), mode: "dev-selector" };
-}
-
-export function accountSelectorFromRequest(request: Request, bodyAccount?: string): string | undefined {
-  if (bodyAccount?.trim()) return bodyAccount.trim();
-
-  const headerAccount = request.headers.get("x-gooddollar-account")?.trim();
-  if (headerAccount) return headerAccount;
-
-  const authAccount = accountFromSelectorToken(request.headers.get("authorization"));
-  if (authAccount) return authAccount;
-
-  return accountFromSelectorToken(request.headers.get("x-api-key"));
-}
-
-function accountFromSelectorToken(value: string | null): string | undefined {
-  if (!value) return undefined;
-  const token = value.replace(/^Bearer\s+/i, "").trim();
-  const match = token.match(/^(?:gd:|account:)(0x[0-9a-fA-F]{40})$/);
-  return match?.[1];
-}
-
-function publicApiKey(record: { id: string; tokenPrefix: string; account: string; rootAccount: string; label?: string; scopes: string[]; status: string; createdAt: string; expiresAt?: string; lastUsedAt?: string; revokedAt?: string }) {
-  return {
-    id: record.id,
-    tokenPrefix: record.tokenPrefix,
-    account: record.account,
-    rootAccount: record.rootAccount,
-    label: record.label,
-    scopes: record.scopes,
-    status: record.status,
-    createdAt: record.createdAt,
-    expiresAt: record.expiresAt,
-    lastUsedAt: record.lastUsedAt,
-    revokedAt: record.revokedAt
-  };
 }
