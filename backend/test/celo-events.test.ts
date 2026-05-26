@@ -37,10 +37,6 @@ test("fetches GoodID root with eth_call for root aggregation", async () => {
 
   try {
     const fetchedRoot = await fetchGoodIdRoot(account, {
-      ANTSEED_BASE_URL: "http://localhost",
-      ANTSEED_MODEL: "test",
-      ANTSEED_TIMEOUT_MS: 1000,
-      ANTSEED_MIN_BUYER_DEPOSIT_MICRO_USD: 1n,
       PRICE_MICRO_USD_PER_1K_INPUT_TOKENS: 1n,
       PRICE_MICRO_USD_PER_1K_OUTPUT_TOKENS: 1n,
       DEFAULT_MAX_OUTPUT_TOKENS: 1,

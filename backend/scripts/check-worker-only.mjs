@@ -41,7 +41,13 @@ for (const file of tracked) {
   if (ignoredContentFiles.has(file)) continue;
   if (file.includes("/node_modules/") || file.includes("/dist/")) continue;
   if (!/\.(ts|tsx|js|mjs|cjs|json|md|toml|yml|yaml)$/.test(file)) continue;
-  const text = readFileSync(new URL(`../../${file}`, import.meta.url), "utf8");
+  let text;
+  try {
+    text = readFileSync(new URL(`../../${file}`, import.meta.url), "utf8");
+  } catch (err) {
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") continue;
+    throw err;
+  }
   for (const pattern of contentPatterns) {
     if (pattern.test(text)) contentHits.push(`${file}: ${pattern}`);
   }
