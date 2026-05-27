@@ -19,7 +19,6 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/accounts/:account/withdraw`
 - `GET /v1/requests/:requestId`
 - `POST /v1/celo/events/record`
-- `POST /v1/celo/deposits/manual`
 - `POST /v1/celo/streams/update`
 - `POST /v1/channels/close`
 

@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
 import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchGoodIdRoot } from "./celo-events.js";
-import { gdWeiToMicroUsd } from "./credit-bonus.js";
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 
@@ -12,14 +11,6 @@ const CeloEventsRecordSchema = z.object({
   toBlock: z.string().regex(/^(latest|0x[0-9a-fA-F]+|\d+)$/).optional()
 }).refine((value) => Boolean(value.txHash || (value.account && value.fromBlock)), {
   message: "provide txHash or account+fromBlock"
-});
-const ManualGdCreditSchema = z.object({
-  account: z.string().min(1),
-  rootAccount: z.string().min(1).optional(),
-  gdAmountWei: z.string().regex(/^\d+$/),
-  source: z.enum(["erc677", "erc777", "erc20", "stream", "manual"]).default("manual"),
-  txHash: z.string().optional(),
-  logIndex: z.number().int().nonnegative().optional()
 });
 const StreamUpdateSchema = z.object({
   account: z.string().min(1),
@@ -159,43 +150,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       toBlock: parsed.data.toBlock ?? "latest",
       events: recorded
     });
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/celo/deposits/manual") {
-    const body = await parseJson(request);
-    const parsed = ManualGdCreditSchema.safeParse(body);
-    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const gdAmountWei = BigInt(parsed.data.gdAmountWei);
-    const principalMicroUsd = gdWeiToMicroUsd(gdAmountWei, cfg.GD_MICRO_USD_PER_TOKEN);
-    const rootAccount = parsed.data.rootAccount ?? await fetchGoodIdRoot(parsed.data.account, cfg);
-    const entry = await store.recordGdCredit({
-      account: parsed.data.account,
-      rootAccount,
-      source: parsed.data.source,
-      gdAmountWei,
-      principalMicroUsd,
-      txHash: parsed.data.txHash,
-      logIndex: parsed.data.logIndex
-    });
-    const depositId = createDepositFundingId(parsed.data.txHash, parsed.data.logIndex, "manual");
-    try {
-      const bridge = await antseedFundingVault.depositForBuyerWithId(parsed.data.account, BigInt(entry.totalCreditMicroUsd), depositId);
-      const updated = await store.markFundingResult(entry.id, { funded: true, id: depositId, txHash: bridge.txHash });
-      return json({ ...updated, bridge, depositId });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "deposit funding failed";
-      const updated = await store.markFundingResult(entry.id, { funded: false, id: depositId, error: message });
-      return json({
-        ...updated,
-        depositId,
-        bridge: {
-          enabled: antseedFundingVault.enabled,
-          buyer: parsed.data.account,
-          amountMicroUsd: entry.totalCreditMicroUsd,
-          error: message
-        }
-      });
-    }
   }
 
   if (request.method === "POST" && url.pathname === "/v1/celo/streams/update") {
