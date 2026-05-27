@@ -20,6 +20,7 @@ interface IConstantFlowAgreementV1Like {
 
 interface IReservePriceOracleLike {
     function gdMicroUsdPerToken() external view returns (uint256);
+    function currentPriceDAI() external view returns (uint256);
 }
 
 /// @title CeloGdAntSeedVault
@@ -27,6 +28,8 @@ interface IReservePriceOracleLike {
 /// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
 ///      and Superfluid SuperApp stream callbacks. Backend converts G$ events into USDC-denominated credits.
 contract CeloGdAntSeedVault {
+    uint256 private constant MICRO_USD_PER_USD = 1_000_000;
+    uint256 private constant RESERVE_PRICE_DECIMALS = 1e18;
     uint256 private constant MIN_REASONABLE_GD_MICRO_USD_PER_TOKEN = 1;
     uint256 private constant MAX_REASONABLE_GD_MICRO_USD_PER_TOKEN = 1_000_000_000;
     error NotOwner();
@@ -292,6 +295,13 @@ contract CeloGdAntSeedVault {
             (bool ok, bytes memory data) = oracle.staticcall(abi.encodeWithSelector(IReservePriceOracleLike.gdMicroUsdPerToken.selector));
             if (ok && data.length >= 32) {
                 uint256 price = abi.decode(data, (uint256));
+                if (price >= MIN_REASONABLE_GD_MICRO_USD_PER_TOKEN && price <= MAX_REASONABLE_GD_MICRO_USD_PER_TOKEN) return price;
+            }
+
+            (ok, data) = oracle.staticcall(abi.encodeWithSelector(IReservePriceOracleLike.currentPriceDAI.selector));
+            if (ok && data.length >= 32) {
+                uint256 reservePriceDai = abi.decode(data, (uint256));
+                uint256 price = (reservePriceDai * MICRO_USD_PER_USD) / RESERVE_PRICE_DECIMALS;
                 if (price >= MIN_REASONABLE_GD_MICRO_USD_PER_TOKEN && price <= MAX_REASONABLE_GD_MICRO_USD_PER_TOKEN) return price;
             }
         }

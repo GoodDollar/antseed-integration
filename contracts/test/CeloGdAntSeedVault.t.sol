@@ -144,6 +144,18 @@ contract MockSuperfluidHost {
     }
 }
 
+contract MockReservePriceOracle {
+    uint256 public priceDai;
+
+    function setCurrentPriceDAI(uint256 value) external {
+        priceDai = value;
+    }
+
+    function currentPriceDAI() external view returns (uint256) {
+        return priceDai;
+    }
+}
+
 contract UserProxy {
     MockGdToken public token;
     CeloGdAntSeedVault public vault;
@@ -366,5 +378,42 @@ contract CeloGdAntSeedVaultTest {
             ""
         ));
         require(!ok, "monthly stream below minimum rejected");
+    }
+
+    function testUsesReserveCurrentPriceForFirstDepositThreshold() public {
+        setUp();
+        MockReservePriceOracle reserve = new MockReservePriceOracle();
+        reserve.setCurrentPriceDAI(5e17); // 0.5 DAI per G$
+        vault.setReserveConfig(address(reserve), 0);
+
+        user.approveVault(2 ether);
+        (bool ok,) = address(user).call(abi.encodeWithSignature("deposit(uint256)", 1.5 ether));
+        require(!ok, "first deposit below $1 reserve equivalent rejected");
+
+        user.deposit(2 ether);
+        require(vault.totalDepositedGd(address(user)) == 2 ether, "deposit at reserve-derived threshold succeeds");
+    }
+
+    function testUsesReserveCurrentPriceForStreamMinimum() public {
+        setUp();
+        MockReservePriceOracle reserve = new MockReservePriceOracle();
+        reserve.setCurrentPriceDAI(2e17); // 0.2 DAI per G$
+        vault.setReserveConfig(address(reserve), 0);
+
+        int96 lowFlow = int96(int256((4 ether) / (30 days)));
+        (bool ok,) = address(host).call(abi.encodeWithSignature(
+            "createFlow(address,address,address,int96,bytes)",
+            address(vault),
+            address(superToken),
+            address(user),
+            lowFlow,
+            ""
+        ));
+        require(!ok, "stream below $1 reserve equivalent rejected");
+
+        int96 minFlow = int96(int256((5 ether) / (30 days)));
+        bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), minFlow, "");
+        require(returnedCtx.length == 0, "ctx passthrough");
+        require(vault.streamFlowRate(address(user)) == minFlow, "stream at reserve-derived threshold succeeds");
     }
 }
