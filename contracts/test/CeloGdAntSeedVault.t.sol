@@ -416,4 +416,15 @@ contract CeloGdAntSeedVaultTest {
         require(returnedCtx.length == 0, "ctx passthrough");
         require(vault.streamFlowRate(address(user)) == minFlow, "stream at reserve-derived threshold succeeds");
     }
+
+    function testAcceptsHighReservePriceWithoutReasonableBoundsFallback() public {
+        setUp();
+        MockReservePriceOracle reserve = new MockReservePriceOracle();
+        reserve.setCurrentPriceDAI(2e21); // 2000 DAI per G$ -> above the old max-reasonable bound path
+        vault.setReserveConfig(address(reserve), 0);
+
+        user.approveVault(1 ether);
+        user.deposit(0.001 ether);
+        require(vault.totalDepositedGd(address(user)) == 0.001 ether, "high reserve price should be used directly");
+    }
 }
