@@ -147,3 +147,40 @@ test("KV store can mark funding success and enforce principal-only withdrawals",
   await store.withdrawPrincipal("0xABC", 1_000_000n);
   await assert.rejects(() => store.withdrawPrincipal("0xABC", 1n), /insufficient deposited principal/);
 });
+
+test("KV store accrues proportional stream bonus on flow change", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const flowRate = 1_157_407_407_407n; // ~3 G$ / month
+  await store.updateStream("0xABC", undefined, flowRate, 1_000_000n);
+  const stream = await store.getStream("0xABC");
+  assert.ok(stream);
+
+  const paidAt = Date.parse(stream.lastBonusPaidAt);
+  const afterHalfMonth = new Date(paidAt + 15 * 24 * 60 * 60 * 1000);
+  const bonusEntry = await store.settleStreamBonusOnFlowChange("0xABC", 0n, undefined, undefined, afterHalfMonth);
+  assert.ok(bonusEntry);
+  assert.equal(bonusEntry.source, "stream");
+  assert.equal(bonusEntry.totalCreditMicroUsd, "299999");
+
+  const profile = await store.getUser("0xABC");
+  assert.equal(profile.totalOutstandingStreamBonusMicroUsd, "299999");
+
+  await store.markFundingResult(bonusEntry.id, { funded: true, txHash: "0xstreamfund" });
+  const fundedProfile = await store.getUser("0xABC");
+  assert.equal(fundedProfile.totalOutstandingStreamBonusMicroUsd, "0");
+});
+
+test("KV store settles monthly stream bonus for active streams", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const flowRate = 1_157_407_407_407n; // ~3 G$ / month
+  await store.updateStream("0xABC", undefined, flowRate, 1_000_000n);
+  const stream = await store.getStream("0xABC");
+  assert.ok(stream);
+
+  const paidAt = Date.parse(stream.lastBonusPaidAt);
+  const afterMonth = new Date(paidAt + 31 * 24 * 60 * 60 * 1000);
+  const bonusEntry = await store.settleDueStreamBonus("0xABC", afterMonth);
+  assert.ok(bonusEntry);
+  assert.equal(bonusEntry.source, "stream");
+  assert.equal(bonusEntry.totalCreditMicroUsd, "599999");
+});

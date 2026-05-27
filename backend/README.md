@@ -7,7 +7,8 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - Wrangler Cloudflare Worker (`src/worker.ts`) only
 - KV namespace binding: `ANTSEED_KV`
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
-- Optional Base `AntseedBuyerOperator` bridge client that calls `depositFor(buyer, amount)`
+- Optional Base `AntseedBuyerOperator` bridge client that calls `depositForWithId(buyer, amount, id)`
+- Cron trigger every minute for stream bonus settlement checks
 
 ## Endpoints
 
@@ -21,6 +22,10 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/celo/deposits/manual`
 - `POST /v1/celo/streams/update`
 - `POST /v1/channels/close`
+
+`POST /v1/celo/events/record` accepts either:
+- `{ "txHash": "0x..." }`
+- `{ "account": "0x...", "fromBlock": "0x...", "toBlock": "latest" }`
 
 ## Setup
 

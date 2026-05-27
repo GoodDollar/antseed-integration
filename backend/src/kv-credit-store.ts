@@ -9,7 +9,12 @@ const USER_REQUESTS_PREFIX = "user-requests:";
 const GD_CREDIT_PREFIX = "gd-credit:";
 const USER_GD_CREDITS_PREFIX = "user-gd-credits:";
 const STREAM_PREFIX = "stream:";
+const STREAM_INDEX_KEY = "stream-index";
 const STREAM_BONUS_USED_PREFIX = "stream-bonus-used:";
+const STREAM_MONTH_SECONDS = BigInt(30 * 24 * 60 * 60);
+const STREAM_BONUS_BPS = 2_000n;
+const BPS = 10_000n;
+const MAX_TRACKED_STREAMS = 1000;
 
 export class KVCreditStore {
   constructor(private readonly kv: KV) {}
@@ -119,18 +124,22 @@ export class KVCreditStore {
     const monthlyGd = monthlyGdAmountWei ?? flowRateWeiPerSecond * BigInt(30 * 24 * 60 * 60);
     const monthlyUsd = monthlyStreamMicroUsd(flowRateWeiPerSecond, gdMicroUsdPerToken);
     const now = new Date().toISOString();
+    const previous = await this.getStream(normalized);
     const state: StreamState = {
       account: normalized,
       rootAccount: normalizedRoot,
       flowRateWeiPerSecond: flowRateWeiPerSecond.toString(),
       monthlyGdAmountWei: monthlyGd.toString(),
       monthlyMicroUsd: monthlyUsd.toString(),
+      active: flowRateWeiPerSecond > 0n,
+      lastBonusPaidAt: previous?.active ? previous.lastBonusPaidAt : now,
       txHash,
       logIndex,
       updatedAt: now
     };
     await this.putJson(`${STREAM_PREFIX}${normalized}`, state);
     await this.putJson(`${STREAM_PREFIX}${normalizedRoot}`, state);
+    await this.addStreamToIndex(normalizedRoot);
     await this.updateUser(normalized, normalizedRoot, (profile) => ({
       ...profile,
       updatedAt: now,
@@ -138,6 +147,64 @@ export class KVCreditStore {
       streamMonthlyMicroUsd: state.monthlyMicroUsd
     }));
     return state;
+  }
+
+  async settleStreamBonusOnFlowChange(
+    account: string,
+    nextFlowRateWeiPerSecond: bigint,
+    txHash?: string,
+    logIndex?: number,
+    now = new Date()
+  ): Promise<GdCreditEntry | undefined> {
+    const stream = await this.getStream(account);
+    if (!stream) return undefined;
+    const previousFlowRate = BigInt(stream.flowRateWeiPerSecond);
+    if (previousFlowRate <= 0n || previousFlowRate === nextFlowRateWeiPerSecond) return undefined;
+    const nowMs = now.getTime();
+    const paidAtMs = Date.parse(stream.lastBonusPaidAt);
+    if (!Number.isFinite(paidAtMs) || nowMs <= paidAtMs) return undefined;
+    const createdAt = now.toISOString();
+    const credit = await this.recordStreamBonusCredit({
+      account: stream.account,
+      rootAccount: stream.rootAccount,
+      monthlyGdAmountWei: BigInt(stream.monthlyGdAmountWei),
+      monthlyMicroUsd: BigInt(stream.monthlyMicroUsd),
+      elapsedSeconds: BigInt(Math.floor((nowMs - paidAtMs) / 1000)),
+      txHash,
+      logIndex,
+      createdAt
+    });
+    if (!credit) return undefined;
+    stream.lastBonusPaidAt = createdAt;
+    stream.updatedAt = createdAt;
+    await this.putJson(`${STREAM_PREFIX}${stream.account}`, stream);
+    await this.putJson(`${STREAM_PREFIX}${stream.rootAccount}`, stream);
+    return credit;
+  }
+
+  async settleDueStreamBonus(account: string, now = new Date()): Promise<GdCreditEntry | undefined> {
+    const stream = await this.getStream(account);
+    if (!stream?.active) return undefined;
+    const nowMs = now.getTime();
+    const paidAtMs = Date.parse(stream.lastBonusPaidAt);
+    if (!Number.isFinite(paidAtMs)) return undefined;
+    if (nowMs - paidAtMs < Number(STREAM_MONTH_SECONDS) * 1000) return undefined;
+    const elapsedSeconds = BigInt(Math.floor((nowMs - paidAtMs) / 1000));
+    const credit = await this.recordStreamBonusCredit({
+      account: stream.account,
+      rootAccount: stream.rootAccount,
+      monthlyGdAmountWei: BigInt(stream.monthlyGdAmountWei),
+      monthlyMicroUsd: BigInt(stream.monthlyMicroUsd),
+      elapsedSeconds,
+      createdAt: now.toISOString()
+    });
+    if (credit) {
+      stream.lastBonusPaidAt = now.toISOString();
+      stream.updatedAt = now.toISOString();
+      await this.putJson(`${STREAM_PREFIX}${stream.account}`, stream);
+      await this.putJson(`${STREAM_PREFIX}${stream.rootAccount}`, stream);
+    }
+    return credit;
   }
 
   async recordGdCredit(input: {
@@ -217,7 +284,10 @@ export class KVCreditStore {
       await this.updateUser(entry.account, entry.rootAccount, (current) => ({
         ...current,
         updatedAt: now,
-        totalOutstandingFundingMicroUsd: subtractDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd)
+        totalOutstandingFundingMicroUsd: subtractDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd),
+        totalOutstandingStreamBonusMicroUsd: entry.source === "stream"
+          ? subtractDecimalStrings(current.totalOutstandingStreamBonusMicroUsd, entry.totalCreditMicroUsd)
+          : current.totalOutstandingStreamBonusMicroUsd
       }));
     }
     return entry;
@@ -252,6 +322,17 @@ export class KVCreditStore {
     const ids = (await this.getJson<string[]>(`${USER_GD_CREDITS_PREFIX}${normalized}`)) ?? [];
     const entries = await Promise.all(ids.map((id) => this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`)));
     return entries.filter((item): item is GdCreditEntry => Boolean(item));
+  }
+
+  async getStream(account: string): Promise<StreamState | undefined> {
+    const normalized = normalizeAccount(account);
+    return this.getJson<StreamState>(`${STREAM_PREFIX}${normalized}`);
+  }
+
+  async listTrackedStreams(): Promise<StreamState[]> {
+    const accounts = (await this.getJson<string[]>(STREAM_INDEX_KEY)) ?? [];
+    const streams = await Promise.all(accounts.map((account) => this.getStream(account)));
+    return streams.filter((item): item is StreamState => Boolean(item));
   }
 
   async getReservation(requestId: string): Promise<CreditReservation | undefined> {
@@ -293,6 +374,64 @@ export class KVCreditStore {
     const ids = (await this.getJson<string[]>(key)) ?? [];
     if (!ids.includes(entryId)) ids.push(entryId);
     await this.putJson(key, ids.slice(-500));
+  }
+
+  private async addStreamToIndex(account: string): Promise<void> {
+    const normalized = normalizeAccount(account);
+    const streams = (await this.getJson<string[]>(STREAM_INDEX_KEY)) ?? [];
+    if (!streams.includes(normalized)) streams.push(normalized);
+    await this.putJson(STREAM_INDEX_KEY, streams.slice(-MAX_TRACKED_STREAMS));
+  }
+
+  private async recordStreamBonusCredit(input: {
+    account: string;
+    rootAccount: string;
+    monthlyGdAmountWei: bigint;
+    monthlyMicroUsd: bigint;
+    elapsedSeconds: bigint;
+    txHash?: string;
+    logIndex?: number;
+    createdAt: string;
+  }): Promise<GdCreditEntry | undefined> {
+    if (input.monthlyGdAmountWei <= 0n || input.monthlyMicroUsd <= 0n || input.elapsedSeconds <= 0n) {
+      return undefined;
+    }
+    // Settle at most one month per credit entry; remaining active-time bonus is handled on later runs.
+    const elapsed = input.elapsedSeconds > STREAM_MONTH_SECONDS ? STREAM_MONTH_SECONDS : input.elapsedSeconds;
+    const principal = (input.monthlyMicroUsd * elapsed) / STREAM_MONTH_SECONDS;
+    if (principal <= 0n) return undefined;
+    const gdAmount = (input.monthlyGdAmountWei * elapsed) / STREAM_MONTH_SECONDS;
+    const bonus = (principal * STREAM_BONUS_BPS) / BPS;
+    const entry: GdCreditEntry = {
+      id: crypto.randomUUID(),
+      account: input.account,
+      rootAccount: input.rootAccount,
+      source: "stream",
+      gdAmountWei: gdAmount.toString(),
+      principalMicroUsd: "0",
+      regularBonusMicroUsd: "0",
+      streamingBonusMicroUsd: bonus.toString(),
+      totalCreditMicroUsd: bonus.toString(),
+      streamingBonusPrincipalAppliedMicroUsd: principal.toString(),
+      month: monthKey(new Date(input.createdAt)),
+      txHash: input.txHash,
+      logIndex: input.logIndex,
+      fundingStatus: "pending",
+      createdAt: input.createdAt
+    };
+    await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
+    await this.addGdCreditToAccount(entry.account, entry.id);
+    await this.addGdCreditToAccount(entry.rootAccount, entry.id);
+    await this.updateUser(entry.account, entry.rootAccount, (current) => ({
+      ...current,
+      updatedAt: input.createdAt,
+      totalGdCreditsIssuedMicroUsd: addDecimalStrings(current.totalGdCreditsIssuedMicroUsd, entry.totalCreditMicroUsd),
+      totalStreamingBonusMicroUsd: addDecimalStrings(current.totalStreamingBonusMicroUsd, entry.streamingBonusMicroUsd),
+      totalOutstandingFundingMicroUsd: addDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd),
+      totalOutstandingStreamBonusMicroUsd: addDecimalStrings(current.totalOutstandingStreamBonusMicroUsd, entry.totalCreditMicroUsd),
+      creditBalanceMicroUsd: addDecimalStrings(current.creditBalanceMicroUsd, entry.totalCreditMicroUsd)
+    }));
+    return entry;
   }
 
   private async updateUser(account: string, rootAccount: string | undefined, mutate: (profile: UserCreditProfile) => UserCreditProfile): Promise<void> {
@@ -337,6 +476,7 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalRegularBonusMicroUsd: saved?.totalRegularBonusMicroUsd ?? "0",
     totalStreamingBonusMicroUsd: saved?.totalStreamingBonusMicroUsd ?? "0",
     totalOutstandingFundingMicroUsd: saved?.totalOutstandingFundingMicroUsd ?? "0",
+    totalOutstandingStreamBonusMicroUsd: saved?.totalOutstandingStreamBonusMicroUsd ?? "0",
     totalWithdrawnPrincipalMicroUsd: saved?.totalWithdrawnPrincipalMicroUsd ?? "0",
     streamFlowRateWeiPerSecond: saved?.streamFlowRateWeiPerSecond ?? "0",
     streamMonthlyMicroUsd: saved?.streamMonthlyMicroUsd ?? "0",

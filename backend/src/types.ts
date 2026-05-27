@@ -34,6 +34,7 @@ export type UserCreditProfile = {
   totalRegularBonusMicroUsd: string;
   totalStreamingBonusMicroUsd: string;
   totalOutstandingFundingMicroUsd: string;
+  totalOutstandingStreamBonusMicroUsd: string;
   totalWithdrawnPrincipalMicroUsd: string;
   streamFlowRateWeiPerSecond: string;
   streamMonthlyMicroUsd: string;
@@ -67,6 +68,8 @@ export type StreamState = {
   flowRateWeiPerSecond: string;
   monthlyGdAmountWei: string;
   monthlyMicroUsd: string;
+  active: boolean;
+  lastBonusPaidAt: string;
   txHash?: string;
   logIndex?: number;
   updatedAt: string;

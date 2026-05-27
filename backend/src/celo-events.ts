@@ -1,4 +1,4 @@
-import { Interface, LogDescription, getAddress, isAddress } from "ethers";
+import { Interface, LogDescription, getAddress, isAddress, zeroPadValue } from "ethers";
 import { RuntimeConfig } from "./env.js";
 import { gdWeiToMicroUsd } from "./credit-bonus.js";
 
@@ -49,6 +49,27 @@ export async function fetchCeloVaultEvents(txHash: string, cfg: RuntimeConfig): 
   const receipt = await rpc<{ logs: RpcLog[] }>(cfg.CELO_RPC_URL, "eth_getTransactionReceipt", [txHash]);
   if (!receipt) throw new Error(`transaction receipt not found: ${txHash}`);
   return parseCeloVaultLogs(receipt.logs, cfg.CELO_VAULT_ADDRESS, cfg.GD_MICRO_USD_PER_TOKEN);
+}
+
+export async function fetchCeloVaultEventsForAccount(
+  account: string,
+  cfg: RuntimeConfig,
+  fromBlock: string,
+  toBlock = "latest"
+): Promise<ParsedCeloVaultEvent[]> {
+  if (!cfg.CELO_RPC_URL) throw new Error("CELO_RPC_URL is required to verify Celo vault events");
+  if (!cfg.CELO_VAULT_ADDRESS) throw new Error("CELO_VAULT_ADDRESS is required to verify Celo vault events");
+  const depositEvent = VAULT_EVENTS.getEvent("GdDeposited");
+  const streamEvent = VAULT_EVENTS.getEvent("StreamUpdated");
+  if (!depositEvent || !streamEvent) throw new Error("vault event ABI missing");
+  const accountTopic = zeroPadValue(account, 32);
+  const logs = await rpc<RpcLog[]>(cfg.CELO_RPC_URL, "eth_getLogs", [{
+    address: cfg.CELO_VAULT_ADDRESS,
+    fromBlock,
+    toBlock,
+    topics: [[depositEvent.topicHash, streamEvent.topicHash], [accountTopic]]
+  }]);
+  return parseCeloVaultLogs(logs, cfg.CELO_VAULT_ADDRESS, cfg.GD_MICRO_USD_PER_TOKEN);
 }
 
 export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string, gdMicroUsdPerToken: bigint): ParsedCeloVaultEvent[] {

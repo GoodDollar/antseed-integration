@@ -1,11 +1,18 @@
 import { z } from "zod";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
-import { fetchCeloVaultEvents, fetchGoodIdRoot } from "./celo-events.js";
+import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchGoodIdRoot } from "./celo-events.js";
 import { gdWeiToMicroUsd } from "./credit-bonus.js";
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 
-const CeloTxSchema = z.object({ txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/) });
+const CeloEventsRecordSchema = z.object({
+  txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
+  account: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional(),
+  fromBlock: z.string().regex(/^(latest|0x[0-9a-fA-F]+|\d+)$/).optional(),
+  toBlock: z.string().regex(/^(latest|0x[0-9a-fA-F]+|\d+)$/).optional()
+}).refine((value) => Boolean(value.txHash || (value.account && value.fromBlock)), {
+  message: "provide txHash or account+fromBlock"
+});
 const ManualGdCreditSchema = z.object({
   account: z.string().min(1),
   rootAccount: z.string().min(1).optional(),
@@ -38,6 +45,18 @@ export default {
       const message = err instanceof Error ? err.message : "unknown error";
       console.error(message, err);
       return json({ error: message }, 500);
+    }
+  },
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const cfg = configFromEnv(env);
+    const store = new KVCreditStore(env.ANTSEED_KV);
+    const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
+    const streams = await store.listTrackedStreams();
+    for (const stream of streams) {
+      if (!stream.active) continue;
+      const credit = await store.settleDueStreamBonus(stream.account, new Date());
+      if (!credit) continue;
+      ctx.waitUntil(fundCredit(credit, store, antseedFundingVault, createStreamFundingId(credit.account, credit.createdAt)));
     }
   }
 };
@@ -93,10 +112,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
   if (request.method === "POST" && url.pathname === "/v1/celo/events/record") {
     const body = await parseJson(request);
-    const parsed = CeloTxSchema.safeParse(body);
+    const parsed = CeloEventsRecordSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-
-    const events = await fetchCeloVaultEvents(parsed.data.txHash, cfg);
+    const events = parsed.data.txHash
+      ? await fetchCeloVaultEvents(parsed.data.txHash, cfg)
+      : await fetchCeloVaultEventsForAccount(parsed.data.account!, cfg, parsed.data.fromBlock!, parsed.data.toBlock ?? "latest");
     const recorded = [];
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
@@ -132,7 +152,13 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         ));
       }
     }
-    return json({ txHash: parsed.data.txHash, events: recorded });
+    return json({
+      txHash: parsed.data.txHash,
+      account: parsed.data.account?.toLowerCase(),
+      fromBlock: parsed.data.fromBlock,
+      toBlock: parsed.data.toBlock ?? "latest",
+      events: recorded
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/v1/celo/deposits/manual") {
@@ -177,6 +203,15 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const parsed = StreamUpdateSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
     const rootAccount = parsed.data.rootAccount ?? await fetchGoodIdRoot(parsed.data.account, cfg);
+    const settled = await store.settleStreamBonusOnFlowChange(
+      parsed.data.account,
+      BigInt(parsed.data.flowRateWeiPerSecond),
+      parsed.data.txHash,
+      parsed.data.logIndex
+    );
+    if (settled) {
+      await fundCredit(settled, store, antseedFundingVault, createStreamFundingId(settled.account, settled.createdAt));
+    }
     const state = await store.updateStream(
       parsed.data.account,
       rootAccount,
@@ -186,7 +221,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       parsed.data.txHash,
       parsed.data.logIndex
     );
-    return json(state);
+    return json({ ...state, settledStreamBonusCreditId: settled?.id });
   }
 
   const outstandingMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/outstanding$/);
@@ -200,7 +235,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({
       account: profile.account,
       outstandingFundingMicroUsd: profile.totalOutstandingFundingMicroUsd,
-      outstandingStreamBonusMicroUsd: "0",
+      outstandingStreamBonusMicroUsd: profile.totalOutstandingStreamBonusMicroUsd,
       failedFundingCredits: outstandingFundingCredits
     });
   }
@@ -250,4 +285,28 @@ function cors(response: Response): Response {
 function createDepositFundingId(txHash: string | undefined, logIndex: number | undefined, prefix: string): string {
   if (txHash && logIndex !== undefined && logIndex !== null) return `${txHash}:${logIndex}`;
   return `${prefix}:${Date.now()}`;
+}
+
+function createStreamFundingId(account: string, createdAt: string): string {
+  const timestamp = Date.parse(createdAt);
+  if (!Number.isFinite(timestamp)) {
+    console.warn("invalid stream credit createdAt timestamp, falling back to current time", { account, createdAt });
+  }
+  return `stream:${Number.isFinite(timestamp) ? timestamp : Date.now()}:${account.toLowerCase()}`;
+}
+
+async function fundCredit(
+  entry: { id: string; account: string; totalCreditMicroUsd: string },
+  store: KVCreditStore,
+  antseedFundingVault: AntSeedFundingVaultClient,
+  fundingId: string
+): Promise<void> {
+  try {
+    const bridge = await antseedFundingVault.depositForBuyerWithId(entry.account, BigInt(entry.totalCreditMicroUsd), fundingId);
+    await store.markFundingResult(entry.id, { funded: true, id: fundingId, txHash: bridge.txHash });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "deposit funding failed";
+    console.error("stream/deferred funding failed", { account: entry.account, entryId: entry.id, fundingId, message });
+    await store.markFundingResult(entry.id, { funded: false, id: fundingId, error: message });
+  }
 }
