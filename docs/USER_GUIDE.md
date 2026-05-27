@@ -157,7 +157,7 @@ token = G$ SuperToken on Celo
 flowRate = token-wei per second
 ```
 
-When the stream is created or updated, the vault emits `StreamUpdated(account, flowRate, monthlyGdAmountWei)`. Record the stream update through the Worker the same way:
+When the stream is created or updated, the vault emits `StreamUpdated(account, flowRate, monthlyGdAmountWei, totalFlowWei)`, where `totalFlowWei = previousFlowRate * secondsSincePreviousUpdate`. Record the stream update through the Worker the same way:
 
 ```bash
 curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/celo/events/record" \

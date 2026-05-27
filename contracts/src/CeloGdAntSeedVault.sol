@@ -64,7 +64,7 @@ contract CeloGdAntSeedVault {
     event ReservePriceOracleUpdated(address indexed reservePriceOracle);
     event MinimumsUpdated(uint256 minFirstDepositMicroUsd, uint256 minMonthlyStreamMicroUsd, uint256 fallbackGdMicroUsdPerToken);
     event GdDeposited(address indexed account, address indexed payer, uint256 gdAmount, bytes data);
-    event StreamUpdated(address indexed account, int96 flowRate, uint256 monthlyGdAmountWei);
+    event StreamUpdated(address indexed account, int96 flowRate, uint256 monthlyGdAmountWei, uint256 totalFlowWei);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -171,33 +171,33 @@ contract CeloGdAntSeedVault {
     }
 
     function beforeAgreementCreated(
-        address,
-        address,
+        address superToken,
+        address agreementClass,
         bytes32,
-        bytes calldata,
-        bytes calldata ctx
+        bytes calldata agreementData,
+        bytes calldata
     ) external view onlySuperfluidHost returns (bytes memory cbdata) {
-        return ctx;
+        return _currentFlowSnapshot(superToken, agreementClass, agreementData);
     }
 
     function beforeAgreementUpdated(
-        address,
-        address,
+        address superToken,
+        address agreementClass,
         bytes32,
-        bytes calldata,
-        bytes calldata ctx
+        bytes calldata agreementData,
+        bytes calldata
     ) external view onlySuperfluidHost returns (bytes memory cbdata) {
-        return ctx;
+        return _currentFlowSnapshot(superToken, agreementClass, agreementData);
     }
 
     function beforeAgreementTerminated(
-        address,
-        address,
+        address superToken,
+        address agreementClass,
         bytes32,
-        bytes calldata,
-        bytes calldata ctx
+        bytes calldata agreementData,
+        bytes calldata
     ) external view onlySuperfluidHost returns (bytes memory cbdata) {
-        return ctx;
+        return _currentFlowSnapshot(superToken, agreementClass, agreementData);
     }
 
     function afterAgreementCreated(
@@ -205,10 +205,10 @@ contract CeloGdAntSeedVault {
         address agreementClass,
         bytes32,
         bytes calldata agreementData,
-        bytes calldata,
+        bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        _recordStream(superToken, agreementClass, agreementData, true);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, true);
         return ctx;
     }
 
@@ -217,10 +217,10 @@ contract CeloGdAntSeedVault {
         address agreementClass,
         bytes32,
         bytes calldata agreementData,
-        bytes calldata,
+        bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        _recordStream(superToken, agreementClass, agreementData, true);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, true);
         return ctx;
     }
 
@@ -229,11 +229,11 @@ contract CeloGdAntSeedVault {
         address agreementClass,
         bytes32,
         bytes calldata agreementData,
-        bytes calldata,
+        bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
         // Do not block stream termination if the user later lost GoodID status.
-        _recordStream(superToken, agreementClass, agreementData, false);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, false);
         return ctx;
     }
 
@@ -255,7 +255,13 @@ contract CeloGdAntSeedVault {
         emit GdDeposited(account, payer, amount, data);
     }
 
-    function _recordStream(address superToken, address agreementClass, bytes calldata agreementData, bool enforceGoodID) private {
+    function _recordStream(
+        address superToken,
+        address agreementClass,
+        bytes calldata agreementData,
+        bytes calldata cbdata,
+        bool enforceGoodID
+    ) private {
         if (superToken != gdSuperToken) revert UnsupportedToken();
         if (agreementClass != cfaV1) revert UnsupportedAgreement();
 
@@ -263,14 +269,45 @@ contract CeloGdAntSeedVault {
         if (receiver != address(this)) revert WrongReceiver();
         if (enforceGoodID) _requireVerified(sender);
 
-        (, int96 flowRate,,) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
+        (uint256 previousTimestamp, int96 previousFlowRate) = _decodeFlowSnapshot(cbdata);
+        (uint256 currentTimestamp, int96 flowRate,,) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
         if (flowRate < 0) revert NegativeFlowRate();
 
         streamFlowRate[sender] = flowRate;
         uint256 monthlyAmount = uint256(uint96(flowRate)) * 30 days;
         if (monthlyAmount > 0 && _gdWeiToMicroUsd(monthlyAmount) < minMonthlyStreamMicroUsd) revert StreamRateBelowMinimum();
         streamMonthlyGdAmount[sender] = monthlyAmount;
-        emit StreamUpdated(sender, flowRate, monthlyAmount);
+
+        uint256 elapsedSeconds = currentTimestamp > previousTimestamp ? currentTimestamp - previousTimestamp : 0;
+        uint256 totalFlow = 0;
+        if (previousFlowRate > 0 && elapsedSeconds > 0) {
+            totalFlow = uint256(uint96(previousFlowRate)) * elapsedSeconds;
+        }
+
+        emit StreamUpdated(sender, flowRate, monthlyAmount, totalFlow);
+    }
+
+    function _currentFlowSnapshot(address superToken, address agreementClass, bytes calldata agreementData)
+        private
+        view
+        returns (bytes memory cbdata)
+    {
+        if (superToken != gdSuperToken || agreementClass != cfaV1) {
+            return abi.encode(uint256(0), int96(0));
+        }
+
+        (address sender, address receiver) = abi.decode(agreementData, (address, address));
+        if (receiver != address(this)) {
+            return abi.encode(uint256(0), int96(0));
+        }
+
+        (uint256 timestamp, int96 flowRate,,) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
+        return abi.encode(timestamp, flowRate);
+    }
+
+    function _decodeFlowSnapshot(bytes calldata cbdata) private pure returns (uint256 previousTimestamp, int96 previousFlowRate) {
+        if (cbdata.length != 64) return (0, 0);
+        return abi.decode(cbdata, (uint256, int96));
     }
 
     function _requireVerified(address account) private view {

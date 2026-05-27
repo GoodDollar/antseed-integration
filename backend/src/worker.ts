@@ -1,8 +1,16 @@
+/***
+ * TODO
+ * 1. keep list of user deposit/stream events when calling store.recordGdCredit, so it can be returned in the API response and used by frontend to correlate with on-chain events and show correct status in UI (eg. if funding failed, frontend can show "failed to credit" status on the specific deposit/stream event instead of just showing "0 G$ available" with no explanation)
+ * 2. end point for user requesting credits for their active streams (if they want to trigger funding outside of the cron or deposit events)
+ * 3. implement withdraw endpoint, user can withdraw their principal from the vault if they want to stop using antseed. any unused deposited bonus will be withdrawn back to the vault.
+ * 4. implement max bonus cap per rootaccount to prevent abuse (eg. if someone creates 1000 accounts and deposits 1 GD in each to get 0.2 USD bonus on each deposit, we should have a cap like max 100 USD bonus per root account or something like that)
+ */
 import { z } from "zod";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
-import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchGoodIdRoot } from "./celo-events.js";
+import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdMicroUsdPerToken, fetchGoodIdRoot } from "./celo-events.js";
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
+import { GdCreditEntry } from "./types.js";
 
 const CeloEventsRecordSchema = z.object({
   txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
@@ -27,6 +35,24 @@ const WithdrawSchema = z.object({
 const CloseChannelSchema = z.object({
   channelId: z.string().regex(/^0x[0-9a-fA-F]{64}$/)
 });
+const SuperfluidStreamsResponseSchema = z.object({
+  data: z.object({
+    streams: z.array(z.object({
+      sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
+      currentFlowRate: z.string().regex(/^\d+$/),
+      updatedAtTimestamp: z.string().regex(/^\d+$/)
+    }))
+  })
+});
+
+const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superfluid.dev/celo-mainnet/protocol-v1";
+
+type SuperfluidIncomingStream = {
+  account: string;
+  gdAmountWei: string;
+  flowRateWeiPerSecond: string;
+  lastUpdateAt: string;
+};
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -42,15 +68,28 @@ export default {
     const cfg = configFromEnv(env);
     const store = new KVCreditStore(env.ANTSEED_KV);
     const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
-    const streams = await store.listTrackedStreams();
+
+
+    const gdPrice = await fetchCurrentGdMicroUsdPerToken(cfg);
+    const streams = await fetchSuperfluidIncomingStreams(cfg);
+    const createdAt = new Date().toISOString();
     for (const stream of streams) {
-      if (!stream.active) continue;
-      const credit = await store.settleDueStreamBonus(stream.account, new Date());
-      if (!credit) continue;
-      ctx.waitUntil(fundCredit(credit, store, antseedFundingVault, createStreamFundingId(credit.account, credit.createdAt)));
+      const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
+      const depositId = createStreamFundingId(stream.account, createdAt);
+      const entry = await store.recordGdCredit({
+        id: depositId,
+        account: stream.account,
+        rootAccount,
+        source: "streamCron",
+        gdAmountWei: BigInt(stream.gdAmountWei),
+        flowRate: BigInt(stream.flowRateWeiPerSecond),
+        isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+        gdPrice
+      });
+      ctx.waitUntil(fundCredit(entry, store, antseedFundingVault));
     }
   }
-};
+}
 
 async function route(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
@@ -77,7 +116,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       celo: {
         rpcConfigured: Boolean(env.CELO_RPC_URL),
         vaultConfigured: Boolean(env.CELO_VAULT_ADDRESS),
-        goodIdConfigured: Boolean(env.CELO_GOODID_ADDRESS)
+        goodIdConfigured: Boolean(env.CELO_GOODID_ADDRESS),
+        reserveOracleConfigured: Boolean(env.CELO_RESERVE_PRICE_ORACLE_ADDRESS)
       },
       kvEnabled: true
     });
@@ -94,12 +134,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ account: profile.account, profile, requests, gdCredits });
   }
 
-  const requestMatch = url.pathname.match(/^\/v1\/requests\/([^/]+)$/);
-  if (request.method === "GET" && requestMatch) {
-    const reservation = await store.getReservation(decodeURIComponent(requestMatch[1]));
-    if (!reservation) return json({ error: "request not found" }, 404);
-    return json(reservation);
-  }
 
   if (request.method === "POST" && url.pathname === "/v1/celo/events/record") {
     const body = await parseJson(request);
@@ -109,38 +143,40 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       ? await fetchCeloVaultEvents(parsed.data.txHash, cfg)
       : await fetchCeloVaultEventsForAccount(parsed.data.account!, cfg, parsed.data.fromBlock!, parsed.data.toBlock ?? "latest");
     const recorded = [];
+    const gdPrice = await fetchCurrentGdMicroUsdPerToken(cfg);
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
       if (event.kind === "deposit") {
+        const depositId = `${event.txHash}:${event.logIndex}`;
         const entry = await store.recordGdCredit({
+          id: depositId,
           account: event.account,
           rootAccount,
-          source: "erc677",
+          source: "deposit",
           gdAmountWei: event.gdAmountWei,
-          principalMicroUsd: event.principalMicroUsd,
           txHash: event.txHash,
-          logIndex: event.logIndex
+          logIndex: event.logIndex,
+          isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+          gdPrice
         });
-        const depositId = createDepositFundingId(event.txHash, event.logIndex, "event");
-        try {
-          const bridge = await antseedFundingVault.depositForBuyerWithId(event.account, BigInt(entry.totalCreditMicroUsd), depositId);
-          const updated = await store.markFundingResult(entry.id, { funded: true, id: depositId, txHash: bridge.txHash });
-          recorded.push({ ...updated, bridge, depositId });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "deposit funding failed";
-          const updated = await store.markFundingResult(entry.id, { funded: false, id: depositId, error: message });
-          recorded.push({ ...updated, bridge: { enabled: antseedFundingVault.enabled, buyer: event.account, amountMicroUsd: entry.totalCreditMicroUsd, error: message }, depositId });
-        }
+        const res = await fundCredit(entry, store, antseedFundingVault);
+        recorded.push(res);
       } else {
-        recorded.push(await store.updateStream(
-          event.account,
+        const depositId = `${event.txHash}:${event.logIndex}`;
+        const entry = await store.recordGdCredit({
+          id: depositId,
+          account: event.account,
           rootAccount,
-          event.flowRateWeiPerSecond,
-          cfg.GD_MICRO_USD_PER_TOKEN,
-          event.monthlyGdAmountWei,
-          event.txHash,
-          event.logIndex
-        ));
+          source: "streamUpdate",
+          gdAmountWei: event.totalFlowWei,
+          flowRate: event.flowRateWeiPerSecond,
+          txHash: event.txHash,
+          logIndex: event.logIndex,
+          isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+          gdPrice
+        });
+        const res = await fundCredit(entry, store, antseedFundingVault);
+        recorded.push(res);
       }
     }
     return json({
@@ -150,32 +186,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       toBlock: parsed.data.toBlock ?? "latest",
       events: recorded
     });
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/celo/streams/update") {
-    const body = await parseJson(request);
-    const parsed = StreamUpdateSchema.safeParse(body);
-    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const rootAccount = parsed.data.rootAccount ?? await fetchGoodIdRoot(parsed.data.account, cfg);
-    const settled = await store.settleStreamBonusOnFlowChange(
-      parsed.data.account,
-      BigInt(parsed.data.flowRateWeiPerSecond),
-      parsed.data.txHash,
-      parsed.data.logIndex
-    );
-    if (settled) {
-      await fundCredit(settled, store, antseedFundingVault, createStreamFundingId(settled.account, settled.createdAt));
-    }
-    const state = await store.updateStream(
-      parsed.data.account,
-      rootAccount,
-      BigInt(parsed.data.flowRateWeiPerSecond),
-      cfg.GD_MICRO_USD_PER_TOKEN,
-      parsed.data.monthlyGdAmountWei ? BigInt(parsed.data.monthlyGdAmountWei) : undefined,
-      parsed.data.txHash,
-      parsed.data.logIndex
-    );
-    return json({ ...state, settledStreamBonusCreditId: settled?.id });
   }
 
   const outstandingMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/outstanding$/);
@@ -236,11 +246,6 @@ function cors(response: Response): Response {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-function createDepositFundingId(txHash: string | undefined, logIndex: number | undefined, prefix: string): string {
-  if (txHash && logIndex !== undefined && logIndex !== null) return `${txHash}:${logIndex}`;
-  return `${prefix}:${Date.now()}`;
-}
-
 function createStreamFundingId(account: string, createdAt: string): string {
   const timestamp = Date.parse(createdAt);
   if (!Number.isFinite(timestamp)) {
@@ -250,17 +255,124 @@ function createStreamFundingId(account: string, createdAt: string): string {
 }
 
 async function fundCredit(
-  entry: { id: string; account: string; totalCreditMicroUsd: string },
+  entry: GdCreditEntry,
   store: KVCreditStore,
-  antseedFundingVault: AntSeedFundingVaultClient,
-  fundingId: string
-): Promise<void> {
+  antseedFundingVault: AntSeedFundingVaultClient
+): Promise<{ [key: string]: unknown }> {
+  if (entry.fundingStatus === "funded") {
+    throw new Error(`cannot fund credit with status ${entry.fundingStatus}`);
+  }
   try {
-    const bridge = await antseedFundingVault.depositForBuyerWithId(entry.account, BigInt(entry.totalCreditMicroUsd), fundingId);
-    await store.markFundingResult(entry.id, { funded: true, id: fundingId, txHash: bridge.txHash });
+    const bridge = await antseedFundingVault.depositForBuyerWithId(entry.account, BigInt(entry.totalCreditMicroUsd), entry.id);
+    const updated = await store.markFundingResult(entry, { funded: true, txHash: bridge.txHash });
+    return { ...updated, bridge };
   } catch (error) {
     const message = error instanceof Error ? error.message : "deposit funding failed";
-    console.error("stream/deferred funding failed", { account: entry.account, entryId: entry.id, fundingId, message });
-    await store.markFundingResult(entry.id, { funded: false, id: fundingId, error: message });
+    console.error("stream/deferred funding failed", { account: entry.account, entryId: entry.id, message });
+    const updated = await store.markFundingResult(entry, { funded: false, error: message });
+    return {
+      ...updated,
+      depositId: entry.id,
+      bridge: {
+        enabled: antseedFundingVault.enabled,
+        buyer: entry.account,
+        amountMicroUsd: entry.totalCreditMicroUsd,
+        error: message
+      }
+    };
   }
 }
+
+
+async function fetchSuperfluidIncomingStreams(cfg: ReturnType<typeof configFromEnv>): Promise<SuperfluidIncomingStream[]> {
+  if (!cfg.CELO_VAULT_ADDRESS || !cfg.CELO_GD_SUPERTOKEN_ADDRESS) {
+    return [];
+  }
+
+  const endpoint = cfg.SUPERFLUID_SUBGRAPH_URL ?? SUPERFLUID_CELO_SUBGRAPH_URL;
+  const receiver = cfg.CELO_VAULT_ADDRESS.toLowerCase();
+  const token = cfg.CELO_GD_SUPERTOKEN_ADDRESS.toLowerCase();
+  const pageSize = 500;
+  let skip = 0;
+  const streams: SuperfluidIncomingStream[] = [];
+
+  try {
+    while (true) {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          query: `
+            query ActiveIncomingStreams($receiver: String!, $token: String!, $first: Int!, $skip: Int!) {
+              streams(
+                first: $first
+                skip: $skip
+                where: {
+                  receiver: $receiver
+                  token: $token
+                  currentFlowRate_gt: "0"
+                }
+                orderBy: updatedAtTimestamp
+                orderDirection: desc
+              ) {
+                sender { id }
+                currentFlowRate
+                updatedAtTimestamp
+              }
+            }
+          `,
+          variables: {
+            receiver,
+            token,
+            first: pageSize,
+            skip
+          }
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Superfluid subgraph HTTP ${response.status}`);
+      }
+
+      const body = await response.json();
+      const parsed = SuperfluidStreamsResponseSchema.safeParse(body);
+      if (!parsed.success) {
+        throw new Error("invalid Superfluid subgraph response shape");
+      }
+
+      const batch = parsed.data.data.streams.map((stream) => {
+        const flowRateWeiPerSecond = stream.currentFlowRate;
+        const gdAmountWei = (BigInt(flowRateWeiPerSecond) * 60n).toString();
+        const updatedAtSeconds = Number(stream.updatedAtTimestamp);
+        const lastUpdateAt = Number.isFinite(updatedAtSeconds)
+          ? new Date(updatedAtSeconds * 1000).toISOString()
+          : new Date().toISOString();
+        return {
+          account: stream.sender.id.toLowerCase(),
+          gdAmountWei,
+          flowRateWeiPerSecond,
+          lastUpdateAt
+        };
+      });
+
+      streams.push(...batch);
+
+      if (batch.length < pageSize) break;
+      skip += pageSize;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown Superfluid stream fetch error";
+    console.error("failed fetching incoming Superfluid streams", {
+      endpoint,
+      receiver,
+      token,
+      message
+    });
+    return [];
+  }
+
+  return streams;
+}
+

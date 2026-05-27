@@ -96,6 +96,7 @@ test("KV store persists stream cap and G$ credit bonuses", async () => {
   await store.updateStream("0xABC", undefined, 385802469136n, 1_000_000n, undefined, "0xstream", 1);
 
   const first = await store.recordGdCredit({
+    id: "0xdeposit1:2",
     account: "0xABC",
     source: "erc677",
     gdAmountWei: 1_000_000_000_000_000_000n,
@@ -103,11 +104,13 @@ test("KV store persists stream cap and G$ credit bonuses", async () => {
     txHash: "0xdeposit1",
     logIndex: 2
   });
+  assert.equal(first.id, "0xdeposit1:2");
   assert.equal(first.totalCreditMicroUsd, "1200000");
   assert.equal(first.streamingBonusMicroUsd, "100000");
   assert.equal(first.fundingStatus, "pending");
 
   const second = await store.recordGdCredit({
+    id: "0xdeposit2:3",
     account: "0xABC",
     source: "erc777",
     gdAmountWei: 1_000_000_000_000_000_000n,
@@ -115,6 +118,7 @@ test("KV store persists stream cap and G$ credit bonuses", async () => {
     txHash: "0xdeposit2",
     logIndex: 3
   });
+  assert.equal(second.id, "0xdeposit2:3");
   assert.equal(second.totalCreditMicroUsd, "1100000");
   assert.equal(second.streamingBonusMicroUsd, "0");
 
@@ -157,8 +161,9 @@ test("KV store accrues proportional stream bonus on flow change", async () => {
 
   const paidAt = Date.parse(stream.lastBonusPaidAt);
   const afterHalfMonth = new Date(paidAt + 15 * 24 * 60 * 60 * 1000);
-  const bonusEntry = await store.settleStreamBonusOnFlowChange("0xABC", 0n, undefined, undefined, afterHalfMonth);
+  const bonusEntry = await store.settleStreamBonusOnFlowChange("0xABC", 0n, "stream:half-month", undefined, undefined, afterHalfMonth);
   assert.ok(bonusEntry);
+  assert.equal(bonusEntry.id, "stream:half-month");
   assert.equal(bonusEntry.source, "stream");
   assert.equal(bonusEntry.totalCreditMicroUsd, "299999");
 
@@ -179,8 +184,9 @@ test("KV store settles monthly stream bonus for active streams", async () => {
 
   const paidAt = Date.parse(stream.lastBonusPaidAt);
   const afterMonth = new Date(paidAt + 31 * 24 * 60 * 60 * 1000);
-  const bonusEntry = await store.settleDueStreamBonus("0xABC", afterMonth);
+  const bonusEntry = await store.settleDueStreamBonus("0xABC", "stream:monthly", afterMonth);
   assert.ok(bonusEntry);
+  assert.equal(bonusEntry.id, "stream:monthly");
   assert.equal(bonusEntry.source, "stream");
   assert.equal(bonusEntry.totalCreditMicroUsd, "599999");
 });

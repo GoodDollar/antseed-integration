@@ -84,13 +84,19 @@ contract MockGoodID {
 
 contract MockCFA {
     mapping(address => int96) public flowRates;
+    mapping(address => uint256) public flowUpdatedAt;
 
     function setFlow(address sender, int96 flowRate) external {
+        setFlowAt(sender, flowRate, block.timestamp);
+    }
+
+    function setFlowAt(address sender, int96 flowRate, uint256 timestamp) public {
         flowRates[sender] = flowRate;
+        flowUpdatedAt[sender] = timestamp;
     }
 
     function getFlow(address, address sender, address) external view returns (uint256, int96, uint256, uint256) {
-        return (block.timestamp, flowRates[sender], 0, 0);
+        return (flowUpdatedAt[sender], flowRates[sender], 0, 0);
     }
 }
 
@@ -112,8 +118,8 @@ contract MockSuperfluidHost {
         external
         returns (bytes memory)
     {
-        cfa.setFlow(sender, flowRate);
         bytes memory cbdata = vault.beforeAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        cfa.setFlowAt(sender, flowRate, block.timestamp);
         return vault.afterAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
     }
 
@@ -121,8 +127,8 @@ contract MockSuperfluidHost {
         external
         returns (bytes memory)
     {
-        cfa.setFlow(sender, flowRate);
         bytes memory cbdata = vault.beforeAgreementUpdated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        cfa.setFlowAt(sender, flowRate, block.timestamp);
         return vault.afterAgreementUpdated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
     }
 
@@ -130,8 +136,8 @@ contract MockSuperfluidHost {
         external
         returns (bytes memory)
     {
-        cfa.setFlow(sender, 0);
         bytes memory cbdata = vault.beforeAgreementTerminated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        cfa.setFlowAt(sender, 0, block.timestamp);
         return vault.afterAgreementTerminated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
     }
 
@@ -140,7 +146,8 @@ contract MockSuperfluidHost {
         returns (bytes memory)
     {
         cfa.setFlow(sender, flowRate);
-        return vault.afterAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, receiver), "", "");
+        bytes memory cbdata = vault.beforeAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, receiver), "");
+        return vault.afterAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, receiver), cbdata, "");
     }
 }
 

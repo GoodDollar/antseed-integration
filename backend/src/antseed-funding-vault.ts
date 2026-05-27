@@ -5,7 +5,8 @@ const FUNDING_VAULT_ABI = [
   "function depositFor(address buyer, uint256 amount)",
   "function depositForWithId(address buyer, uint256 amount, string id)",
   "function withdrawDepositedFor(address buyer, uint256 amount, address recipient)",
-  "function requestClose(bytes32 channelId)"
+  "function requestClose(bytes32 channelId)",
+  "function usedDepositIds(bytes32 id) view returns (bool)"
 ] as const;
 
 export type AntSeedFundingResult = {
@@ -19,6 +20,10 @@ export type AntSeedFundingResult = {
 export class AntSeedFundingVaultClient {
   readonly enabled: boolean;
   private contract?: ethers.Contract;
+
+  private toBytes32Id(id: string): string {
+    return ethers.id(id);
+  }
 
   constructor(private readonly cfg: RuntimeConfig) {
     this.enabled = Boolean(
@@ -47,6 +52,12 @@ export class AntSeedFundingVaultClient {
 
   async depositForBuyerWithId(buyer: string, amountMicroUsd: bigint, id: string): Promise<AntSeedFundingResult> {
     if (!this.contract) return { enabled: false, buyer, amountMicroUsd: amountMicroUsd.toString() };
+
+    const alreadyUsed = await this.contract.usedDepositIds(this.toBytes32Id(id));
+    if (alreadyUsed) {
+      return { enabled: true, buyer, amountMicroUsd: amountMicroUsd.toString() };
+    }
+
     const tx = await this.contract.depositForWithId(buyer, amountMicroUsd, id);
     const receipt = await tx.wait();
     return {
