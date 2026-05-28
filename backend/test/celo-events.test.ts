@@ -9,7 +9,7 @@ const txHash = "0x" + "11".repeat(32);
 
 test("parses verified Celo vault GdDeposited logs into credit principal", () => {
   const log = encodeVaultEventLog("GdDeposited", [account, account, 2_000_000_000_000_000_000n, "0x1234"], vault, txHash, 7);
-  const events = parseCeloVaultLogs([log], vault, 1_000_000n);
+  const events = parseCeloVaultLogs([log], vault);
 
   assert.equal(events.length, 1);
   assert.equal(events[0].kind, "deposit");
@@ -38,7 +38,8 @@ test("fetches GoodID root with eth_call for root aggregation", async () => {
     const fetchedRoot = await fetchGoodIdRoot(account, {
       GD_MICRO_USD_PER_TOKEN: 1_000_000n,
       CELO_RPC_URL: "https://celo.example",
-      CELO_GOODID_ADDRESS: "0x0000000000000000000000000000000000000abc"
+      CELO_GOODID_ADDRESS: "0x0000000000000000000000000000000000000abc",
+      MAX_BONUS_CAP_MICRO_USD: 100_000_000n
     });
     assert.equal(fetchedRoot, root);
   } finally {
@@ -82,7 +83,8 @@ test("fetches GD price from reserve currentPriceCDAI", async () => {
     const price = await fetchCurrentGdMicroUsdPerToken({
       GD_MICRO_USD_PER_TOKEN: 1_000_000n,
       CELO_RPC_URL: "https://celo.example",
-      CELO_RESERVE_PRICE_ORACLE_ADDRESS: "0x0000000000000000000000000000000000000abc"
+      CELO_RESERVE_PRICE_ORACLE_ADDRESS: "0x0000000000000000000000000000000000000abc",
+      MAX_BONUS_CAP_MICRO_USD: 100_000_000n
     });
     assert.equal(price, 500000n);
   } finally {
