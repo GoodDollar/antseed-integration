@@ -20,13 +20,21 @@ contract AntseedBuyerOperator {
     address public pendingOwner;
     bool private locked;
     mapping(bytes32 => bool) public usedDepositIds;
+    mapping(address => uint256) public totalPrincipalDeposited;
+    mapping(address => uint256) public totalBonusDeposited;
+    mapping(address => uint256) public totalWithdrawn;
+
+    bytes32 public immutable DOMAIN_SEPARATOR;
+    bytes32 public constant WITHDRAW_TYPEHASH =
+        keccak256("WithdrawPrincipal(address buyer,uint256 amount,address recipient,uint256 timestamp)");
 
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event BuyerOperatorAccepted(address indexed buyer, uint256 nonce);
-    event BuyerDepositFunded(address indexed buyer, uint256 amount);
-    event BuyerDepositFundedWithId(address indexed buyer, uint256 amount, string id);
+    event BuyerDepositFunded(address indexed buyer, uint256 principal, uint256 bonus);
+    event BuyerDepositFundedWithId(address indexed buyer, uint256 principal, uint256 bonus, string id);
     event BuyerDepositWithdrawn(address indexed buyer, address indexed recipient, uint256 amount);
+    event BuyerPrincipalWithdrawn(address indexed buyer, address indexed recipient, uint256 amount);
     event BuyerOperatorTransferred(address indexed buyer, address indexed newOperator);
     event ChannelCloseRequested(bytes32 indexed channelId, address indexed buyer, address indexed caller);
     event ChannelWithdrawn(bytes32 indexed channelId, address indexed buyer, address indexed caller);
@@ -40,6 +48,9 @@ contract AntseedBuyerOperator {
     error TransferFailed();
     error ApproveFailed();
     error DuplicateDepositId();
+    error InsufficientPrincipal();
+    error InvalidSignature();
+    error ExpiredSignature();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -66,6 +77,14 @@ contract AntseedBuyerOperator {
 
         usdc = IERC20(IAntseedDeposits(depositsAddress).usdc());
         _forceApprove(usdc, depositsAddress, type(uint256).max);
+
+        DOMAIN_SEPARATOR = keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+            keccak256("AntseedBuyerOperator"),
+            keccak256("1"),
+            block.chainid,
+            address(this)
+        ));
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
@@ -88,25 +107,31 @@ contract AntseedBuyerOperator {
         emit BuyerOperatorAccepted(buyer, nonce);
     }
 
-    function depositFor(address buyer, uint256 amount) external nonReentrant onlyOwner {
+    function depositFor(address buyer, uint256 principal, uint256 bonus) external nonReentrant onlyOwner {
         if (buyer == address(0)) revert InvalidAddress();
-        if (amount == 0) revert InvalidAmount();
+        uint256 total = principal + bonus;
+        if (total == 0) revert InvalidAmount();
         _requireDepositsOperator(buyer);
 
-        _deposits().deposit(buyer, amount);
-        emit BuyerDepositFunded(buyer, amount);
+        totalPrincipalDeposited[buyer] += principal;
+        totalBonusDeposited[buyer] += bonus;
+        _deposits().deposit(buyer, total);
+        emit BuyerDepositFunded(buyer, principal, bonus);
     }
 
-    function depositForWithId(address buyer, uint256 amount, string calldata id) external nonReentrant onlyOwner {
+    function depositForWithId(address buyer, uint256 principal, uint256 bonus, string calldata id) external nonReentrant onlyOwner {
         if (buyer == address(0)) revert InvalidAddress();
-        if (amount == 0) revert InvalidAmount();
+        uint256 total = principal + bonus;
+        if (total == 0) revert InvalidAmount();
         bytes32 idHash = keccak256(bytes(id));
         if (usedDepositIds[idHash]) revert DuplicateDepositId();
         usedDepositIds[idHash] = true;
         _requireDepositsOperator(buyer);
 
-        _deposits().deposit(buyer, amount);
-        emit BuyerDepositFundedWithId(buyer, amount, id);
+        totalPrincipalDeposited[buyer] += principal;
+        totalBonusDeposited[buyer] += bonus;
+        _deposits().deposit(buyer, total);
+        emit BuyerDepositFundedWithId(buyer, principal, bonus, id);
     }
 
     function withdrawDepositedFor(address buyer, uint256 amount, address recipient) external nonReentrant onlyOwner {
@@ -121,6 +146,43 @@ contract AntseedBuyerOperator {
 
         _safeTransfer(usdc, recipient, amount);
         emit BuyerDepositWithdrawn(buyer, recipient, amount);
+    }
+
+    /// @notice Withdraws principal on behalf of a buyer, authorized by their EIP-712 signature.
+    /// @param buyer The buyer whose principal is being withdrawn.
+    /// @param amount The amount in USDC micro-units to withdraw.
+    /// @param recipient The address to receive the withdrawn USDC.
+    /// @param buyerSig The buyer's EIP-712 signature authorizing this withdrawal.
+    function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 timestamp, bytes calldata buyerSig) external nonReentrant {
+        if (buyer == address(0) || recipient == address(0)) revert InvalidAddress();
+        if (amount == 0) revert InvalidAmount();
+        if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
+
+        bytes32 structHash = keccak256(abi.encode(WITHDRAW_TYPEHASH, buyer, amount, recipient, timestamp));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        address signer = _recoverSigner(digest, buyerSig);
+        if (signer != buyer) revert InvalidSignature();
+
+        _requireDepositsOperator(buyer);
+
+        if (amount > withdrawablePrincipal(buyer)) revert InsufficientPrincipal();
+
+        totalWithdrawn[buyer] += amount;
+
+        uint256 beforeBalance = usdc.balanceOf(address(this));
+        _deposits().withdraw(buyer, amount);
+        uint256 received = usdc.balanceOf(address(this)) - beforeBalance;
+        if (received < amount) revert InvalidAmount();
+
+        _safeTransfer(usdc, recipient, amount);
+        emit BuyerPrincipalWithdrawn(buyer, recipient, amount);
+    }
+
+    /// @notice Returns the amount of principal a buyer can still withdraw.
+    function withdrawablePrincipal(address buyer) public view returns (uint256) {
+        return totalPrincipalDeposited[buyer] > totalWithdrawn[buyer]
+            ? totalPrincipalDeposited[buyer] - totalWithdrawn[buyer]
+            : 0;
     }
 
     function transferBuyerOperator(address buyer, address newOperator) external nonReentrant onlyOwner {
@@ -193,6 +255,21 @@ contract AntseedBuyerOperator {
     function _forceApprove(IERC20 token, address spender, uint256 amount) private {
         _safeApprove(token, spender, 0);
         _safeApprove(token, spender, amount);
+    }
+
+    function _recoverSigner(bytes32 digest, bytes calldata sig) internal pure returns (address) {
+        if (sig.length != 65) return address(0);
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        if (v < 27) v += 27;
+        if (v != 27 && v != 28) return address(0);
+        return ecrecover(digest, v, r, s);
     }
 }
 

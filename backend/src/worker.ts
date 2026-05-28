@@ -28,10 +28,7 @@ const StreamUpdateSchema = z.object({
   txHash: z.string().optional(),
   logIndex: z.number().int().nonnegative().optional()
 });
-const WithdrawSchema = z.object({
-  amountMicroUsd: z.string().regex(/^\d+$/),
-  recipient: z.string().min(1).optional()
-});
+
 const CloseChannelSchema = z.object({
   channelId: z.string().regex(/^0x[0-9a-fA-F]{64}$/)
 });
@@ -75,7 +72,7 @@ export default {
     const createdAt = new Date().toISOString();
     for (const stream of streams) {
       const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
-      const depositId = createStreamFundingId(stream.account, createdAt);
+      const depositId = createStreamFundingId(stream.account, new Date(createdAt));
       const entry = await store.recordGdCredit({
         id: depositId,
         account: stream.account,
@@ -84,7 +81,8 @@ export default {
         gdAmountWei: BigInt(stream.gdAmountWei),
         flowRate: BigInt(stream.flowRateWeiPerSecond),
         isVerified: !!rootAccount, // if root acccount was found it is whitelisted
-        gdPrice
+        gdPrice,
+        maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD
       });
       ctx.waitUntil(fundCredit(entry, store, antseedFundingVault));
     }
@@ -126,12 +124,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
   if (request.method === "GET" && accountMatch) {
     const account = decodeURIComponent(accountMatch[1]);
-    const [profile, requests, gdCredits] = await Promise.all([
+    const [profile, gdCredits] = await Promise.all([
       store.getUser(account),
-      store.getUserRequests(account),
       store.getGdCredits(account)
     ]);
-    return json({ account: profile.account, profile, requests, gdCredits });
+    return json({ account: profile.account, profile, gdCredits });
   }
 
 
@@ -157,7 +154,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           txHash: event.txHash,
           logIndex: event.logIndex,
           isVerified: !!rootAccount, // if root acccount was found it is whitelisted
-          gdPrice
+          gdPrice,
+          maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
         recorded.push(res);
@@ -173,7 +171,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           txHash: event.txHash,
           logIndex: event.logIndex,
           isVerified: !!rootAccount, // if root acccount was found it is whitelisted
-          gdPrice
+          gdPrice,
+          maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
         recorded.push(res);
@@ -199,22 +198,54 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({
       account: profile.account,
       outstandingFundingMicroUsd: profile.totalOutstandingFundingMicroUsd,
-      outstandingStreamBonusMicroUsd: profile.totalOutstandingStreamBonusMicroUsd,
       failedFundingCredits: outstandingFundingCredits
     });
   }
 
-  const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);
-  if (request.method === "POST" && withdrawMatch) {
-    const account = decodeURIComponent(withdrawMatch[1]);
-    const body = await parseJson(request);
-    const parsed = WithdrawSchema.safeParse(body);
-    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const amount = BigInt(parsed.data.amountMicroUsd);
-    const recipient = parsed.data.recipient ?? account;
-    const profile = await store.withdrawPrincipal(account, amount);
-    const bridge = await antseedFundingVault.withdrawDepositedFor(account, amount, recipient);
-    return json({ account: profile.account, amountMicroUsd: amount.toString(), recipient, bridge });
+  const streamCreditsMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/stream-credits$/);
+  if (request.method === "POST" && streamCreditsMatch) {
+    const account = decodeURIComponent(streamCreditsMatch[1]).toLowerCase();
+    const profile = await store.getUser(account);
+    const rootAccount = await fetchGoodIdRoot(account, cfg);
+    const isVerified = !!rootAccount;
+    const streams = await fetchSuperfluidStreamsForAccount(account, cfg);
+    if (streams.length === 0) {
+      return json({ account, streams: [], message: "no active streams found" });
+    }
+
+    const gdPrice = await fetchCurrentGdMicroUsdPerToken(cfg);
+    const now = new Date();
+    const lastCreditMs = Date.parse(profile.lastStreamCreditAt);
+    const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));
+
+    if (elapsedSeconds < 60 * 60 * 24) { // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
+      return json({ account, streams: [], message: "stream credits were issued less than 60 seconds ago" });
+    }
+
+    const recorded = [];
+    for (const stream of streams) {
+      const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
+      if (gdAmountWei <= 0n) continue;
+
+      const depositId = createStreamFundingId(account, now);
+      const entry = await store.recordGdCredit({
+        id: depositId,
+        account,
+        rootAccount,
+        source: "streamRequest",
+        gdAmountWei,
+        flowRate: BigInt(stream.flowRateWeiPerSecond),
+        isVerified,
+        gdPrice,
+        maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD
+      });
+      const res = await fundCredit(entry, store, antseedFundingVault);
+      recorded.push(res);
+    }
+    if (recorded.length === 0) {
+      return json({ account, streams: [], message: "stream credits already issued today" });
+    }
+    return json({ account, elapsedSeconds, streams: recorded });
   }
 
   if (request.method === "POST" && url.pathname === "/v1/channels/close") {
@@ -246,12 +277,9 @@ function cors(response: Response): Response {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-function createStreamFundingId(account: string, createdAt: string): string {
-  const timestamp = Date.parse(createdAt);
-  if (!Number.isFinite(timestamp)) {
-    console.warn("invalid stream credit createdAt timestamp, falling back to current time", { account, createdAt });
-  }
-  return `stream:${Number.isFinite(timestamp) ? timestamp : Date.now()}:${account.toLowerCase()}`;
+function createStreamFundingId(account: string, date: Date): string {
+  const day = date.toISOString().slice(0, 10); // YYYY-MM-DD
+  return `stream:${day}:${account.toLowerCase()}`;
 }
 
 async function fundCredit(
@@ -263,7 +291,12 @@ async function fundCredit(
     throw new Error(`cannot fund credit with status ${entry.fundingStatus}`);
   }
   try {
-    const bridge = await antseedFundingVault.depositForBuyerWithId(entry.account, BigInt(entry.totalCreditMicroUsd), entry.id);
+    const bridge = await antseedFundingVault.depositForBuyerWithId(
+      entry.account,
+      BigInt(entry.principalMicroUsd),
+      BigInt(entry.bonusMicroUsd),
+      entry.id
+    );
     const updated = await store.markFundingResult(entry, { funded: true, txHash: bridge.txHash });
     return { ...updated, bridge };
   } catch (error) {
@@ -285,6 +318,14 @@ async function fundCredit(
 
 
 async function fetchSuperfluidIncomingStreams(cfg: ReturnType<typeof configFromEnv>): Promise<SuperfluidIncomingStream[]> {
+  return fetchSuperfluidStreams(cfg);
+}
+
+async function fetchSuperfluidStreamsForAccount(account: string, cfg: ReturnType<typeof configFromEnv>): Promise<SuperfluidIncomingStream[]> {
+  return fetchSuperfluidStreams(cfg, account);
+}
+
+async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, senderFilter?: string): Promise<SuperfluidIncomingStream[]> {
   if (!cfg.CELO_VAULT_ADDRESS || !cfg.CELO_GD_SUPERTOKEN_ADDRESS) {
     return [];
   }
@@ -298,6 +339,15 @@ async function fetchSuperfluidIncomingStreams(cfg: ReturnType<typeof configFromE
 
   try {
     while (true) {
+      const whereClause = senderFilter
+        ? `{ receiver: $receiver, token: $token, currentFlowRate_gt: "0", sender: $sender }`
+        : `{ receiver: $receiver, token: $token, currentFlowRate_gt: "0" }`;
+      const queryParams = senderFilter
+        ? `$receiver: String!, $token: String!, $first: Int!, $skip: Int!, $sender: String!`
+        : `$receiver: String!, $token: String!, $first: Int!, $skip: Int!`;
+      const variables: Record<string, unknown> = { receiver, token, first: pageSize, skip };
+      if (senderFilter) variables.sender = senderFilter.toLowerCase();
+
       const response = await fetch(endpoint, {
         method: "POST",
         headers: {
@@ -305,15 +355,11 @@ async function fetchSuperfluidIncomingStreams(cfg: ReturnType<typeof configFromE
         },
         body: JSON.stringify({
           query: `
-            query ActiveIncomingStreams($receiver: String!, $token: String!, $first: Int!, $skip: Int!) {
+            query ActiveIncomingStreams(${queryParams}) {
               streams(
                 first: $first
                 skip: $skip
-                where: {
-                  receiver: $receiver
-                  token: $token
-                  currentFlowRate_gt: "0"
-                }
+                where: ${whereClause}
                 orderBy: updatedAtTimestamp
                 orderDirection: desc
               ) {
@@ -323,12 +369,7 @@ async function fetchSuperfluidIncomingStreams(cfg: ReturnType<typeof configFromE
               }
             }
           `,
-          variables: {
-            receiver,
-            token,
-            first: pageSize,
-            skip
-          }
+          variables
         })
       });
 

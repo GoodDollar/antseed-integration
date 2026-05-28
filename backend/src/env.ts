@@ -12,6 +12,7 @@ export interface Env {
   CELO_GOODID_ADDRESS?: string;
   CELO_RESERVE_PRICE_ORACLE_ADDRESS?: string;
   SUPERFLUID_SUBGRAPH_URL?: string;
+  MAX_BONUS_CAP_MICRO_USD?: string;
 }
 
 export type RuntimeConfig = {
@@ -25,6 +26,7 @@ export type RuntimeConfig = {
   CELO_GOODID_ADDRESS?: string;
   CELO_RESERVE_PRICE_ORACLE_ADDRESS?: string;
   SUPERFLUID_SUBGRAPH_URL?: string;
+  MAX_BONUS_CAP_MICRO_USD: bigint;
 };
 
 export function configFromEnv(env: Env): RuntimeConfig {
@@ -38,7 +40,8 @@ export function configFromEnv(env: Env): RuntimeConfig {
     CELO_GD_SUPERTOKEN_ADDRESS: env.CELO_GD_SUPERTOKEN_ADDRESS,
     CELO_GOODID_ADDRESS: env.CELO_GOODID_ADDRESS,
     CELO_RESERVE_PRICE_ORACLE_ADDRESS: env.CELO_RESERVE_PRICE_ORACLE_ADDRESS,
-    SUPERFLUID_SUBGRAPH_URL: env.SUPERFLUID_SUBGRAPH_URL
+    SUPERFLUID_SUBGRAPH_URL: env.SUPERFLUID_SUBGRAPH_URL,
+    MAX_BONUS_CAP_MICRO_USD: bigintEnv(env.MAX_BONUS_CAP_MICRO_USD, 100_000_000n)
   };
 }
 

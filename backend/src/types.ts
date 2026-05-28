@@ -25,9 +25,9 @@ export type UserCreditProfile = {
   updatedAt: string;
   totalGdDepositedWei: string;
   totalPrincipalMicroUsd: string;
-  totalWithdrawnPrincipalMicroUsd: string;
   totalBonusMicroUsd: string;
   totalGDStreamedWei: string;
+  totalOutstandingFundingMicroUsd: string;
   streamFlowRateWeiPerSecond: string;
   lastStreamCreditAt: string;
 };

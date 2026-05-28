@@ -6,6 +6,12 @@ import {IAntseedChannels} from "../src/interfaces/IAntseedChannels.sol";
 import {IAntseedDeposits} from "../src/interfaces/IAntseedDeposits.sol";
 import {IAntseedRegistry} from "../src/interfaces/IAntseedRegistry.sol";
 
+interface Vm {
+    function sign(uint256 privateKey, bytes32 digest) external pure returns (uint8 v, bytes32 r, bytes32 s);
+    function addr(uint256 privateKey) external pure returns (address);
+    function warp(uint256 newTimestamp) external;
+}
+
 contract TestUsdc is IERC20 {
     mapping(address => uint256) public override balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
@@ -156,7 +162,25 @@ contract OperatorCaller {
     }
 }
 
+contract BuyerCaller {
+    AntseedBuyerOperator public operator;
+
+    constructor(AntseedBuyerOperator operator_) {
+        operator = operator_;
+    }
+
+    function callWithdrawPrincipal(uint256 amount, address recipient, uint256 timestamp, bytes calldata buyerSig) external returns (bool) {
+        try operator.withdrawPrincipal(address(this), amount, recipient, timestamp, buyerSig) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+}
+
 contract AntseedBuyerOperatorTest {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
     TestUsdc usdc;
     MockDeposits deposits;
     MockChannels channels;
@@ -165,6 +189,7 @@ contract AntseedBuyerOperatorTest {
 
     address buyer = address(0xB0B);
     address recipient = address(0xCAFE);
+    uint256 constant BUYER_PK = 0xBEEF;
 
     function setUp() public {
         usdc = new TestUsdc();
@@ -174,15 +199,30 @@ contract AntseedBuyerOperatorTest {
         operator = new AntseedBuyerOperator(address(registry));
     }
 
+    function _signWithdraw(uint256 pk, address buyerAddr, uint256 amount, address to, uint256 timestamp) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(
+            operator.WITHDRAW_TYPEHASH(),
+            buyerAddr,
+            amount,
+            to,
+            timestamp
+        ));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
     function testDepositForFundsBuyerWhenOperatorAccepted() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
 
         operator.acceptBuyerOperator(buyer, 1, "");
-        operator.depositFor(buyer, 12_345_678);
+        operator.depositFor(buyer, 10_000_000, 2_345_678);
 
-        require(deposits.available(buyer) == 12_345_678, "buyer funded");
+        require(deposits.available(buyer) == 12_345_678, "buyer funded with total");
         require(usdc.balanceOf(address(deposits)) == 12_345_678, "deposits funded");
+        require(operator.totalPrincipalDeposited(buyer) == 10_000_000, "principal tracked");
+        require(operator.totalBonusDeposited(buyer) == 2_345_678, "bonus tracked");
     }
 
     function testDepositForWithIdPreventsDuplicates() public {
@@ -190,11 +230,13 @@ contract AntseedBuyerOperatorTest {
         usdc.mint(address(operator), 100_000_000);
         operator.acceptBuyerOperator(buyer, 1, "");
 
-        operator.depositForWithId(buyer, 1_000_000, "tx:1");
+        operator.depositForWithId(buyer, 800_000, 200_000, "tx:1");
         require(deposits.available(buyer) == 1_000_000, "funded once");
+        require(operator.totalPrincipalDeposited(buyer) == 800_000, "principal tracked");
+        require(operator.totalBonusDeposited(buyer) == 200_000, "bonus tracked");
 
         bool ok;
-        try operator.depositForWithId(buyer, 1_000_000, "tx:1") {
+        try operator.depositForWithId(buyer, 800_000, 200_000, "tx:1") {
             ok = true;
         } catch {
             ok = false;
@@ -207,7 +249,7 @@ contract AntseedBuyerOperatorTest {
         usdc.mint(address(operator), 100_000_000);
 
         operator.acceptBuyerOperator(buyer, 1, "");
-        operator.depositFor(buyer, 12_345_678);
+        operator.depositFor(buyer, 10_000_000, 2_345_678);
         operator.withdrawDepositedFor(buyer, 2_345_678, recipient);
 
         require(deposits.available(buyer) == 10_000_000, "buyer debited");
@@ -219,7 +261,7 @@ contract AntseedBuyerOperatorTest {
         usdc.mint(address(operator), 100_000_000);
 
         bool ok;
-        try operator.depositFor(buyer, 1_000_000) {
+        try operator.depositFor(buyer, 900_000, 100_000) {
             ok = true;
         } catch {
             ok = false;
@@ -244,5 +286,104 @@ contract AntseedBuyerOperatorTest {
         channels.setChannelBuyer(channelId, buyer);
         require(!outsider.callRequestClose(channelId), "outsider blocked close");
         require(!outsider.callWithdrawChannel(channelId), "outsider blocked withdraw");
+    }
+
+    function testDepositTracksPrincipalAndBonus() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        operator.acceptBuyerOperator(buyer, 1, "");
+
+        operator.depositFor(buyer, 4_000_000, 1_000_000);
+        require(operator.totalPrincipalDeposited(buyer) == 4_000_000, "principal after depositFor");
+        require(operator.totalBonusDeposited(buyer) == 1_000_000, "bonus after depositFor");
+
+        operator.depositForWithId(buyer, 2_000_000, 1_000_000, "tx:track");
+        require(operator.totalPrincipalDeposited(buyer) == 6_000_000, "principal after depositForWithId");
+        require(operator.totalBonusDeposited(buyer) == 2_000_000, "bonus after depositForWithId");
+        // withdrawable is principal only
+        require(operator.withdrawablePrincipal(buyer) == 6_000_000, "withdrawable equals principal only");
+    }
+
+    function testWithdrawPrincipalWithBuyerSig() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 8_000_000, 2_000_000);
+
+        require(operator.withdrawablePrincipal(buyerAddr) == 8_000_000, "full principal withdrawable");
+
+        // Withdraw part of principal
+        uint256 ts1 = block.timestamp;
+        bytes memory sig1 = _signWithdraw(BUYER_PK, buyerAddr, 3_000_000, recipient, ts1);
+        operator.withdrawPrincipal(buyerAddr, 3_000_000, recipient, ts1, sig1);
+        require(usdc.balanceOf(recipient) == 3_000_000, "recipient received funds");
+        require(operator.totalWithdrawn(buyerAddr) == 3_000_000, "withdrawn tracked");
+        require(operator.withdrawablePrincipal(buyerAddr) == 5_000_000, "remaining withdrawable");
+
+        // Withdraw rest of principal
+        vm.warp(block.timestamp + 1);
+        uint256 ts2 = block.timestamp;
+        bytes memory sig2 = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, ts2);
+        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, ts2, sig2);
+        require(usdc.balanceOf(recipient) == 8_000_000, "recipient received all principal");
+        require(operator.withdrawablePrincipal(buyerAddr) == 0, "nothing left");
+
+        // Cannot withdraw more than principal (bonus not withdrawable)
+        vm.warp(block.timestamp + 1);
+        uint256 ts3 = block.timestamp;
+        bytes memory sig3 = _signWithdraw(BUYER_PK, buyerAddr, 1, recipient, ts3);
+        bool ok;
+        try operator.withdrawPrincipal(buyerAddr, 1, recipient, ts3, sig3) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "over-withdraw rejected");
+    }
+
+    function testWithdrawPrincipalRejectsWrongSigner() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 10_000_000, 0);
+
+        // Sign with a different private key (not the buyer)
+        uint256 wrongPk = 0xDEAD;
+        uint256 ts = block.timestamp;
+        bytes memory badSig = _signWithdraw(wrongPk, buyerAddr, 1_000_000, recipient, ts);
+        bool ok;
+        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, ts, badSig) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "wrong signer rejected");
+    }
+
+    function testWithdrawPrincipalRejectsExpiredTimestamp() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 10_000_000, 0);
+
+        uint256 ts = block.timestamp;
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 1_000_000, recipient, ts);
+
+        // Warp 6 minutes into the future so the timestamp is expired
+        vm.warp(ts + 6 minutes);
+
+        bool ok;
+        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, ts, sig) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "expired timestamp rejected");
     }
 }

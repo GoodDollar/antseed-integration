@@ -2,9 +2,8 @@ import { ethers } from "ethers";
 import { RuntimeConfig } from "./env.js";
 
 const FUNDING_VAULT_ABI = [
-  "function depositFor(address buyer, uint256 amount)",
-  "function depositForWithId(address buyer, uint256 amount, string id)",
-  "function withdrawDepositedFor(address buyer, uint256 amount, address recipient)",
+  "function depositFor(address buyer, uint256 principal, uint256 bonus)",
+  "function depositForWithId(address buyer, uint256 principal, uint256 bonus, string id)",
   "function requestClose(bytes32 channelId)",
   "function usedDepositIds(bytes32 id) view returns (bool)"
 ] as const;
@@ -38,41 +37,36 @@ export class AntSeedFundingVaultClient {
     }
   }
 
-  async depositForBuyer(buyer: string, amountMicroUsd: bigint): Promise<AntSeedFundingResult> {
-    if (!this.contract) return { enabled: false, buyer, amountMicroUsd: amountMicroUsd.toString() };
-    const tx = await this.contract.depositFor(buyer, amountMicroUsd);
+  async depositForBuyer(buyer: string, principalMicroUsd: bigint, bonusMicroUsd: bigint): Promise<AntSeedFundingResult> {
+    const total = principalMicroUsd + bonusMicroUsd;
+    if (!this.contract) return { enabled: false, buyer, amountMicroUsd: total.toString() };
+    const tx = await this.contract.depositFor(buyer, principalMicroUsd, bonusMicroUsd);
     const receipt = await tx.wait();
     return {
       enabled: true,
       buyer,
-      amountMicroUsd: amountMicroUsd.toString(),
+      amountMicroUsd: total.toString(),
       txHash: receipt?.hash
     };
   }
 
-  async depositForBuyerWithId(buyer: string, amountMicroUsd: bigint, id: string): Promise<AntSeedFundingResult> {
-    if (!this.contract) return { enabled: false, buyer, amountMicroUsd: amountMicroUsd.toString() };
+  async depositForBuyerWithId(buyer: string, principalMicroUsd: bigint, bonusMicroUsd: bigint, id: string): Promise<AntSeedFundingResult> {
+    const total = principalMicroUsd + bonusMicroUsd;
+    if (!this.contract) return { enabled: false, buyer, amountMicroUsd: total.toString() };
 
     const alreadyUsed = await this.contract.usedDepositIds(this.toBytes32Id(id));
     if (alreadyUsed) {
-      return { enabled: true, buyer, amountMicroUsd: amountMicroUsd.toString() };
+      return { enabled: true, buyer, amountMicroUsd: total.toString() };
     }
 
-    const tx = await this.contract.depositForWithId(buyer, amountMicroUsd, id);
+    const tx = await this.contract.depositForWithId(buyer, principalMicroUsd, bonusMicroUsd, id);
     const receipt = await tx.wait();
     return {
       enabled: true,
       buyer,
-      amountMicroUsd: amountMicroUsd.toString(),
+      amountMicroUsd: total.toString(),
       txHash: receipt?.hash
     };
-  }
-
-  async withdrawDepositedFor(buyer: string, amountMicroUsd: bigint, recipient: string): Promise<{ enabled: boolean; txHash?: string }> {
-    if (!this.contract) return { enabled: false };
-    const tx = await this.contract.withdrawDepositedFor(buyer, amountMicroUsd, recipient);
-    const receipt = await tx.wait();
-    return { enabled: true, txHash: receipt?.hash };
   }
 
   async requestClose(channelId: string): Promise<{ enabled: boolean; txHash?: string }> {
