@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
 interface IERC20Like {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -18,11 +21,17 @@ interface IConstantFlowAgreementV1Like {
         returns (uint256 timestamp, int96 flowRate, uint256 deposit, uint256 owedDeposit);
 }
 
+interface IReservePriceOracleLike {
+    function currentPriceDAI() external view returns (uint256);
+}
+
 /// @title CeloGdAntSeedVault
 /// @notice Celo-side G$ vault for AntSeed credits. No bridge logic is included.
 /// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
 ///      and Superfluid SuperApp stream callbacks. Backend converts G$ events into USDC-denominated credits.
-contract CeloGdAntSeedVault {
+contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
+    uint256 private constant MICRO_USD_PER_USD = 1_000_000;
+    uint256 private constant RESERVE_PRICE_DECIMALS = 1e18;
     error NotOwner();
     error ZeroAddress();
     error ZeroAmount();
@@ -33,6 +42,9 @@ contract CeloGdAntSeedVault {
     error WrongReceiver();
     error NegativeFlowRate();
     error TransferFailed();
+    error FirstDepositBelowMinimum();
+    error StreamRateBelowMinimum();
+    error InvalidPriceConfig();
 
     IERC20Like public immutable gdToken;
     address public immutable gdSuperToken;
@@ -40,16 +52,24 @@ contract CeloGdAntSeedVault {
     address public goodIdVerifier;
     address public superfluidHost;
     address public cfaV1;
+    address public reservePriceOracle;
+    uint256 public minFirstDepositMicroUsd;
+    uint256 public minMonthlyStreamMicroUsd;
+    uint256 public fallbackGdMicroUsdPerToken;
 
     mapping(address => uint256) public totalDepositedGd;
     mapping(address => int96) public streamFlowRate;
     mapping(address => uint256) public streamMonthlyGdAmount;
 
+    uint256[50] private __gap;
+
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event GoodIDVerifierUpdated(address indexed verifier);
     event SuperfluidConfigUpdated(address indexed host, address indexed cfaV1);
+    event ReservePriceOracleUpdated(address indexed reservePriceOracle);
+    event MinimumsUpdated(uint256 minFirstDepositMicroUsd, uint256 minMonthlyStreamMicroUsd, uint256 fallbackGdMicroUsdPerToken);
     event GdDeposited(address indexed account, address indexed payer, uint256 gdAmount, bytes data);
-    event StreamUpdated(address indexed account, int96 flowRate, uint256 monthlyGdAmountWei);
+    event StreamUpdated(address indexed account, int96 flowRate, uint256 monthlyGdAmountWei, uint256 totalFlowWei);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -66,19 +86,29 @@ contract CeloGdAntSeedVault {
         _;
     }
 
-    constructor(address gdToken_, address gdSuperToken_, address goodIdVerifier_, address superfluidHost_, address cfaV1_) {
-        if (gdToken_ == address(0) || goodIdVerifier_ == address(0)) revert ZeroAddress();
+    constructor(address gdToken_, address gdSuperToken_) {
+        if (gdToken_ == address(0)) revert ZeroAddress();
         gdToken = IERC20Like(gdToken_);
         gdSuperToken = gdSuperToken_;
+        _disableInitializers();
+    }
+
+    function initialize(address owner_, address goodIdVerifier_, address superfluidHost_, address cfaV1_) external initializer {
+        if (owner_ == address(0) || goodIdVerifier_ == address(0)) revert ZeroAddress();
+        owner = owner_;
         goodIdVerifier = goodIdVerifier_;
         superfluidHost = superfluidHost_;
         cfaV1 = cfaV1_;
-        owner = msg.sender;
+        minFirstDepositMicroUsd = 1_000_000;
+        minMonthlyStreamMicroUsd = 1_000_000;
+        fallbackGdMicroUsdPerToken = 1_000_000;
 
-        emit OwnershipTransferred(address(0), msg.sender);
+        emit OwnershipTransferred(address(0), owner_);
         emit GoodIDVerifierUpdated(goodIdVerifier_);
         emit SuperfluidConfigUpdated(superfluidHost_, cfaV1_);
     }
+
+    function _authorizeUpgrade(address) internal override onlyOwner {}
 
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
@@ -98,6 +128,20 @@ contract CeloGdAntSeedVault {
         emit SuperfluidConfigUpdated(host, agreement);
     }
 
+    function setReserveConfig(address reservePriceOracle_, uint256 fallbackGdMicroUsdPerToken_) external onlyOwner {
+        if (reservePriceOracle_ == address(0) && fallbackGdMicroUsdPerToken_ == 0) revert InvalidPriceConfig();
+        reservePriceOracle = reservePriceOracle_;
+        if (fallbackGdMicroUsdPerToken_ > 0) fallbackGdMicroUsdPerToken = fallbackGdMicroUsdPerToken_;
+        emit ReservePriceOracleUpdated(reservePriceOracle_);
+        emit MinimumsUpdated(minFirstDepositMicroUsd, minMonthlyStreamMicroUsd, fallbackGdMicroUsdPerToken);
+    }
+
+    function setMinimumUsdThresholds(uint256 minFirstDepositMicroUsd_, uint256 minMonthlyStreamMicroUsd_) external onlyOwner {
+        minFirstDepositMicroUsd = minFirstDepositMicroUsd_;
+        minMonthlyStreamMicroUsd = minMonthlyStreamMicroUsd_;
+        emit MinimumsUpdated(minFirstDepositMicroUsd, minMonthlyStreamMicroUsd, fallbackGdMicroUsdPerToken);
+    }
+
     /// @notice Optional registration helper for deployments that want the vault registered as a SuperApp.
     /// @dev The config word is intentionally supplied by deployment scripts because Superfluid app level
     ///      and callback noop bitmap are network/version specific.
@@ -110,6 +154,7 @@ contract CeloGdAntSeedVault {
     function deposit(uint256 amount, bytes calldata data) external returns (uint256) {
         if (amount == 0) revert ZeroAmount();
         _requireVerified(msg.sender);
+        if (totalDepositedGd[msg.sender] == 0 && _gdWeiToMicroUsd(amount) < minFirstDepositMicroUsd) revert FirstDepositBelowMinimum();
         totalDepositedGd[msg.sender] += amount;
         _safeTransferFrom(msg.sender, address(this), amount);
         emit GdDeposited(msg.sender, msg.sender, amount, data);
@@ -141,33 +186,33 @@ contract CeloGdAntSeedVault {
     }
 
     function beforeAgreementCreated(
-        address,
-        address,
+        address superToken,
+        address agreementClass,
         bytes32,
-        bytes calldata,
-        bytes calldata ctx
+        bytes calldata agreementData,
+        bytes calldata
     ) external view onlySuperfluidHost returns (bytes memory cbdata) {
-        return ctx;
+        return _currentFlowSnapshot(superToken, agreementClass, agreementData);
     }
 
     function beforeAgreementUpdated(
-        address,
-        address,
+        address superToken,
+        address agreementClass,
         bytes32,
-        bytes calldata,
-        bytes calldata ctx
+        bytes calldata agreementData,
+        bytes calldata
     ) external view onlySuperfluidHost returns (bytes memory cbdata) {
-        return ctx;
+        return _currentFlowSnapshot(superToken, agreementClass, agreementData);
     }
 
     function beforeAgreementTerminated(
-        address,
-        address,
+        address superToken,
+        address agreementClass,
         bytes32,
-        bytes calldata,
-        bytes calldata ctx
+        bytes calldata agreementData,
+        bytes calldata
     ) external view onlySuperfluidHost returns (bytes memory cbdata) {
-        return ctx;
+        return _currentFlowSnapshot(superToken, agreementClass, agreementData);
     }
 
     function afterAgreementCreated(
@@ -175,10 +220,10 @@ contract CeloGdAntSeedVault {
         address agreementClass,
         bytes32,
         bytes calldata agreementData,
-        bytes calldata,
+        bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        _recordStream(superToken, agreementClass, agreementData, true);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, true);
         return ctx;
     }
 
@@ -187,10 +232,10 @@ contract CeloGdAntSeedVault {
         address agreementClass,
         bytes32,
         bytes calldata agreementData,
-        bytes calldata,
+        bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        _recordStream(superToken, agreementClass, agreementData, true);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, true);
         return ctx;
     }
 
@@ -199,11 +244,11 @@ contract CeloGdAntSeedVault {
         address agreementClass,
         bytes32,
         bytes calldata agreementData,
-        bytes calldata,
+        bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
         // Do not block stream termination if the user later lost GoodID status.
-        _recordStream(superToken, agreementClass, agreementData, false);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, false);
         return ctx;
     }
 
@@ -220,11 +265,18 @@ contract CeloGdAntSeedVault {
     function _recordTokenCallbackDeposit(address account, address payer, uint256 amount, bytes calldata data) private {
         if (amount == 0) revert ZeroAmount();
         _requireVerified(account);
+        if (totalDepositedGd[account] == 0 && _gdWeiToMicroUsd(amount) < minFirstDepositMicroUsd) revert FirstDepositBelowMinimum();
         totalDepositedGd[account] += amount;
         emit GdDeposited(account, payer, amount, data);
     }
 
-    function _recordStream(address superToken, address agreementClass, bytes calldata agreementData, bool enforceGoodID) private {
+    function _recordStream(
+        address superToken,
+        address agreementClass,
+        bytes calldata agreementData,
+        bytes calldata cbdata,
+        bool enforceGoodID
+    ) private {
         if (superToken != gdSuperToken) revert UnsupportedToken();
         if (agreementClass != cfaV1) revert UnsupportedAgreement();
 
@@ -232,13 +284,45 @@ contract CeloGdAntSeedVault {
         if (receiver != address(this)) revert WrongReceiver();
         if (enforceGoodID) _requireVerified(sender);
 
-        (, int96 flowRate,,) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
+        (uint256 previousTimestamp, int96 previousFlowRate) = _decodeFlowSnapshot(cbdata);
+        (uint256 currentTimestamp, int96 flowRate,,) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
         if (flowRate < 0) revert NegativeFlowRate();
 
         streamFlowRate[sender] = flowRate;
         uint256 monthlyAmount = uint256(uint96(flowRate)) * 30 days;
+        if (monthlyAmount > 0 && _gdWeiToMicroUsd(monthlyAmount) < minMonthlyStreamMicroUsd) revert StreamRateBelowMinimum();
         streamMonthlyGdAmount[sender] = monthlyAmount;
-        emit StreamUpdated(sender, flowRate, monthlyAmount);
+
+        uint256 elapsedSeconds = currentTimestamp > previousTimestamp ? currentTimestamp - previousTimestamp : 0;
+        uint256 totalFlow = 0;
+        if (previousFlowRate > 0 && elapsedSeconds > 0) {
+            totalFlow = uint256(uint96(previousFlowRate)) * elapsedSeconds;
+        }
+
+        emit StreamUpdated(sender, flowRate, monthlyAmount, totalFlow);
+    }
+
+    function _currentFlowSnapshot(address superToken, address agreementClass, bytes calldata agreementData)
+        private
+        view
+        returns (bytes memory cbdata)
+    {
+        if (superToken != gdSuperToken || agreementClass != cfaV1) {
+            return abi.encode(uint256(0), int96(0));
+        }
+
+        (address sender, address receiver) = abi.decode(agreementData, (address, address));
+        if (receiver != address(this)) {
+            return abi.encode(uint256(0), int96(0));
+        }
+
+        (uint256 timestamp, int96 flowRate,,) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
+        return abi.encode(timestamp, flowRate);
+    }
+
+    function _decodeFlowSnapshot(bytes calldata cbdata) private pure returns (uint256 previousTimestamp, int96 previousFlowRate) {
+        if (cbdata.length != 64) return (0, 0);
+        return abi.decode(cbdata, (uint256, int96));
     }
 
     function _requireVerified(address account) private view {
@@ -248,5 +332,22 @@ contract CeloGdAntSeedVault {
     function _safeTransferFrom(address from, address to, uint256 amount) private {
         (bool ok, bytes memory data) = address(gdToken).call(abi.encodeWithSelector(IERC20Like.transferFrom.selector, from, to, amount));
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
+    }
+
+    function _gdWeiToMicroUsd(uint256 gdAmountWei) private view returns (uint256) {
+        return (gdAmountWei * _gdMicroUsdPerToken()) / 1e18;
+    }
+
+    function _gdMicroUsdPerToken() private view returns (uint256) {
+        address oracle = reservePriceOracle;
+        if (oracle != address(0)) {
+            (bool ok, bytes memory data) = oracle.staticcall(abi.encodeWithSelector(IReservePriceOracleLike.currentPriceDAI.selector));
+            if (ok && data.length >= 32) {
+                uint256 reservePriceDai = abi.decode(data, (uint256));
+                uint256 price = (reservePriceDai * MICRO_USD_PER_USD) / RESERVE_PRICE_DECIMALS;
+                return price;
+            }
+        }
+        return fallbackGdMicroUsdPerToken;
     }
 }

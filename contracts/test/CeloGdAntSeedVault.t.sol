@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {CeloGdAntSeedVault, IERC20Like} from "../src/CeloGdAntSeedVault.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 contract MockGdToken is IERC20Like {
     mapping(address => uint256) public override balanceOf;
@@ -84,13 +85,19 @@ contract MockGoodID {
 
 contract MockCFA {
     mapping(address => int96) public flowRates;
+    mapping(address => uint256) public flowUpdatedAt;
 
     function setFlow(address sender, int96 flowRate) external {
+        setFlowAt(sender, flowRate, block.timestamp);
+    }
+
+    function setFlowAt(address sender, int96 flowRate, uint256 timestamp) public {
         flowRates[sender] = flowRate;
+        flowUpdatedAt[sender] = timestamp;
     }
 
     function getFlow(address, address sender, address) external view returns (uint256, int96, uint256, uint256) {
-        return (block.timestamp, flowRates[sender], 0, 0);
+        return (flowUpdatedAt[sender], flowRates[sender], 0, 0);
     }
 }
 
@@ -112,8 +119,8 @@ contract MockSuperfluidHost {
         external
         returns (bytes memory)
     {
-        cfa.setFlow(sender, flowRate);
         bytes memory cbdata = vault.beforeAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        cfa.setFlowAt(sender, flowRate, block.timestamp);
         return vault.afterAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
     }
 
@@ -121,8 +128,8 @@ contract MockSuperfluidHost {
         external
         returns (bytes memory)
     {
-        cfa.setFlow(sender, flowRate);
         bytes memory cbdata = vault.beforeAgreementUpdated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        cfa.setFlowAt(sender, flowRate, block.timestamp);
         return vault.afterAgreementUpdated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
     }
 
@@ -130,8 +137,8 @@ contract MockSuperfluidHost {
         external
         returns (bytes memory)
     {
-        cfa.setFlow(sender, 0);
         bytes memory cbdata = vault.beforeAgreementTerminated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
+        cfa.setFlowAt(sender, 0, block.timestamp);
         return vault.afterAgreementTerminated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
     }
 
@@ -140,7 +147,20 @@ contract MockSuperfluidHost {
         returns (bytes memory)
     {
         cfa.setFlow(sender, flowRate);
-        return vault.afterAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, receiver), "", "");
+        bytes memory cbdata = vault.beforeAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, receiver), "");
+        return vault.afterAgreementCreated(superToken, address(cfa), bytes32(0), abi.encode(sender, receiver), cbdata, "");
+    }
+}
+
+contract MockReservePriceOracle {
+    uint256 public priceDai;
+
+    function setCurrentPriceDAI(uint256 value) external {
+        priceDai = value;
+    }
+
+    function currentPriceDAI() external view returns (uint256) {
+        return priceDai;
     }
 }
 
@@ -195,7 +215,12 @@ contract CeloGdAntSeedVaultTest {
         goodId = new MockGoodID();
         cfa = new MockCFA();
         host = new MockSuperfluidHost(cfa);
-        vault = new CeloGdAntSeedVault(address(token), address(superToken), address(goodId), address(host), address(cfa));
+        CeloGdAntSeedVault impl = new CeloGdAntSeedVault(address(token), address(superToken));
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(goodId), address(host), address(cfa)))
+        );
+        vault = CeloGdAntSeedVault(address(proxy));
         user = new UserProxy(token, vault);
         goodId.setWhitelisted(address(user), true);
         token.mint(address(user), 1_000 ether);
@@ -229,6 +254,17 @@ contract CeloGdAntSeedVaultTest {
         user.approveVault(1 ether);
         (bool ok,) = address(user).call(abi.encodeWithSignature("deposit(uint256)", 1 ether));
         require(!ok, "unverified deposit rejected");
+    }
+
+    function testRejectsFirstDepositBelowOneUsdAndAllowsLaterSmallTopUps() public {
+        setUp();
+        user.approveVault(2 ether);
+        (bool ok,) = address(user).call(abi.encodeWithSignature("deposit(uint256)", 0.5 ether));
+        require(!ok, "first deposit below minimum rejected");
+
+        user.deposit(1 ether);
+        user.deposit(0.25 ether);
+        require(vault.totalDepositedGd(address(user)) == 1.25 ether, "subsequent top up allowed");
     }
 
     function testGoodIdRootAlsoVerifiesConnectedWallet() public {
@@ -342,5 +378,97 @@ contract CeloGdAntSeedVaultTest {
 
         host.terminateFlow(vault, address(superToken), address(user), "");
         require(vault.streamFlowRate(address(user)) == 0, "termination allowed");
+    }
+
+    function testRejectsMonthlyStreamBelowOneUsd() public {
+        setUp();
+        (bool ok,) = address(host).call(abi.encodeWithSignature(
+            "createFlow(address,address,address,int96,bytes)",
+            address(vault),
+            address(superToken),
+            address(user),
+            int96(1),
+            ""
+        ));
+        require(!ok, "monthly stream below minimum rejected");
+    }
+
+    function testUsesReserveCurrentPriceForFirstDepositThreshold() public {
+        setUp();
+        MockReservePriceOracle reserve = new MockReservePriceOracle();
+        reserve.setCurrentPriceDAI(5e17); // 0.5 DAI per G$
+        vault.setReserveConfig(address(reserve), 0);
+
+        user.approveVault(2 ether);
+        (bool ok,) = address(user).call(abi.encodeWithSignature("deposit(uint256)", 1.5 ether));
+        require(!ok, "first deposit below $1 reserve equivalent rejected");
+
+        user.deposit(2 ether);
+        require(vault.totalDepositedGd(address(user)) == 2 ether, "deposit at reserve-derived threshold succeeds");
+    }
+
+    function testUsesReserveCurrentPriceForStreamMinimum() public {
+        setUp();
+        MockReservePriceOracle reserve = new MockReservePriceOracle();
+        reserve.setCurrentPriceDAI(2e17); // 0.2 DAI per G$
+        vault.setReserveConfig(address(reserve), 0);
+        uint256 monthSeconds = uint256(30 days);
+
+        uint256 lowFlowValue = uint256(4 ether) / monthSeconds;
+        int96 lowFlow = int96(int256(lowFlowValue));
+        (bool ok,) = address(host).call(abi.encodeWithSignature(
+            "createFlow(address,address,address,int96,bytes)",
+            address(vault),
+            address(superToken),
+            address(user),
+            lowFlow,
+            ""
+        ));
+        require(!ok, "stream below $1 reserve equivalent rejected");
+
+        uint256 minFlowValue = (uint256(5 ether) + monthSeconds - 1) / monthSeconds;
+        int96 minFlow = int96(int256(minFlowValue));
+        bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), minFlow, "");
+        require(returnedCtx.length == 0, "ctx passthrough");
+        require(vault.streamFlowRate(address(user)) == minFlow, "stream at reserve-derived threshold succeeds");
+    }
+
+    function testAcceptsHighReservePriceWithoutReasonableBoundsFallback() public {
+        setUp();
+        MockReservePriceOracle reserve = new MockReservePriceOracle();
+        reserve.setCurrentPriceDAI(2e21); // 2000 DAI per G$ -> above the old max-reasonable bound path
+        vault.setReserveConfig(address(reserve), 0);
+
+        user.approveVault(1 ether);
+        user.deposit(0.001 ether);
+        require(vault.totalDepositedGd(address(user)) == 0.001 ether, "high reserve price should be used directly");
+    }
+
+    function testCannotReinitialize() public {
+        setUp();
+        (bool ok,) = address(vault).call(
+            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(goodId), address(host), address(cfa)))
+        );
+        require(!ok, "double init rejected");
+    }
+
+    function testOnlyOwnerCanUpgrade() public {
+        setUp();
+        CeloGdAntSeedVault newImpl = new CeloGdAntSeedVault(address(token), address(superToken));
+        // owner (address(this)) can call upgradeToAndCall
+        vault.upgradeToAndCall(address(newImpl), "");
+
+        // non-owner cannot
+        UpgradeHelper outsider = new UpgradeHelper();
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("upgrade(address,address)", address(vault), address(newImpl))
+        );
+        require(!ok, "non-owner upgrade rejected");
+    }
+}
+
+contract UpgradeHelper {
+    function upgrade(address vault, address newImpl) external {
+        CeloGdAntSeedVault(vault).upgradeToAndCall(newImpl, "");
     }
 }

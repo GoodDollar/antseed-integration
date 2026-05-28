@@ -8,7 +8,11 @@ export interface Env {
   GD_MICRO_USD_PER_TOKEN?: string;
   CELO_RPC_URL?: string;
   CELO_VAULT_ADDRESS?: string;
+  CELO_GD_SUPERTOKEN_ADDRESS?: string;
   CELO_GOODID_ADDRESS?: string;
+  CELO_RESERVE_PRICE_ORACLE_ADDRESS?: string;
+  SUPERFLUID_SUBGRAPH_URL?: string;
+  MAX_BONUS_CAP_MICRO_USD?: string;
 }
 
 export type RuntimeConfig = {
@@ -18,7 +22,11 @@ export type RuntimeConfig = {
   GD_MICRO_USD_PER_TOKEN: bigint;
   CELO_RPC_URL?: string;
   CELO_VAULT_ADDRESS?: string;
+  CELO_GD_SUPERTOKEN_ADDRESS?: string;
   CELO_GOODID_ADDRESS?: string;
+  CELO_RESERVE_PRICE_ORACLE_ADDRESS?: string;
+  SUPERFLUID_SUBGRAPH_URL?: string;
+  MAX_BONUS_CAP_MICRO_USD: bigint;
 };
 
 export function configFromEnv(env: Env): RuntimeConfig {
@@ -29,7 +37,11 @@ export function configFromEnv(env: Env): RuntimeConfig {
     GD_MICRO_USD_PER_TOKEN: bigintEnv(env.GD_MICRO_USD_PER_TOKEN, 1_000_000n),
     CELO_RPC_URL: env.CELO_RPC_URL,
     CELO_VAULT_ADDRESS: env.CELO_VAULT_ADDRESS,
-    CELO_GOODID_ADDRESS: env.CELO_GOODID_ADDRESS
+    CELO_GD_SUPERTOKEN_ADDRESS: env.CELO_GD_SUPERTOKEN_ADDRESS,
+    CELO_GOODID_ADDRESS: env.CELO_GOODID_ADDRESS,
+    CELO_RESERVE_PRICE_ORACLE_ADDRESS: env.CELO_RESERVE_PRICE_ORACLE_ADDRESS,
+    SUPERFLUID_SUBGRAPH_URL: env.SUPERFLUID_SUBGRAPH_URL,
+    MAX_BONUS_CAP_MICRO_USD: bigintEnv(env.MAX_BONUS_CAP_MICRO_USD, 100_000_000n)
   };
 }
 

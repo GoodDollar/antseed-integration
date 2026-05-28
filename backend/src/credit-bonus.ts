@@ -1,3 +1,5 @@
+import { GdCreditEntry } from "./types";
+
 export type CreditBonusInput = {
   principalMicroUsd: bigint;
   monthlyStreamCapMicroUsd: bigint;
@@ -6,30 +8,27 @@ export type CreditBonusInput = {
 
 export type CreditBonusResult = {
   principalMicroUsd: bigint;
-  regularBonusMicroUsd: bigint;
-  streamingBonusMicroUsd: bigint;
+  bonusMicroUsd: bigint;
   totalCreditMicroUsd: bigint;
-  streamingBonusPrincipalAppliedMicroUsd: bigint;
 };
 
 const REGULAR_BONUS_BPS = 1_000n; // +10%
-const STREAMING_EXTRA_BONUS_BPS = 1_000n; // extra +10%, total +20% on capped principal
+const STREAMING_BONUS_BPS = 2_000n; // +20% for streaming sources
 const BPS = 10_000n;
 
-export function calculateCreditWithBonus(input: CreditBonusInput): CreditBonusResult {
-  const remainingStreamingCap = input.monthlyStreamCapMicroUsd > input.streamingBonusUsedMicroUsd
-    ? input.monthlyStreamCapMicroUsd - input.streamingBonusUsedMicroUsd
-    : 0n;
-  const streamingBonusPrincipal = min(input.principalMicroUsd, remainingStreamingCap);
-  const regularBonus = (input.principalMicroUsd * REGULAR_BONUS_BPS) / BPS;
-  const streamingBonus = (streamingBonusPrincipal * STREAMING_EXTRA_BONUS_BPS) / BPS;
+
+export function calculateCreditWithBonus(gdAmountWei: bigint, source: GdCreditEntry["source"], isVerified: boolean, gdPrice: bigint): CreditBonusResult {
+  
+  const principalMicroUsd = gdWeiToMicroUsd(gdAmountWei, gdPrice);
+  let bonusMicroUsd = source.startsWith("stream") ? (principalMicroUsd * STREAMING_BONUS_BPS) / BPS : (principalMicroUsd * REGULAR_BONUS_BPS) / BPS;
+  if(!isVerified) {
+    bonusMicroUsd = 0n;
+  }
 
   return {
-    principalMicroUsd: input.principalMicroUsd,
-    regularBonusMicroUsd: regularBonus,
-    streamingBonusMicroUsd: streamingBonus,
-    totalCreditMicroUsd: input.principalMicroUsd + regularBonus + streamingBonus,
-    streamingBonusPrincipalAppliedMicroUsd: streamingBonusPrincipal
+    principalMicroUsd,
+    bonusMicroUsd,
+    totalCreditMicroUsd: principalMicroUsd + bonusMicroUsd,
   };
 }
 
@@ -48,3 +47,4 @@ export function monthKey(date = new Date()): string {
 function min(a: bigint, b: bigint): bigint {
   return a < b ? a : b;
 }
+

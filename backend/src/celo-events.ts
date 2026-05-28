@@ -1,45 +1,47 @@
-import { Interface, LogDescription, getAddress, isAddress } from "ethers";
+import { Interface, LogDescription, getAddress, isAddress, zeroPadValue } from "ethers";
 import { RuntimeConfig } from "./env.js";
 import { gdWeiToMicroUsd } from "./credit-bonus.js";
 
 const VAULT_EVENTS = new Interface([
   "event GdDeposited(address indexed account,address indexed payer,uint256 gdAmount,bytes data)",
-  "event StreamUpdated(address indexed account,int96 flowRate,uint256 monthlyGdAmountWei)"
+  "event StreamUpdated(address indexed account,int96 flowRate,uint256 monthlyGdAmountWei,uint256 totalFlowWei)"
 ]);
 
 const GOODID_ABI = new Interface([
   "function getWhitelistedRoot(address account) view returns (address)"
 ]);
 
+const RESERVE_ORACLE_ABI = new Interface([
+  "function currentPrice(bytes32 exchangeId) view returns (uint256)"
+]);
+
 export type ParsedCeloVaultEvent =
   | {
-      kind: "deposit";
-      account: string;
-      payer: string;
-      gdAmountWei: bigint;
-      principalMicroUsd: bigint;
-      txHash: string;
-      logIndex: number;
-    }
+    kind: "deposit";
+    account: string;
+    payer: string;
+    gdAmountWei: bigint;
+    txHash: string;
+    logIndex: number;
+  }
   | {
-      kind: "stream";
-      account: string;
-      flowRateWeiPerSecond: bigint;
-      monthlyGdAmountWei: bigint;
-      txHash: string;
-      logIndex: number;
-    };
+    kind: "stream";
+    account: string;
+    flowRateWeiPerSecond: bigint;
+    monthlyGdAmountWei: bigint;
+    totalFlowWei: bigint;
+    txHash: string;
+    logIndex: number;
+  };
 
-export async function fetchGoodIdRoot(account: string, cfg: RuntimeConfig): Promise<string> {
+export async function fetchGoodIdRoot(account: string, cfg: RuntimeConfig): Promise<string | undefined> {
   if (!cfg.CELO_RPC_URL || !cfg.CELO_GOODID_ADDRESS) return normalizeAccount(account);
   const data = GOODID_ABI.encodeFunctionData("getWhitelistedRoot", [account]);
   const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: cfg.CELO_GOODID_ADDRESS, data }, "latest"]);
   if (!result || result === "0x") return normalizeAccount(account);
   const [root] = GOODID_ABI.decodeFunctionResult("getWhitelistedRoot", result);
   const rootString = String(root);
-  return isAddress(rootString) && rootString !== "0x0000000000000000000000000000000000000000"
-    ? normalizeAccount(rootString)
-    : normalizeAccount(account);
+  return isAddress(rootString) && rootString !== "0x0000000000000000000000000000000000000000" ? normalizeAccount(rootString) : undefined;
 }
 
 export async function fetchCeloVaultEvents(txHash: string, cfg: RuntimeConfig): Promise<ParsedCeloVaultEvent[]> {
@@ -48,10 +50,46 @@ export async function fetchCeloVaultEvents(txHash: string, cfg: RuntimeConfig): 
 
   const receipt = await rpc<{ logs: RpcLog[] }>(cfg.CELO_RPC_URL, "eth_getTransactionReceipt", [txHash]);
   if (!receipt) throw new Error(`transaction receipt not found: ${txHash}`);
-  return parseCeloVaultLogs(receipt.logs, cfg.CELO_VAULT_ADDRESS, cfg.GD_MICRO_USD_PER_TOKEN);
+  return parseCeloVaultLogs(receipt.logs, cfg.CELO_VAULT_ADDRESS);
 }
 
-export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string, gdMicroUsdPerToken: bigint): ParsedCeloVaultEvent[] {
+export async function fetchCeloVaultEventsForAccount(
+  account: string,
+  cfg: RuntimeConfig,
+  fromBlock: string,
+  toBlock = "latest"
+): Promise<ParsedCeloVaultEvent[]> {
+  if (!cfg.CELO_RPC_URL) throw new Error("CELO_RPC_URL is required to verify Celo vault events");
+  if (!cfg.CELO_VAULT_ADDRESS) throw new Error("CELO_VAULT_ADDRESS is required to verify Celo vault events");
+  const depositEvent = VAULT_EVENTS.getEvent("GdDeposited");
+  const streamEvent = VAULT_EVENTS.getEvent("StreamUpdated");
+  if (!depositEvent || !streamEvent) throw new Error("vault event ABI missing");
+  const accountTopic = zeroPadValue(account, 32);
+  const logs = await rpc<RpcLog[]>(cfg.CELO_RPC_URL, "eth_getLogs", [{
+    address: cfg.CELO_VAULT_ADDRESS,
+    fromBlock,
+    toBlock,
+    topics: [[depositEvent.topicHash, streamEvent.topicHash], [accountTopic]]
+  }]);
+  return parseCeloVaultLogs(logs, cfg.CELO_VAULT_ADDRESS);
+}
+
+export async function fetchCurrentGdMicroUsdPerToken(cfg: RuntimeConfig): Promise<bigint> {
+  if (!cfg.CELO_RPC_URL || !cfg.CELO_RESERVE_PRICE_ORACLE_ADDRESS) return cfg.GD_MICRO_USD_PER_TOKEN;
+  const data = RESERVE_ORACLE_ABI.encodeFunctionData("currentPrice", []);
+  const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: cfg.CELO_RESERVE_PRICE_ORACLE_ADDRESS, data }, "latest"]);
+  if (!result || result === "0x") return cfg.GD_MICRO_USD_PER_TOKEN;
+  const [price] = RESERVE_ORACLE_ABI.decodeFunctionResult("currentPrice", result);
+  const reservePrice = BigInt(price.toString());
+  if (reservePrice > 0n) {
+    return reservePrice;
+  }
+
+
+  return cfg.GD_MICRO_USD_PER_TOKEN;
+}
+
+export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): ParsedCeloVaultEvent[] {
   const normalizedVault = getAddress(vaultAddress);
   const parsed: ParsedCeloVaultEvent[] = [];
 
@@ -72,7 +110,6 @@ export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string, gdMicro
         account: decoded.args.account,
         payer: decoded.args.payer,
         gdAmountWei,
-        principalMicroUsd: gdWeiToMicroUsd(gdAmountWei, gdMicroUsdPerToken),
         txHash: log.transactionHash,
         logIndex: Number(log.logIndex)
       });
@@ -84,6 +121,7 @@ export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string, gdMicro
         account: decoded.args.account,
         flowRateWeiPerSecond: BigInt(decoded.args.flowRate.toString()),
         monthlyGdAmountWei: BigInt(decoded.args.monthlyGdAmountWei.toString()),
+        totalFlowWei: BigInt(decoded.args.totalFlowWei.toString()),
         txHash: log.transactionHash,
         logIndex: Number(log.logIndex)
       });
