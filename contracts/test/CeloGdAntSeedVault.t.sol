@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {CeloGdAntSeedVault, IERC20Like} from "../src/CeloGdAntSeedVault.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 contract MockGdToken is IERC20Like {
     mapping(address => uint256) public override balanceOf;
@@ -214,7 +215,12 @@ contract CeloGdAntSeedVaultTest {
         goodId = new MockGoodID();
         cfa = new MockCFA();
         host = new MockSuperfluidHost(cfa);
-        vault = new CeloGdAntSeedVault(address(token), address(superToken), address(goodId), address(host), address(cfa));
+        CeloGdAntSeedVault impl = new CeloGdAntSeedVault(address(token), address(superToken));
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(goodId), address(host), address(cfa)))
+        );
+        vault = CeloGdAntSeedVault(address(proxy));
         user = new UserProxy(token, vault);
         goodId.setWhitelisted(address(user), true);
         token.mint(address(user), 1_000 ether);
@@ -406,8 +412,10 @@ contract CeloGdAntSeedVaultTest {
         MockReservePriceOracle reserve = new MockReservePriceOracle();
         reserve.setCurrentPriceDAI(2e17); // 0.2 DAI per G$
         vault.setReserveConfig(address(reserve), 0);
+        uint256 monthSeconds = uint256(30 days);
 
-        int96 lowFlow = int96(int256((4 ether) / (30 days)));
+        uint256 lowFlowValue = uint256(4 ether) / monthSeconds;
+        int96 lowFlow = int96(int256(lowFlowValue));
         (bool ok,) = address(host).call(abi.encodeWithSignature(
             "createFlow(address,address,address,int96,bytes)",
             address(vault),
@@ -418,7 +426,8 @@ contract CeloGdAntSeedVaultTest {
         ));
         require(!ok, "stream below $1 reserve equivalent rejected");
 
-        int96 minFlow = int96(int256((5 ether) / (30 days)));
+        uint256 minFlowValue = (uint256(5 ether) + monthSeconds - 1) / monthSeconds;
+        int96 minFlow = int96(int256(minFlowValue));
         bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), minFlow, "");
         require(returnedCtx.length == 0, "ctx passthrough");
         require(vault.streamFlowRate(address(user)) == minFlow, "stream at reserve-derived threshold succeeds");
@@ -433,5 +442,33 @@ contract CeloGdAntSeedVaultTest {
         user.approveVault(1 ether);
         user.deposit(0.001 ether);
         require(vault.totalDepositedGd(address(user)) == 0.001 ether, "high reserve price should be used directly");
+    }
+
+    function testCannotReinitialize() public {
+        setUp();
+        (bool ok,) = address(vault).call(
+            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(goodId), address(host), address(cfa)))
+        );
+        require(!ok, "double init rejected");
+    }
+
+    function testOnlyOwnerCanUpgrade() public {
+        setUp();
+        CeloGdAntSeedVault newImpl = new CeloGdAntSeedVault(address(token), address(superToken));
+        // owner (address(this)) can call upgradeToAndCall
+        vault.upgradeToAndCall(address(newImpl), "");
+
+        // non-owner cannot
+        UpgradeHelper outsider = new UpgradeHelper();
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("upgrade(address,address)", address(vault), address(newImpl))
+        );
+        require(!ok, "non-owner upgrade rejected");
+    }
+}
+
+contract UpgradeHelper {
+    function upgrade(address vault, address newImpl) external {
+        CeloGdAntSeedVault(vault).upgradeToAndCall(newImpl, "");
     }
 }

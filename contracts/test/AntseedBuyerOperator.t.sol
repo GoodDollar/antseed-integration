@@ -5,6 +5,7 @@ import {AntseedBuyerOperator, IERC20} from "../src/AntseedBuyerOperator.sol";
 import {IAntseedChannels} from "../src/interfaces/IAntseedChannels.sol";
 import {IAntseedDeposits} from "../src/interfaces/IAntseedDeposits.sol";
 import {IAntseedRegistry} from "../src/interfaces/IAntseedRegistry.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 interface Vm {
     function sign(uint256 privateKey, bytes32 digest) external pure returns (uint8 v, bytes32 r, bytes32 s);
@@ -196,7 +197,12 @@ contract AntseedBuyerOperatorTest {
         deposits = new MockDeposits(usdc);
         channels = new MockChannels();
         registry = new MockRegistry(address(deposits), address(channels));
-        operator = new AntseedBuyerOperator(address(registry));
+        AntseedBuyerOperator impl = new AntseedBuyerOperator(address(registry));
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(AntseedBuyerOperator.initialize, (address(this)))
+        );
+        operator = AntseedBuyerOperator(address(proxy));
     }
 
     function _signWithdraw(uint256 pk, address buyerAddr, uint256 amount, address to, uint256 timestamp) internal view returns (bytes memory) {
@@ -385,5 +391,33 @@ contract AntseedBuyerOperatorTest {
             ok = false;
         }
         require(!ok, "expired timestamp rejected");
+    }
+
+    function testCannotReinitialize() public {
+        setUp();
+        (bool ok,) = address(operator).call(
+            abi.encodeCall(AntseedBuyerOperator.initialize, (address(this)))
+        );
+        require(!ok, "double init rejected");
+    }
+
+    function testOnlyOwnerCanUpgrade() public {
+        setUp();
+        AntseedBuyerOperator newImpl = new AntseedBuyerOperator(address(registry));
+        // owner (address(this)) can call upgradeToAndCall
+        operator.upgradeToAndCall(address(newImpl), "");
+
+        // non-owner cannot
+        OperatorUpgradeHelper outsider = new OperatorUpgradeHelper();
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("upgrade(address,address)", address(operator), address(newImpl))
+        );
+        require(!ok, "non-owner upgrade rejected");
+    }
+}
+
+contract OperatorUpgradeHelper {
+    function upgrade(address op, address newImpl) external {
+        AntseedBuyerOperator(op).upgradeToAndCall(newImpl, "");
     }
 }

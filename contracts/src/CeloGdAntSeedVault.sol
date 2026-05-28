@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
 interface IERC20Like {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -26,7 +29,7 @@ interface IReservePriceOracleLike {
 /// @notice Celo-side G$ vault for AntSeed credits. No bridge logic is included.
 /// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
 ///      and Superfluid SuperApp stream callbacks. Backend converts G$ events into USDC-denominated credits.
-contract CeloGdAntSeedVault {
+contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     uint256 private constant MICRO_USD_PER_USD = 1_000_000;
     uint256 private constant RESERVE_PRICE_DECIMALS = 1e18;
     error NotOwner();
@@ -50,13 +53,15 @@ contract CeloGdAntSeedVault {
     address public superfluidHost;
     address public cfaV1;
     address public reservePriceOracle;
-    uint256 public minFirstDepositMicroUsd = 1_000_000;
-    uint256 public minMonthlyStreamMicroUsd = 1_000_000;
-    uint256 public fallbackGdMicroUsdPerToken = 1_000_000;
+    uint256 public minFirstDepositMicroUsd;
+    uint256 public minMonthlyStreamMicroUsd;
+    uint256 public fallbackGdMicroUsdPerToken;
 
     mapping(address => uint256) public totalDepositedGd;
     mapping(address => int96) public streamFlowRate;
     mapping(address => uint256) public streamMonthlyGdAmount;
+
+    uint256[50] private __gap;
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event GoodIDVerifierUpdated(address indexed verifier);
@@ -81,19 +86,29 @@ contract CeloGdAntSeedVault {
         _;
     }
 
-    constructor(address gdToken_, address gdSuperToken_, address goodIdVerifier_, address superfluidHost_, address cfaV1_) {
-        if (gdToken_ == address(0) || goodIdVerifier_ == address(0)) revert ZeroAddress();
+    constructor(address gdToken_, address gdSuperToken_) {
+        if (gdToken_ == address(0)) revert ZeroAddress();
         gdToken = IERC20Like(gdToken_);
         gdSuperToken = gdSuperToken_;
+        _disableInitializers();
+    }
+
+    function initialize(address owner_, address goodIdVerifier_, address superfluidHost_, address cfaV1_) external initializer {
+        if (owner_ == address(0) || goodIdVerifier_ == address(0)) revert ZeroAddress();
+        owner = owner_;
         goodIdVerifier = goodIdVerifier_;
         superfluidHost = superfluidHost_;
         cfaV1 = cfaV1_;
-        owner = msg.sender;
+        minFirstDepositMicroUsd = 1_000_000;
+        minMonthlyStreamMicroUsd = 1_000_000;
+        fallbackGdMicroUsdPerToken = 1_000_000;
 
-        emit OwnershipTransferred(address(0), msg.sender);
+        emit OwnershipTransferred(address(0), owner_);
         emit GoodIDVerifierUpdated(goodIdVerifier_);
         emit SuperfluidConfigUpdated(superfluidHost_, cfaV1_);
     }
+
+    function _authorizeUpgrade(address) internal override onlyOwner {}
 
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -12,7 +15,7 @@ import { IAntseedChannels } from "./interfaces/IAntseedChannels.sol";
 import { IAntseedDeposits } from "./interfaces/IAntseedDeposits.sol";
 import { IAntseedRegistry } from "./interfaces/IAntseedRegistry.sol";
 
-contract AntseedBuyerOperator {
+contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     IAntseedRegistry public immutable registry;
     IERC20 public immutable usdc;
 
@@ -24,11 +27,12 @@ contract AntseedBuyerOperator {
     mapping(address => uint256) public totalBonusDeposited;
     mapping(address => uint256) public totalWithdrawn;
 
-    bytes32 public immutable DOMAIN_SEPARATOR;
+    bytes32 public DOMAIN_SEPARATOR;
     bytes32 public constant WITHDRAW_TYPEHASH =
         keccak256("WithdrawPrincipal(address buyer,uint256 amount,address recipient,uint256 timestamp)");
 
-    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    uint256[50] private __gap;
+
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event BuyerOperatorAccepted(address indexed buyer, uint256 nonce);
     event BuyerDepositFunded(address indexed buyer, uint256 principal, uint256 bonus);
@@ -67,15 +71,22 @@ contract AntseedBuyerOperator {
     constructor(address _registry) {
         if (_registry == address(0)) revert InvalidAddress();
 
-        owner = msg.sender;
-        emit OwnershipTransferred(address(0), msg.sender);
-
         registry = IAntseedRegistry(_registry);
 
         address depositsAddress = registry.deposits();
         if (depositsAddress == address(0) || registry.channels() == address(0)) revert InvalidAddress();
 
         usdc = IERC20(IAntseedDeposits(depositsAddress).usdc());
+
+        _disableInitializers();
+    }
+
+    function initialize(address owner_) external initializer {
+        if (owner_ == address(0)) revert InvalidAddress();
+        owner = owner_;
+        emit OwnershipTransferred(address(0), owner_);
+
+        address depositsAddress = registry.deposits();
         _forceApprove(usdc, depositsAddress, type(uint256).max);
 
         DOMAIN_SEPARATOR = keccak256(abi.encode(
@@ -87,18 +98,12 @@ contract AntseedBuyerOperator {
         ));
     }
 
+    function _authorizeUpgrade(address) internal override onlyOwner {}
+
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert InvalidAddress();
-        pendingOwner = newOwner;
-        emit OwnershipTransferStarted(owner, newOwner);
-    }
-
-    function acceptOwnership() external {
-        if (msg.sender != pendingOwner) revert NotOwner();
-        address previousOwner = owner;
-        owner = msg.sender;
-        pendingOwner = address(0);
-        emit OwnershipTransferred(previousOwner, msg.sender);
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
     }
 
     function acceptBuyerOperator(address buyer, uint256 nonce, bytes calldata buyerSig) external nonReentrant onlyOwner {
