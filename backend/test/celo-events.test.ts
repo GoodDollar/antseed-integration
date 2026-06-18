@@ -1,20 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface } from "ethers";
-import { encodeVaultEventLog, fetchCurrentGdMicroUsdPerToken, fetchGoodIdRoot, parseCeloVaultLogs } from "../src/celo-events.js";
+import { encodeVaultEventLog, fetchCurrentGdMicroUsdPerToken, fetchGoodIdRoot, parseCeloVaultLogs, decodeBuyerFromUserData } from "../src/celo-events.js";
 
 const vault = "0x0000000000000000000000000000000000000abc";
 const account = "0x0000000000000000000000000000000000000def";
 const txHash = "0x" + "11".repeat(32);
 
 test("parses verified Celo vault GdDeposited logs into credit principal", () => {
-  const log = encodeVaultEventLog("GdDeposited", [account, account, 2_000_000_000_000_000_000n, "0x1234"], vault, txHash, 7);
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const log = encodeVaultEventLog("GdDeposited", [account, buyer, 2_000_000_000_000_000_000n, "0x1234"], vault, txHash, 7);
   const events = parseCeloVaultLogs([log], vault);
 
   assert.equal(events.length, 1);
   assert.equal(events[0].kind, "deposit");
   if (events[0].kind === "deposit") {
     assert.equal(events[0].account.toLowerCase(), account.toLowerCase());
+    assert.equal(events[0].buyer.toLowerCase(), buyer.toLowerCase());
     assert.equal(events[0].gdAmountWei, 2_000_000_000_000_000_000n);
     assert.equal(events[0].logIndex, 7);
   }
@@ -48,19 +50,33 @@ test("fetches GoodID root with eth_call for root aggregation", async () => {
 });
 
 test("parses Celo vault StreamUpdated logs", () => {
+  const buyer = "0x0000000000000000000000000000000000000bbb";
   const flowRate = 38580246913580n;
   const monthly = flowRate * BigInt(30 * 24 * 60 * 60);
   const totalFlow = flowRate * 3600n;
-  const log = encodeVaultEventLog("StreamUpdated", [account, flowRate, monthly, totalFlow], vault, txHash, 2);
+  const log = encodeVaultEventLog("StreamUpdated", [account, buyer, flowRate, monthly, totalFlow], vault, txHash, 2);
   const events = parseCeloVaultLogs([log], vault);
 
   assert.equal(events.length, 1);
   assert.equal(events[0].kind, "stream");
   if (events[0].kind === "stream") {
+    assert.equal(events[0].buyer.toLowerCase(), buyer.toLowerCase());
     assert.equal(events[0].flowRateWeiPerSecond, flowRate);
     assert.equal(events[0].monthlyGdAmountWei, monthly);
     assert.equal(events[0].totalFlowWei, totalFlow);
   }
+});
+
+test("decodeBuyerFromUserData decodes abi-encoded address from Superfluid userData", () => {
+  const buyer = "0x000000000000000000000000000000000000bEEF";
+  // Simulate abi.encode(address): 12 bytes padding + 20 bytes address = 32 bytes
+  const encoded = "0x" + "00".repeat(12) + buyer.slice(2).toLowerCase();
+  const decoded = decodeBuyerFromUserData(encoded);
+  assert.equal(decoded, buyer.toLowerCase());
+
+  assert.equal(decodeBuyerFromUserData(undefined), undefined);
+  assert.equal(decodeBuyerFromUserData("0x"), undefined);
+  assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(32)), undefined); // zero address
 });
 
 test("fetches GD price from reserve currentPriceCDAI", async () => {

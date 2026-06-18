@@ -29,6 +29,13 @@ A Celo-side G$ vault for credit issuance without a bridge. It supports:
 - Superfluid SuperApp `afterAgreementCreated`, `afterAgreementUpdated`, and `afterAgreementTerminated` callbacks
 - stream state events with monthly stream-speed cap data for Worker-side bonus accounting
 
+**Buyer address requirement.** Every deposit and stream creation/update must specify the AntSeed buyer account that receives the funded credits:
+
+- **Deposits** — the caller encodes the buyer address in the `data` / `userData` field as `abi.encode(buyerAddress)`. The vault decodes it and emits `GdDeposited(account, buyer, gdAmount, data)`. Missing or zero buyer causes a `MissingBuyerAddress` revert.
+- **Streams** — the stream creator passes `userData = abi.encode(buyerAddress)` when calling `createFlow` / `updateFlow` on the Superfluid host. The vault's SuperApp callbacks call `host.decodeCtx(ctx).userData` to extract and validate the buyer. The buyer is stored on-chain in `streamBuyer[sender]` and re-used on stream termination (terminator need not re-supply it). The vault emits `StreamUpdated(account, buyer, flowRate, monthlyGdAmountWei, totalFlowWei)`.
+
+The backend reads `buyer` directly from on-chain events (log topics) for deposit ingestion. For stream subgraph polling it reads the `userData` field on the most recent `FlowUpdatedEvent` and decodes the buyer from it. Credits are always funded to `buyerAddress`, not to the depositor wallet.
+
 ### Backend credit service
 
 The backend is a Cloudflare Worker managed by Wrangler. It owns the operational flow:

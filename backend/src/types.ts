@@ -48,6 +48,8 @@ export type GdCreditEntry = {
   fundingError?: string;
   createdAt: string;
   streamUpdateMonth: string;
+  /** AntSeed buyer account address to which credits are funded. */
+  buyerAddress?: string;
 };
 
 export type StreamState = {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {CeloGdAntSeedVault, IERC20Like} from "../src/CeloGdAntSeedVault.sol";
+import {CeloGdAntSeedVault, IERC20Like, ISuperfluidHostLike} from "../src/CeloGdAntSeedVault.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 contract MockGdToken is IERC20Like {
@@ -115,6 +115,11 @@ contract MockSuperfluidHost {
         registeredConfigWord = configWord;
     }
 
+    /// @dev For testing: treats the entire ctx bytes as userData so tests can pass abi.encode(buyer) as ctx.
+    function decodeCtx(bytes calldata ctx) external pure returns (ISuperfluidHostLike.Context memory context) {
+        context.userData = ctx;
+    }
+
     function createFlow(CeloGdAntSeedVault vault, address superToken, address sender, int96 flowRate, bytes calldata ctx)
         external
         returns (bytes memory)
@@ -167,10 +172,12 @@ contract MockReservePriceOracle {
 contract UserProxy {
     MockGdToken public token;
     CeloGdAntSeedVault public vault;
+    address public buyer;
 
-    constructor(MockGdToken token_, CeloGdAntSeedVault vault_) {
+    constructor(MockGdToken token_, CeloGdAntSeedVault vault_, address buyer_) {
         token = token_;
         vault = vault_;
+        buyer = buyer_;
     }
 
     function approveVault(uint256 amount) external {
@@ -178,11 +185,11 @@ contract UserProxy {
     }
 
     function deposit(uint256 amount) external {
-        vault.deposit(amount, "0x01");
+        vault.deposit(amount, abi.encode(buyer));
     }
 
     function transferAndCall(uint256 amount) external {
-        token.transferAndCall(address(vault), amount, "0x02");
+        token.transferAndCall(address(vault), amount, abi.encode(buyer));
     }
 }
 
@@ -209,6 +216,8 @@ contract CeloGdAntSeedVaultTest {
     CeloGdAntSeedVault vault;
     UserProxy user;
 
+    address constant BUYER = address(0xBEEF);
+
     function setUp() public {
         token = new MockGdToken();
         superToken = new MockGdToken();
@@ -221,7 +230,7 @@ contract CeloGdAntSeedVaultTest {
             abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(goodId), address(host), address(cfa)))
         );
         vault = CeloGdAntSeedVault(address(proxy));
-        user = new UserProxy(token, vault);
+        user = new UserProxy(token, vault, BUYER);
         goodId.setWhitelisted(address(user), true);
         token.mint(address(user), 1_000 ether);
     }
@@ -243,7 +252,7 @@ contract CeloGdAntSeedVaultTest {
 
     function testErc777TokensReceivedSingleTxDeposit() public {
         setUp();
-        token.erc777Send(address(0xBEEF), address(user), address(vault), 30 ether, "0x03");
+        token.erc777Send(address(0xBEEF), address(user), address(vault), 30 ether, abi.encode(BUYER));
         require(vault.totalDepositedGd(address(user)) == 30 ether, "erc777 deposit recorded");
         require(token.balanceOf(address(vault)) == 30 ether, "vault funded");
     }
@@ -298,17 +307,20 @@ contract CeloGdAntSeedVaultTest {
 
     function testSuperAppCreateUpdateTerminateStreamLifecycleAndPreservesCtx() public {
         setUp();
-        bytes memory ctx = hex"123456";
+        // ctx is treated as userData by MockSuperfluidHost.decodeCtx; pass abi.encode(buyer) so vault can decode it.
+        bytes memory ctx = abi.encode(BUYER);
         int96 flowRate = 38580246913580; // ~100 G$ / 30 days at 18 decimals
         bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), flowRate, ctx);
         require(keccak256(returnedCtx) == keccak256(ctx), "create ctx preserved");
         require(vault.streamFlowRate(address(user)) == flowRate, "flow recorded");
         require(vault.streamMonthlyGdAmount(address(user)) == uint256(uint96(flowRate)) * 30 days, "monthly amount recorded");
+        require(vault.streamBuyer(address(user)) == BUYER, "buyer recorded");
 
         int96 updatedFlowRate = flowRate * 2;
         returnedCtx = host.updateFlow(vault, address(superToken), address(user), updatedFlowRate, ctx);
         require(keccak256(returnedCtx) == keccak256(ctx), "update ctx preserved");
         require(vault.streamFlowRate(address(user)) == updatedFlowRate, "updated flow recorded");
+        require(vault.streamBuyer(address(user)) == BUYER, "buyer preserved on update");
 
         goodId.setWhitelisted(address(user), false);
         returnedCtx = host.terminateFlow(vault, address(superToken), address(user), ctx);
@@ -428,8 +440,9 @@ contract CeloGdAntSeedVaultTest {
 
         uint256 minFlowValue = (uint256(5 ether) + monthSeconds - 1) / monthSeconds;
         int96 minFlow = int96(int256(minFlowValue));
-        bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), minFlow, "");
-        require(returnedCtx.length == 0, "ctx passthrough");
+        bytes memory buyerCtx = abi.encode(BUYER);
+        bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), minFlow, buyerCtx);
+        require(keccak256(returnedCtx) == keccak256(buyerCtx), "ctx passthrough");
         require(vault.streamFlowRate(address(user)) == minFlow, "stream at reserve-derived threshold succeeds");
     }
 

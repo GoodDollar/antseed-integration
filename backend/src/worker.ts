@@ -7,7 +7,7 @@
  */
 import { z } from "zod";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
-import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdMicroUsdPerToken, fetchGoodIdRoot } from "./celo-events.js";
+import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdMicroUsdPerToken, fetchGoodIdRoot, decodeBuyerFromUserData } from "./celo-events.js";
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
@@ -37,7 +37,10 @@ const SuperfluidStreamsResponseSchema = z.object({
     streams: z.array(z.object({
       sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
       currentFlowRate: z.string().regex(/^\d+$/),
-      updatedAtTimestamp: z.string().regex(/^\d+$/)
+      updatedAtTimestamp: z.string().regex(/^\d+$/),
+      flowUpdatedEvents: z.array(z.object({
+        userData: z.string()
+      }))
     }))
   })
 });
@@ -49,6 +52,8 @@ type SuperfluidIncomingStream = {
   gdAmountWei: string;
   flowRateWeiPerSecond: string;
   lastUpdateAt: string;
+  /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
+  buyerAddress?: string;
 };
 
 export default {
@@ -82,7 +87,8 @@ export default {
         flowRate: BigInt(stream.flowRateWeiPerSecond),
         isVerified: !!rootAccount, // if root acccount was found it is whitelisted
         gdPrice,
-        maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD
+        maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD,
+        buyerAddress: stream.buyerAddress
       });
       ctx.waitUntil(fundCredit(entry, store, antseedFundingVault));
     }
@@ -155,7 +161,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           logIndex: event.logIndex,
           isVerified: !!rootAccount, // if root acccount was found it is whitelisted
           gdPrice,
-          maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD
+          maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD,
+          buyerAddress: event.buyer
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
         recorded.push(res);
@@ -172,7 +179,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           logIndex: event.logIndex,
           isVerified: !!rootAccount, // if root acccount was found it is whitelisted
           gdPrice,
-          maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD
+          maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD,
+          buyerAddress: event.buyer
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
         recorded.push(res);
@@ -237,7 +245,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         flowRate: BigInt(stream.flowRateWeiPerSecond),
         isVerified,
         gdPrice,
-        maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD
+        maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD,
+        buyerAddress: stream.buyerAddress
       });
       const res = await fundCredit(entry, store, antseedFundingVault);
       recorded.push(res);
@@ -290,9 +299,10 @@ async function fundCredit(
   if (entry.fundingStatus === "funded") {
     throw new Error(`cannot fund credit with status ${entry.fundingStatus}`);
   }
+  const buyer = entry.buyerAddress || entry.account;
   try {
     const bridge = await antseedFundingVault.depositForBuyerWithId(
-      entry.account,
+      buyer,
       BigInt(entry.principalMicroUsd),
       BigInt(entry.bonusMicroUsd),
       entry.id
@@ -308,7 +318,7 @@ async function fundCredit(
       depositId: entry.id,
       bridge: {
         enabled: antseedFundingVault.enabled,
-        buyer: entry.account,
+        buyer,
         amountMicroUsd: entry.totalCreditMicroUsd,
         error: message
       }
@@ -366,6 +376,9 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
                 sender { id }
                 currentFlowRate
                 updatedAtTimestamp
+                flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
+                  userData
+                }
               }
             }
           `,
@@ -390,11 +403,14 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
         const lastUpdateAt = Number.isFinite(updatedAtSeconds)
           ? new Date(updatedAtSeconds * 1000).toISOString()
           : new Date().toISOString();
+        const rawUserData = stream.flowUpdatedEvents[0]?.userData;
+        const buyerAddress = decodeBuyerFromUserData(rawUserData);
         return {
           account: stream.sender.id.toLowerCase(),
           gdAmountWei,
           flowRateWeiPerSecond,
-          lastUpdateAt
+          lastUpdateAt,
+          buyerAddress
         };
       });
 

@@ -3,8 +3,8 @@ import { RuntimeConfig } from "./env.js";
 import { gdWeiToMicroUsd } from "./credit-bonus.js";
 
 const VAULT_EVENTS = new Interface([
-  "event GdDeposited(address indexed account,address indexed payer,uint256 gdAmount,bytes data)",
-  "event StreamUpdated(address indexed account,int96 flowRate,uint256 monthlyGdAmountWei,uint256 totalFlowWei)"
+  "event GdDeposited(address indexed account,address indexed buyer,uint256 gdAmount,bytes data)",
+  "event StreamUpdated(address indexed account,address indexed buyer,int96 flowRate,uint256 monthlyGdAmountWei,uint256 totalFlowWei)"
 ]);
 
 const GOODID_ABI = new Interface([
@@ -19,7 +19,7 @@ export type ParsedCeloVaultEvent =
   | {
     kind: "deposit";
     account: string;
-    payer: string;
+    buyer: string;
     gdAmountWei: bigint;
     txHash: string;
     logIndex: number;
@@ -27,6 +27,7 @@ export type ParsedCeloVaultEvent =
   | {
     kind: "stream";
     account: string;
+    buyer: string;
     flowRateWeiPerSecond: bigint;
     monthlyGdAmountWei: bigint;
     totalFlowWei: bigint;
@@ -108,7 +109,7 @@ export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): Parsed
       parsed.push({
         kind: "deposit",
         account: decoded.args.account,
-        payer: decoded.args.payer,
+        buyer: getAddress(decoded.args.buyer).toLowerCase(),
         gdAmountWei,
         txHash: log.transactionHash,
         logIndex: Number(log.logIndex)
@@ -119,6 +120,7 @@ export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): Parsed
       parsed.push({
         kind: "stream",
         account: decoded.args.account,
+        buyer: getAddress(decoded.args.buyer).toLowerCase(),
         flowRateWeiPerSecond: BigInt(decoded.args.flowRate.toString()),
         monthlyGdAmountWei: BigInt(decoded.args.monthlyGdAmountWei.toString()),
         totalFlowWei: BigInt(decoded.args.totalFlowWei.toString()),
@@ -142,6 +144,24 @@ export function encodeVaultEventLog(eventName: "GdDeposited" | "StreamUpdated", 
     transactionHash: txHash,
     logIndex: `0x${logIndex.toString(16)}`
   };
+}
+
+/**
+ * Decode an AntSeed buyer address from ABI-encoded Superfluid userdata.
+ * userdata is expected to be `abi.encode(address)` — 32 bytes, address right-aligned.
+ * Returns the lowercase checksummed address, or undefined if absent/invalid.
+ */
+export function decodeBuyerFromUserData(userData: string | undefined): string | undefined {
+  // Expect "0x" + 64 hex chars (32 bytes)
+  if (!userData || userData === "0x" || userData.length < 66) return undefined;
+  try {
+    // First 12 bytes (24 hex chars after "0x") are zero-padding; last 20 bytes are the address
+    const addressHex = "0x" + userData.slice(26, 66);
+    if (!isAddress(addressHex) || addressHex === "0x0000000000000000000000000000000000000000") return undefined;
+    return getAddress(addressHex).toLowerCase();
+  } catch {
+    return undefined;
+  }
 }
 
 type RpcLog = {

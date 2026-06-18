@@ -101,13 +101,17 @@ The Worker also uses `getWhitelistedRoot(account)` to maintain an additional agg
 
 Preferred path: send G$ to the Celo vault with `transferAndCall`.
 
+You must supply your AntSeed buyer account address encoded as the `data` / `userData` parameter:
+
 ```solidity
 GoodDollar.transferAndCall(
   CELO_GD_ANTSEED_VAULT,
   amountGdWei,
-  userData
+  abi.encode(YOUR_ANTSEED_BUYER_ADDRESS)
 );
 ```
+
+The `data` field **must** be `abi.encode(buyerAddress)` — a 32-byte ABI-encoded address. A zero or missing buyer causes the vault to revert with `MissingBuyerAddress`.
 
 The vault supports these single-transaction hooks:
 
@@ -137,7 +141,7 @@ If your wallet cannot call `transferAndCall`, approve and deposit:
 
 ```solidity
 GoodDollar.approve(CELO_GD_ANTSEED_VAULT, amountGdWei);
-CeloGdAntSeedVault.deposit(amountGdWei, userData);
+CeloGdAntSeedVault.deposit(amountGdWei, abi.encode(YOUR_ANTSEED_BUYER_ADDRESS));
 ```
 
 This takes two transactions, so use `transferAndCall` when possible.
@@ -148,16 +152,19 @@ If you stream G$ to the Celo vault through Superfluid, the vault reacts as a Sup
 
 Create or update a Constant Flow Agreement from your wallet to the vault using the G$ SuperToken on Celo.
 
-Conceptually:
+You **must** pass your AntSeed buyer address as `userData` when creating or updating the flow:
 
 ```text
-sender = your GoodID wallet
+sender   = your GoodID wallet
 receiver = CELO_GD_ANTSEED_VAULT
-token = G$ SuperToken on Celo
+token    = G$ SuperToken on Celo
 flowRate = token-wei per second
+userData = abi.encode(YOUR_ANTSEED_BUYER_ADDRESS)   ← required
 ```
 
-When the stream is created or updated, the vault emits `StreamUpdated(account, flowRate, monthlyGdAmountWei, totalFlowWei)`, where `totalFlowWei = previousFlowRate * secondsSincePreviousUpdate`. Record the stream update through the Worker the same way:
+The vault's SuperApp callback decodes the buyer from `ctx.userData`. A missing or zero buyer causes `MissingBuyerAddress` revert. On stream termination the stored buyer is used automatically; you do not need to re-supply it.
+
+When the stream is created or updated, the vault emits `StreamUpdated(account, buyer, flowRate, monthlyGdAmountWei, totalFlowWei)`, where `totalFlowWei = previousFlowRate * secondsSincePreviousUpdate`. Record the stream update through the Worker the same way:
 
 ```bash
 curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/celo/events/record" \

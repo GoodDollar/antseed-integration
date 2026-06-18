@@ -48,7 +48,7 @@ This funds a single backend/operator AntSeed buyer balance. Developers do not re
 - Bonus credit calculation: regular +10%, streaming +20% up to monthly stream-speed cap.
 - KV-backed user/request/credit accounting.
 - Request-level reserve/release/settle lifecycle for the GoodDollar credit layer.
-- Ensuring the backend AntSeed buyer deposit is funded from the Base USDC vault.
+- Ensuring the backend AntSeed buyer deposit is funded from the Base USDC vault — **to the AntSeed buyer address specified at deposit/stream time**, not the GoodDollar wallet address.
 - Forwarding the model request to the AntSeed buyer gateway.
 
 ## What the AntSeed buyer/deposits layer owns today

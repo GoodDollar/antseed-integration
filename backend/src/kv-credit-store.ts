@@ -25,6 +25,7 @@ export class KVCreditStore {
     gdPrice: bigint;
     flowRate?: bigint;
     maxBonusCapMicroUsd: bigint;
+    buyerAddress?: string;
   }): Promise<GdCreditEntry> {
     const account = normalizeAccount(input.account);
     const rootAccount = normalizeAccount(input.rootAccount ?? input.account);
@@ -60,7 +61,8 @@ export class KVCreditStore {
       txHash: input.txHash,
       logIndex: input.logIndex,
       fundingStatus: "pending",
-      createdAt: now
+      createdAt: now,
+      buyerAddress: input.buyerAddress ? input.buyerAddress.toLowerCase() : undefined
     };
 
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);

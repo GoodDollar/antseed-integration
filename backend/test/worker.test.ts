@@ -75,6 +75,7 @@ test("GET /v1/accounts/:account/outstanding returns outstanding funding info", a
 
 test("/v1/celo/events/record processes deposit logs and records credits", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"2".repeat(64)}`;
   const celoVault = "0x0000000000000000000000000000000000000def";
 
@@ -85,7 +86,7 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
 
     const depositLog = encodeVaultEventLog(
       "GdDeposited",
-      [account, account, 2_000_000_000_000_000_000n, "0x1234"],
+      [account, buyer, 2_000_000_000_000_000_000n, "0x"],
       celoVault,
       txHash,
       0
@@ -115,10 +116,11 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
       body: JSON.stringify({ txHash })
     }), testEnv, {} as ExecutionContext);
     assert.equal(res.status, 200);
-    const body = await res.json() as { events: Array<{ id: string; source: string; fundingStatus: string; principalMicroUsd: string }> };
+    const body = await res.json() as { events: Array<{ id: string; source: string; fundingStatus: string; principalMicroUsd: string; buyerAddress?: string }> };
     assert.equal(body.events.length, 1);
     assert.equal(body.events[0].source, "deposit");
     assert.equal(body.events[0].fundingStatus, "pending");
+    assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
 
     // Verify credit was recorded
     const creditRes = await worker.fetch(
