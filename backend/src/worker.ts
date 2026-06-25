@@ -12,6 +12,7 @@ import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
 import { assertWithdrawTimestampFresh, buildWithdrawPrincipalPayload, recoverWithdrawPrincipalSigner } from "./withdraw-auth.js";
 import { recoverSetOperatorSigner } from "./operator-auth.js";
+import { quoteCreditToGd, quoteGdToCredit } from "./quote.js";
 
 const CeloEventsRecordSchema = z.object({
   txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
@@ -133,6 +134,20 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       },
       kvEnabled: true
     });
+  }
+
+  if (request.method === "GET" && url.pathname === "/v1/quote/gd-to-credit") {
+    const gdAmountWei = parseQuoteAmount(url.searchParams.get("gdAmountWei"), "gdAmountWei");
+    if (typeof gdAmountWei === "string") return json({ error: gdAmountWei }, 400);
+    const gdMicroUsdPerToken = await fetchCurrentGdMicroUsdPerToken(cfg);
+    return json(quoteGdToCredit({ gdAmountWei, gdMicroUsdPerToken }));
+  }
+
+  if (request.method === "GET" && url.pathname === "/v1/quote/credit-to-gd") {
+    const creditMicroUsd = parseQuoteAmount(url.searchParams.get("creditMicroUsd"), "creditMicroUsd");
+    if (typeof creditMicroUsd === "string") return json({ error: creditMicroUsd }, 400);
+    const gdMicroUsdPerToken = await fetchCurrentGdMicroUsdPerToken(cfg);
+    return json(quoteCreditToGd({ creditMicroUsd, gdMicroUsdPerToken }));
   }
 
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
@@ -567,6 +582,11 @@ function cors(response: Response): Response {
 function createStreamFundingId(account: string, date: Date): string {
   const day = date.toISOString().slice(0, 10); // YYYY-MM-DD
   return `stream:${day}:${account.toLowerCase()}`;
+}
+
+function parseQuoteAmount(value: string | null, field: string): bigint | string {
+  if (!value || !/^\d+$/.test(value)) return `${field} must be a non-negative integer string`;
+  return BigInt(value);
 }
 
 async function fundCredit(

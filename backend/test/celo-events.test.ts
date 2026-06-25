@@ -79,19 +79,20 @@ test("decodeBuyerFromUserData decodes abi-encoded address from Superfluid userDa
   assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(32)), undefined); // zero address
 });
 
-test("fetches GD price from reserve currentPriceDAI", async () => {
-  const reserveAbi = new Interface(["function currentPriceDAI() view returns (uint256)"]);
+test("fetches GD price from reserve currentPrice", async () => {
+  const exchangeId = "0xba77f5c7bb3317643c6d81d1ef3f9913561741d92095f88efa402faf2cbe9124";
+  const reserveAbi = new Interface(["function currentPrice(bytes32 exchangeId) view returns (uint256)"]);
   const previousFetch = globalThis.fetch;
   globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
     assert.equal(body.method, "eth_call");
     const callData = String(body.params[0].data);
-    const expectedSelector = reserveAbi.encodeFunctionData("currentPriceDAI", []).slice(0, 10);
+    const expectedSelector = reserveAbi.encodeFunctionData("currentPrice", [exchangeId]).slice(0, 10);
     assert.equal(callData.slice(0, 10), expectedSelector);
     return Response.json({
       jsonrpc: "2.0",
       id: body.id,
-      result: reserveAbi.encodeFunctionResult("currentPriceDAI", [500000000000000000n])
+      result: reserveAbi.encodeFunctionResult("currentPrice", [500_000n])
     });
   }) as typeof fetch;
 
@@ -100,9 +101,10 @@ test("fetches GD price from reserve currentPriceDAI", async () => {
       GD_MICRO_USD_PER_TOKEN: 1_000_000n,
       CELO_RPC_URL: "https://celo.example",
       CELO_RESERVE_PRICE_ORACLE_ADDRESS: "0x0000000000000000000000000000000000000abc",
+      CELO_RESERVE_EXCHANGE_ID: exchangeId,
       MAX_BONUS_CAP_MICRO_USD: 100_000_000n
     });
-    assert.equal(price, 500000n);
+    assert.equal(price, 500_000n);
   } finally {
     globalThis.fetch = previousFetch;
   }

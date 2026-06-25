@@ -12,11 +12,8 @@ const GOODID_ABI = new Interface([
 ]);
 
 const RESERVE_ORACLE_ABI = new Interface([
-  "function currentPriceDAI() view returns (uint256)"
+  "function currentPrice(bytes32 exchangeId) view returns (uint256)"
 ]);
-
-const RESERVE_PRICE_DECIMALS = 1_000_000_000_000_000_000n;
-const MICRO_USD_PER_USD = 1_000_000n;
 
 export type ParsedCeloVaultEvent =
   | {
@@ -80,13 +77,13 @@ export async function fetchCeloVaultEventsForAccount(
 
 export async function fetchCurrentGdMicroUsdPerToken(cfg: RuntimeConfig): Promise<bigint> {
   if (!cfg.CELO_RPC_URL || !cfg.CELO_RESERVE_PRICE_ORACLE_ADDRESS) return cfg.GD_MICRO_USD_PER_TOKEN;
-  const data = RESERVE_ORACLE_ABI.encodeFunctionData("currentPriceDAI", []);
+  const data = RESERVE_ORACLE_ABI.encodeFunctionData("currentPrice", [cfg.CELO_RESERVE_EXCHANGE_ID]);
   const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: cfg.CELO_RESERVE_PRICE_ORACLE_ADDRESS, data }, "latest"]);
   if (!result || result === "0x") return cfg.GD_MICRO_USD_PER_TOKEN;
-  const [reservePriceDai] = RESERVE_ORACLE_ABI.decodeFunctionResult("currentPriceDAI", result);
-  const reservePrice = BigInt(reservePriceDai.toString());
+  const [price] = RESERVE_ORACLE_ABI.decodeFunctionResult("currentPrice", result);
+  const reservePrice = BigInt(price.toString());
   if (reservePrice > 0n) {
-    return (reservePrice * MICRO_USD_PER_USD) / RESERVE_PRICE_DECIMALS;
+    return reservePrice;
   }
 
   return cfg.GD_MICRO_USD_PER_TOKEN;

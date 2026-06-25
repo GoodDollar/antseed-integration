@@ -363,3 +363,29 @@ test("POST /v1/channels/withdraw returns bridge disabled when not configured", a
   assert.equal(body.channelId, channelId);
   assert.equal(body.bridge.enabled, false);
 });
+
+test("GET /v1/quote/gd-to-credit returns oracle conversion without bonus", async () => {
+  const res = await worker.fetch(
+    new Request("https://worker.test/v1/quote/gd-to-credit?gdAmountWei=1000000000000000000"),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json() as {
+    direction: string;
+    creditMicroUsd: string;
+    gdAmountWei: string;
+  };
+  assert.equal(body.direction, "gd-to-credit");
+  assert.equal(body.creditMicroUsd, "1000000");
+  assert.equal(body.gdAmountWei, "1000000000000000000");
+});
+
+test("GET /v1/quote/credit-to-gd validates creditMicroUsd", async () => {
+  const res = await worker.fetch(
+    new Request("https://worker.test/v1/quote/credit-to-gd"),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 400);
+});

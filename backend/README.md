@@ -14,6 +14,8 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 
 - `GET /health`
 - `GET /config/status`
+- `GET /v1/quote/gd-to-credit` — G$ → AI credits via oracle (no bonus; bonus applied at record time)
+- `GET /v1/quote/credit-to-gd` — AI credits → G$ via oracle (no bonus)
 - `GET /v1/accounts/:account/status` — dashboard: profile, linked `buyer`, operator consent, withdrawable, outstanding
 - `GET /v1/accounts/:account/credit`
 - `GET /v1/accounts/:account/outstanding`
