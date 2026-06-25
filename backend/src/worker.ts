@@ -2,8 +2,7 @@
  * TODO
  * 1. keep list of user deposit/stream events when calling store.recordGdCredit, so it can be returned in the API response and used by frontend to correlate with on-chain events and show correct status in UI (eg. if funding failed, frontend can show "failed to credit" status on the specific deposit/stream event instead of just showing "0 G$ available" with no explanation)
  * 2. end point for user requesting credits for their active streams (if they want to trigger funding outside of the cron or deposit events)
- * 3. implement withdraw endpoint, user can withdraw their principal from the vault if they want to stop using antseed. any unused deposited bonus will be withdrawn back to the vault.
- * 4. implement max bonus cap per rootaccount to prevent abuse (eg. if someone creates 1000 accounts and deposits 1 GD in each to get 0.2 USD bonus on each deposit, we should have a cap like max 100 USD bonus per root account or something like that)
+ * 3. implement max bonus cap per rootaccount to prevent abuse (eg. if someone creates 1000 accounts and deposits 1 GD in each to get 0.2 USD bonus on each deposit, we should have a cap like max 100 USD bonus per root account or something like that)
  */
 import { z } from "zod";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
@@ -11,6 +10,7 @@ import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdMic
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
+import { assertWithdrawTimestampFresh, recoverWithdrawPrincipalSigner } from "./withdraw-auth.js";
 
 const CeloEventsRecordSchema = z.object({
   txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
@@ -20,18 +20,20 @@ const CeloEventsRecordSchema = z.object({
 }).refine((value) => Boolean(value.txHash || (value.account && value.fromBlock)), {
   message: "provide txHash or account+fromBlock"
 });
-const StreamUpdateSchema = z.object({
-  account: z.string().min(1),
-  rootAccount: z.string().min(1).optional(),
-  flowRateWeiPerSecond: z.string().regex(/^\d+$/),
-  monthlyGdAmountWei: z.string().regex(/^\d+$/).optional(),
-  txHash: z.string().optional(),
-  logIndex: z.number().int().nonnegative().optional()
-});
 
 const CloseChannelSchema = z.object({
   channelId: z.string().regex(/^0x[0-9a-fA-F]{64}$/)
 });
+
+const WithdrawSchema = z.object({
+  buyerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+  amountMicroUsd: z.string().regex(/^\d+$/),
+  recipient: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+  timestamp: z.number().int().nonnegative(),
+  buyerSig: z.string().regex(/^0x[0-9a-fA-F]+$/)
+});
+
+const addressParam = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
 const SuperfluidStreamsResponseSchema = z.object({
   data: z.object({
     streams: z.array(z.object({
@@ -210,6 +212,115 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     });
   }
 
+  const transactionsMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/transactions$/);
+  if (request.method === "GET" && transactionsMatch) {
+    const account = decodeURIComponent(transactionsMatch[1]);
+    const statusParam = url.searchParams.get("status");
+    const statusParsed = statusParam
+      ? z.enum(["pending", "funded", "failed"]).safeParse(statusParam)
+      : { success: true as const, data: undefined };
+    if (!statusParsed.success) {
+      return json({ error: "status must be pending, funded, or failed" }, 400);
+    }
+    const limitParam = url.searchParams.get("limit");
+    const limit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
+    if (limitParam && (!Number.isFinite(limit) || limit! <= 0)) {
+      return json({ error: "limit must be a positive integer" }, 400);
+    }
+    const cursor = url.searchParams.get("cursor") ?? undefined;
+    const page = await store.listGdCredits(account, {
+      status: statusParsed.data,
+      limit,
+      cursor
+    });
+    return json({ account: account.toLowerCase(), ...page });
+  }
+
+  const withdrawableMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdrawable$/);
+  if (request.method === "GET" && withdrawableMatch) {
+    const account = decodeURIComponent(withdrawableMatch[1]).toLowerCase();
+    const buyer = url.searchParams.get("buyer");
+    const buyerParsed = buyer ? addressParam.safeParse(buyer) : { success: false as const };
+    if (!buyerParsed.success) {
+      return json({ error: "buyer query param required" }, 400);
+    }
+    const result = await antseedFundingVault.getWithdrawablePrincipal(buyerParsed.data);
+    return json({ account, ...result });
+  }
+
+  const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);
+  if (request.method === "POST" && withdrawMatch) {
+    const account = decodeURIComponent(withdrawMatch[1]).toLowerCase();
+    const body = await parseJson(request);
+    const parsed = WithdrawSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+
+    const buyerAddress = parsed.data.buyerAddress.toLowerCase();
+    const recipient = parsed.data.recipient.toLowerCase();
+    const amountMicroUsd = BigInt(parsed.data.amountMicroUsd);
+    const timestamp = BigInt(parsed.data.timestamp);
+
+    if (amountMicroUsd <= 0n) {
+      return json({ error: "amountMicroUsd must be greater than zero" }, 400);
+    }
+
+    try {
+      assertWithdrawTimestampFresh(parsed.data.timestamp);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "invalid withdraw timestamp";
+      return json({ error: message }, 400);
+    }
+
+    if (!antseedFundingVault.enabled || !antseedFundingVault.vaultAddress) {
+      return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
+    }
+
+    let signer: string;
+    try {
+      const chainId = await antseedFundingVault.getChainId();
+      signer = recoverWithdrawPrincipalSigner(
+        chainId,
+        antseedFundingVault.vaultAddress,
+        buyerAddress,
+        amountMicroUsd,
+        recipient,
+        timestamp,
+        parsed.data.buyerSig
+      ).toLowerCase();
+    } catch {
+      return json({ error: "invalid buyer signature" }, 400);
+    }
+
+    if (signer !== buyerAddress) {
+      return json({ error: "buyer signature does not match buyerAddress" }, 400);
+    }
+
+    const withdrawable = await antseedFundingVault.getWithdrawablePrincipal(buyerAddress);
+    if (!withdrawable.enabled) {
+      return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
+    }
+    if (amountMicroUsd > BigInt(withdrawable.withdrawableMicroUsd)) {
+      return json({
+        error: "amount exceeds withdrawable principal",
+        withdrawableMicroUsd: withdrawable.withdrawableMicroUsd
+      }, 400);
+    }
+
+    try {
+      const bridge = await antseedFundingVault.withdrawPrincipal(
+        buyerAddress,
+        amountMicroUsd,
+        recipient,
+        timestamp,
+        parsed.data.buyerSig
+      );
+      return json({ account, buyerAddress, recipient, amountMicroUsd: amountMicroUsd.toString(), bridge });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "withdraw failed";
+      return json({ error: message, account, buyerAddress }, 502);
+    }
+  }
+
   const streamCreditsMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/stream-credits$/);
   if (request.method === "POST" && streamCreditsMatch) {
     const account = decodeURIComponent(streamCreditsMatch[1]).toLowerCase();
@@ -265,6 +376,14 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ channelId: parsed.data.channelId, bridge });
   }
 
+  if (request.method === "POST" && url.pathname === "/v1/channels/withdraw") {
+    const body = await parseJson(request);
+    const parsed = CloseChannelSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const bridge = await antseedFundingVault.withdrawChannel(parsed.data.channelId);
+    return json({ channelId: parsed.data.channelId, bridge });
+  }
+
   return json({ error: "not found" }, 404);
 }
 
@@ -307,6 +426,18 @@ async function fundCredit(
       BigInt(entry.bonusMicroUsd),
       entry.id
     );
+    if (!bridge.enabled) {
+      const updated = await store.markFundingResult(entry, { funded: false, error: "bridge not configured" });
+      return {
+        ...updated,
+        bridge: {
+          enabled: false,
+          buyer,
+          amountMicroUsd: entry.totalCreditMicroUsd,
+          error: "bridge not configured"
+        }
+      };
+    }
     const updated = await store.markFundingResult(entry, { funded: true, txHash: bridge.txHash });
     return { ...updated, bridge };
   } catch (error) {

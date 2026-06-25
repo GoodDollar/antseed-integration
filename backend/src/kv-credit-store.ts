@@ -120,6 +120,29 @@ export class KVCreditStore {
     return entries.filter((item): item is GdCreditEntry => Boolean(item));
   }
 
+  async listGdCredits(
+    account: string,
+    options: { status?: GdCreditEntry["fundingStatus"]; limit?: number; cursor?: string } = {}
+  ): Promise<{ transactions: GdCreditEntry[]; nextCursor?: string }> {
+    const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
+    let entries = await this.getGdCredits(account);
+    if (options.status) {
+      entries = entries.filter((entry) => entry.fundingStatus === options.status);
+    }
+    entries.sort((a, b) => {
+      const byCreatedAt = b.createdAt.localeCompare(a.createdAt);
+      return byCreatedAt !== 0 ? byCreatedAt : b.id.localeCompare(a.id);
+    });
+    if (options.cursor) {
+      const cursorIndex = entries.findIndex((entry) => entry.id === options.cursor);
+      if (cursorIndex >= 0) {
+        entries = entries.slice(cursorIndex + 1);
+      }
+    }
+    const page = entries.slice(0, limit);
+    const nextCursor = entries.length > limit ? page[page.length - 1]?.id : undefined;
+    return { transactions: page, nextCursor };
+  }
 
   async getUser(account: string): Promise<UserCreditProfile> {
     const normalized = normalizeAccount(account);

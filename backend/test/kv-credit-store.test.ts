@@ -273,3 +273,31 @@ test("markFundingResult updates lastStreamCreditAt for stream sources", async ()
   // lastStreamCreditAt should be updated for stream sources
   assert.notEqual(after.lastStreamCreditAt, before.createdAt);
 });
+
+test("listGdCredits paginates and filters by status", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const base = {
+    account: "0xabc",
+    rootAccount: "0xabc",
+    isVerified: true,
+    gdPrice: 1_000_000n,
+    maxBonusCapMicroUsd: 100_000_000n,
+    gdAmountWei: 1_000_000_000_000_000_000n
+  };
+
+  await store.recordGdCredit({ ...base, id: "a", source: "deposit" });
+  const funded = await store.recordGdCredit({ ...base, id: "b", source: "deposit" });
+  await store.markFundingResult(funded, { funded: true, txHash: "0xfunded" });
+  await store.recordGdCredit({ ...base, id: "c", source: "deposit" });
+
+  const fundedOnly = await store.listGdCredits("0xabc", { status: "funded" });
+  assert.equal(fundedOnly.transactions.length, 1);
+  assert.equal(fundedOnly.transactions[0].id, "b");
+
+  const firstPage = await store.listGdCredits("0xabc", { limit: 2 });
+  assert.equal(firstPage.transactions.length, 2);
+  assert.equal(firstPage.nextCursor, firstPage.transactions[1]?.id);
+
+  const secondPage = await store.listGdCredits("0xabc", { limit: 2, cursor: firstPage.nextCursor });
+  assert.equal(secondPage.transactions.length, 1);
+});
