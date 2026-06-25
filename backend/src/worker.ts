@@ -148,20 +148,19 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const statusMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/status$/);
   if (request.method === "GET" && statusMatch) {
     const account = decodeURIComponent(statusMatch[1]).toLowerCase();
-    const buyerQuery = url.searchParams.get("buyer");
-    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
-      ? buyerQuery.toLowerCase()
-      : account;
-    const [profile, gdCredits, operator, withdrawable] = await Promise.all([
+    const [profile, gdCredits] = await Promise.all([
       store.getUser(account),
       store.getGdCredits(account),
-      antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress),
-      antseedFundingVault.getWithdrawablePrincipal(buyerAddress)
+    ]);
+    const buyer = profile.buyer ?? account;
+    const [operator, withdrawable] = await Promise.all([
+      antseedFundingVault.getBuyerOperatorStatus(account, buyer),
+      antseedFundingVault.getWithdrawablePrincipal(buyer),
     ]);
     const outstandingFundingCredits = gdCredits.filter((entry) => entry.fundingStatus === "failed" || entry.fundingStatus === "pending");
     return json({
       account,
-      buyerAddress,
+      buyer: profile.buyer ?? null,
       profile,
       operator,
       withdrawableMicroUsd: withdrawable.withdrawableMicroUsd,
@@ -228,6 +227,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
     try {
       const bridge = await antseedFundingVault.acceptBuyerOperator(buyerAddress, nonce, parsed.data.buyerSig);
+      const rootAccount = await fetchGoodIdRoot(account, cfg);
+      await store.setBuyer(account, buyerAddress, rootAccount ?? account);
       const operator = await antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress);
       return json({ account, buyerAddress, operator, bridge });
     } catch (error) {

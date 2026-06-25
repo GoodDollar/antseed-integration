@@ -312,11 +312,14 @@ test("GET /v1/accounts/:account/status returns profile and operator summary", as
   assert.equal(res.status, 200);
   const body = await res.json() as {
     account: string;
-    profile: { totalGdDepositedWei: string };
+    buyer: string | null;
+    profile: { totalGdDepositedWei: string; buyer?: string };
     operator: { operatorAccepted: boolean };
     withdrawableMicroUsd: string;
   };
   assert.equal(body.account, account);
+  assert.equal(body.buyer, null);
+  assert.equal(body.profile.buyer, undefined);
   assert.equal(body.profile.totalGdDepositedWei, "0");
   assert.equal(body.operator.operatorAccepted, false);
   assert.equal(body.withdrawableMicroUsd, "0");

@@ -251,6 +251,7 @@ test("getUser returns default profile for unknown account", async () => {
   assert.equal(user.totalBonusMicroUsd, "0");
   assert.equal(user.totalOutstandingFundingMicroUsd, "0");
   assert.equal(user.streamFlowRateWeiPerSecond, "0");
+  assert.equal(user.buyer, undefined);
 });
 
 test("markFundingResult updates lastStreamCreditAt for stream sources", async () => {
@@ -301,4 +302,71 @@ test("listGdCredits paginates and filters by status", async () => {
 
   const secondPage = await store.listGdCredits("0xabc", { limit: 2, cursor: firstPage.nextCursor });
   assert.equal(secondPage.transactions.length, 1);
+});
+
+test("recordGdCredit does not set buyer on payer profile", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.recordGdCredit({
+    id: "d1",
+    account: "0xPAYER",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    isVerified: true,
+    gdPrice: GD_PRICE,
+    maxBonusCapMicroUsd: 100_000_000n,
+    buyerAddress: "0xBuyer1",
+  });
+
+  const user = await store.getUser("0xPAYER");
+  assert.equal(user.buyer, undefined);
+});
+
+test("recordGdCredit rejects credit when buyer differs from linked profile buyer", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.setBuyer("0xPAYER", "0xBuyer1");
+
+  await assert.rejects(
+    () => store.recordGdCredit({
+      id: "d2",
+      account: "0xPAYER",
+      source: "deposit",
+      gdAmountWei: 1_000_000_000_000_000_000n,
+      isVerified: true,
+      gdPrice: GD_PRICE,
+      maxBonusCapMicroUsd: 100_000_000n,
+      buyerAddress: "0xBuyer2",
+    }),
+    /linked to buyer 0xbuyer1/
+  );
+});
+
+test("recordGdCredit accepts credit when buyer matches linked profile buyer", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.setBuyer("0xPAYER", "0xBuyer1");
+  await store.recordGdCredit({
+    id: "d1",
+    account: "0xPAYER",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    isVerified: true,
+    gdPrice: GD_PRICE,
+    maxBonusCapMicroUsd: 100_000_000n,
+    buyerAddress: "0xBuyer1",
+  });
+
+  const user = await store.getUser("0xPAYER");
+  assert.equal(user.buyer, "0xbuyer1");
+  assert.equal(user.totalOutstandingFundingMicroUsd, "1100000");
+});
+
+test("setBuyer links buyer without recording credit", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.setBuyer("0xPAYER", "0xBuyerA");
+  const user = await store.getUser("0xPAYER");
+  assert.equal(user.buyer, "0xbuyera");
+
+  await assert.rejects(
+    () => store.setBuyer("0xPAYER", "0xBuyerB"),
+    /linked to buyer 0xbuyera/
+  );
 });

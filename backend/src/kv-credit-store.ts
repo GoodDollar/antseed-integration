@@ -73,16 +73,20 @@ export class KVCreditStore {
     if (effectiveBonusMicroUsd > 0n) {
       await this.addMonthlyBonusUsed(rootAccount, month, effectiveBonusMicroUsd);
     }
-    await this.updateUser(account, rootAccount, (current) => ({
-      ...current,
-      rootAccount: rootAccount,
-      createdAt: current.createdAt ?? now,
-      updatedAt: now,
-      streamFlowRateWeiPerSecond: input.flowRate ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
-      totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
-      totalGDStreamedWei: input.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
-      totalOutstandingFundingMicroUsd: addDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd),
-    }));
+    const effectiveBuyer = (entry.buyerAddress ?? account).toLowerCase();
+    await this.updateUser(account, rootAccount, (current) => {
+      assertBuyerMatches(current, effectiveBuyer);
+      return {
+        ...current,
+        rootAccount: rootAccount,
+        createdAt: current.createdAt ?? now,
+        updatedAt: now,
+        streamFlowRateWeiPerSecond: input.flowRate ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
+        totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
+        totalGDStreamedWei: input.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
+        totalOutstandingFundingMicroUsd: addDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd),
+      };
+    });
 
     return (await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${entryId}`))!;
   }
@@ -150,6 +154,18 @@ export class KVCreditStore {
     return normalizeProfile(saved, normalized);
   }
 
+  async setBuyer(account: string, buyerAddress: string, rootAccount?: string): Promise<UserCreditProfile> {
+    const normalized = normalizeAccount(account);
+    const buyer = normalizeAccount(buyerAddress);
+    const root = normalizeAccount(rootAccount ?? account);
+    const now = new Date().toISOString();
+    await this.updateUser(normalized, root, (current) => ({
+      ...assignBuyer(current, buyer),
+      updatedAt: now,
+    }));
+    return this.getUser(normalized);
+  }
+
   private async addGdCreditToAccount(account: string, entryId: string): Promise<void> {
     const key = `${USER_GD_CREDITS_PREFIX}${account}`;
     const ids = (await this.getJson<string[]>(key)) ?? [];
@@ -179,6 +195,7 @@ export class KVCreditStore {
     if (normalizedRoot !== normalized) {
       const rootCurrent = await this.getUser(normalizedRoot);
       const rootNext = mutate({ ...rootCurrent, account: normalizedRoot, rootAccount: normalizedRoot });
+      rootNext.buyer = rootCurrent.buyer;
       await this.putJson(`${USER_PREFIX}${normalizedRoot}`, rootNext);
     }
   }
@@ -207,7 +224,26 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingMicroUsd: saved?.totalOutstandingFundingMicroUsd ?? "0",
     lastStreamCreditAt: saved?.lastStreamCreditAt ?? createdAt,
+    buyer: normalizeBuyer(saved?.buyer),
   };
+}
+
+function normalizeBuyer(buyer: string | undefined): string | undefined {
+  return buyer ? buyer.toLowerCase() : undefined;
+}
+
+function assignBuyer(profile: UserCreditProfile, buyer: string): UserCreditProfile {
+  const normalized = buyer.toLowerCase();
+  if (!profile.buyer) return { ...profile, buyer: normalized };
+  if (profile.buyer === normalized) return profile;
+  throw new Error(`payer ${profile.account} is linked to buyer ${profile.buyer}, cannot use ${normalized}`);
+}
+
+function assertBuyerMatches(profile: UserCreditProfile, buyer: string): void {
+  const normalized = buyer.toLowerCase();
+  if (profile.buyer && profile.buyer !== normalized) {
+    throw new Error(`payer ${profile.account} is linked to buyer ${profile.buyer}, cannot credit buyer ${normalized}`);
+  }
 }
 
 function normalizeAccount(account: string): string {

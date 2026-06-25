@@ -14,7 +14,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 
 - `GET /health`
 - `GET /config/status`
-- `GET /v1/accounts/:account/status` — dashboard: profile, operator consent, withdrawable, outstanding
+- `GET /v1/accounts/:account/status` — dashboard: profile, linked `buyer`, operator consent, withdrawable, outstanding
 - `GET /v1/accounts/:account/credit`
 - `GET /v1/accounts/:account/outstanding`
 - `GET /v1/accounts/:account/transactions` — paginated `gdCredits` history (`status`, `limit`, `cursor`)
