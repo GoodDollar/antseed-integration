@@ -10,7 +10,8 @@ import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdMic
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
-import { assertWithdrawTimestampFresh, recoverWithdrawPrincipalSigner } from "./withdraw-auth.js";
+import { assertWithdrawTimestampFresh, buildWithdrawPrincipalPayload, recoverWithdrawPrincipalSigner } from "./withdraw-auth.js";
+import { recoverSetOperatorSigner } from "./operator-auth.js";
 
 const CeloEventsRecordSchema = z.object({
   txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
@@ -30,6 +31,11 @@ const WithdrawSchema = z.object({
   amountMicroUsd: z.string().regex(/^\d+$/),
   recipient: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
   timestamp: z.number().int().nonnegative(),
+  buyerSig: z.string().regex(/^0x[0-9a-fA-F]+$/)
+});
+
+const OperatorAcceptSchema = z.object({
+  buyerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional(),
   buyerSig: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
 
@@ -139,6 +145,108 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ account: profile.account, profile, gdCredits });
   }
 
+  const statusMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/status$/);
+  if (request.method === "GET" && statusMatch) {
+    const account = decodeURIComponent(statusMatch[1]).toLowerCase();
+    const buyerQuery = url.searchParams.get("buyer");
+    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
+      ? buyerQuery.toLowerCase()
+      : account;
+    const [profile, gdCredits, operator, withdrawable] = await Promise.all([
+      store.getUser(account),
+      store.getGdCredits(account),
+      antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress),
+      antseedFundingVault.getWithdrawablePrincipal(buyerAddress)
+    ]);
+    const outstandingFundingCredits = gdCredits.filter((entry) => entry.fundingStatus === "failed" || entry.fundingStatus === "pending");
+    return json({
+      account,
+      buyerAddress,
+      profile,
+      operator,
+      withdrawableMicroUsd: withdrawable.withdrawableMicroUsd,
+      outstandingFundingMicroUsd: profile.totalOutstandingFundingMicroUsd,
+      outstandingFundingCount: outstandingFundingCredits.length
+    });
+  }
+
+  const operatorConsentPayloadMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator\/consent-payload$/);
+  if (request.method === "GET" && operatorConsentPayloadMatch) {
+    const account = decodeURIComponent(operatorConsentPayloadMatch[1]).toLowerCase();
+    const buyerQuery = url.searchParams.get("buyer");
+    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
+      ? buyerQuery.toLowerCase()
+      : account;
+    const payload = await antseedFundingVault.buildOperatorConsentPayload(account, buyerAddress);
+    if (!payload.enabled) {
+      return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
+    }
+    return json(payload);
+  }
+
+  const operatorAcceptMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator\/accept$/);
+  if (request.method === "POST" && operatorAcceptMatch) {
+    const account = decodeURIComponent(operatorAcceptMatch[1]).toLowerCase();
+    const body = await parseJson(request);
+    const parsed = OperatorAcceptSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+
+    const buyerAddress = (parsed.data.buyerAddress ?? account).toLowerCase();
+    if (!antseedFundingVault.enabled || !antseedFundingVault.vaultAddress) {
+      return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
+    }
+
+    const operatorStatus = await antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress);
+    if (operatorStatus.operatorAccepted) {
+      return json({ account, buyerAddress, operator: operatorStatus, message: "operator already accepted" });
+    }
+
+    const [chainId, depositsAddress, domain, nonce] = await Promise.all([
+      antseedFundingVault.getChainId(),
+      antseedFundingVault.getDepositsAddress(),
+      antseedFundingVault.getDepositsSigningDomain(),
+      antseedFundingVault.getOperatorNonce(buyerAddress)
+    ]);
+
+    let signer: string;
+    try {
+      signer = recoverSetOperatorSigner(
+        chainId,
+        depositsAddress,
+        operatorStatus.operatorAddress!,
+        nonce,
+        parsed.data.buyerSig,
+        domain
+      ).toLowerCase();
+    } catch {
+      return json({ error: "invalid buyer signature" }, 400);
+    }
+
+    if (signer !== buyerAddress) {
+      return json({ error: "buyer signature does not match buyerAddress" }, 400);
+    }
+
+    try {
+      const bridge = await antseedFundingVault.acceptBuyerOperator(buyerAddress, nonce, parsed.data.buyerSig);
+      const operator = await antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress);
+      return json({ account, buyerAddress, operator, bridge });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "operator accept failed";
+      return json({ error: message, account, buyerAddress }, 502);
+    }
+  }
+
+  const operatorMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator$/);
+  if (request.method === "GET" && operatorMatch) {
+    const account = decodeURIComponent(operatorMatch[1]).toLowerCase();
+    const buyerQuery = url.searchParams.get("buyer");
+    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
+      ? buyerQuery.toLowerCase()
+      : account;
+    const operator = await antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress);
+    return json(operator);
+  }
+
 
   if (request.method === "POST" && url.pathname === "/v1/celo/events/record") {
     const body = await parseJson(request);
@@ -239,13 +347,63 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const withdrawableMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdrawable$/);
   if (request.method === "GET" && withdrawableMatch) {
     const account = decodeURIComponent(withdrawableMatch[1]).toLowerCase();
-    const buyer = url.searchParams.get("buyer");
-    const buyerParsed = buyer ? addressParam.safeParse(buyer) : { success: false as const };
-    if (!buyerParsed.success) {
-      return json({ error: "buyer query param required" }, 400);
+    const buyerQuery = url.searchParams.get("buyer");
+    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
+      ? buyerQuery.toLowerCase()
+      : account;
+    const result = await antseedFundingVault.getWithdrawablePrincipal(buyerAddress);
+    return json({ account, buyerAddress, ...result });
+  }
+
+  const withdrawPayloadMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw\/payload$/);
+  if (request.method === "GET" && withdrawPayloadMatch) {
+    const account = decodeURIComponent(withdrawPayloadMatch[1]).toLowerCase();
+    const buyerQuery = url.searchParams.get("buyer");
+    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
+      ? buyerQuery.toLowerCase()
+      : account;
+    const amountParam = url.searchParams.get("amountMicroUsd");
+    const recipientParam = url.searchParams.get("recipient");
+    if (!amountParam || !/^\d+$/.test(amountParam)) {
+      return json({ error: "amountMicroUsd query param required" }, 400);
     }
-    const result = await antseedFundingVault.getWithdrawablePrincipal(buyerParsed.data);
-    return json({ account, ...result });
+    const recipientParsed = recipientParam ? addressParam.safeParse(recipientParam) : { success: false as const };
+    if (!recipientParsed.success) {
+      return json({ error: "recipient query param required" }, 400);
+    }
+    const amountMicroUsd = BigInt(amountParam);
+    if (amountMicroUsd <= 0n) {
+      return json({ error: "amountMicroUsd must be greater than zero" }, 400);
+    }
+    if (!antseedFundingVault.enabled || !antseedFundingVault.vaultAddress) {
+      return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
+    }
+    const [chainId, withdrawable] = await Promise.all([
+      antseedFundingVault.getChainId(),
+      antseedFundingVault.getWithdrawablePrincipal(buyerAddress)
+    ]);
+    if (amountMicroUsd > BigInt(withdrawable.withdrawableMicroUsd)) {
+      return json({
+        error: "amount exceeds withdrawable principal",
+        withdrawableMicroUsd: withdrawable.withdrawableMicroUsd
+      }, 400);
+    }
+    const timestamp = Math.floor(Date.now() / 1000);
+    return json({
+      account,
+      buyerAddress,
+      recipient: recipientParsed.data.toLowerCase(),
+      amountMicroUsd: amountMicroUsd.toString(),
+      timestamp,
+      typedData: buildWithdrawPrincipalPayload(
+        chainId,
+        antseedFundingVault.vaultAddress,
+        buyerAddress,
+        amountMicroUsd,
+        recipientParsed.data,
+        timestamp
+      )
+    });
   }
 
   const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);
@@ -416,7 +574,7 @@ async function fundCredit(
   antseedFundingVault: AntSeedFundingVaultClient
 ): Promise<{ [key: string]: unknown }> {
   if (entry.fundingStatus === "funded") {
-    throw new Error(`cannot fund credit with status ${entry.fundingStatus}`);
+    return { ...entry, bridge: { enabled: antseedFundingVault.enabled, skipped: true } };
   }
   const buyer = entry.buyerAddress || entry.account;
   try {

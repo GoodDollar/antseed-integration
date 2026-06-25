@@ -264,28 +264,72 @@ test("GET /v1/accounts/:account/transactions returns paginated gd credits", asyn
   }
 });
 
-test("GET /v1/accounts/:account/withdrawable requires buyer query param", async () => {
+test("GET /v1/accounts/:account/withdrawable returns disabled bridge state", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/accounts/${account}/withdrawable`),
     env(),
     {} as ExecutionContext
   );
-  assert.equal(res.status, 400);
+  assert.equal(res.status, 200);
+  const body = await res.json() as { enabled: boolean; withdrawableMicroUsd: string; buyerAddress: string };
+  assert.equal(body.enabled, false);
+  assert.equal(body.withdrawableMicroUsd, "0");
+  assert.equal(body.buyerAddress, account);
 });
 
-test("GET /v1/accounts/:account/withdrawable returns disabled bridge state", async () => {
+test("GET /v1/accounts/:account/operator returns disabled bridge state", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
-  const buyer = "0x0000000000000000000000000000000000000aaa";
   const res = await worker.fetch(
-    new Request(`https://worker.test/v1/accounts/${account}/withdrawable?buyer=${buyer}`),
+    new Request(`https://worker.test/v1/accounts/${account}/operator`),
     env(),
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as { enabled: boolean; withdrawableMicroUsd: string };
+  const body = await res.json() as { enabled: boolean; operatorAccepted: boolean; consentNonce: string };
   assert.equal(body.enabled, false);
+  assert.equal(body.operatorAccepted, false);
+  assert.equal(body.consentNonce, "0");
+});
+
+test("GET /v1/accounts/:account/operator/consent-payload returns 503 when bridge disabled", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/operator/consent-payload`),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 503);
+});
+
+test("GET /v1/accounts/:account/status returns profile and operator summary", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/status`),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json() as {
+    account: string;
+    profile: { totalGdDepositedWei: string };
+    operator: { operatorAccepted: boolean };
+    withdrawableMicroUsd: string;
+  };
+  assert.equal(body.account, account);
+  assert.equal(body.profile.totalGdDepositedWei, "0");
+  assert.equal(body.operator.operatorAccepted, false);
   assert.equal(body.withdrawableMicroUsd, "0");
+});
+
+test("GET /v1/accounts/:account/withdraw/payload validates query params", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/withdraw/payload`),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 400);
 });
 
 test("POST /v1/accounts/:account/withdraw rejects when bridge disabled", async () => {

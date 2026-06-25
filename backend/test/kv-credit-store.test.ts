@@ -267,11 +267,12 @@ test("markFundingResult updates lastStreamCreditAt for stream sources", async ()
   });
 
   const before = await store.getUser("0xABC");
+  await new Promise((resolve) => setTimeout(resolve, 5));
   await store.markFundingResult(entry, { funded: true, txHash: "0xstream" });
   const after = await store.getUser("0xABC");
 
-  // lastStreamCreditAt should be updated for stream sources
-  assert.notEqual(after.lastStreamCreditAt, before.createdAt);
+  assert.notEqual(after.lastStreamCreditAt, before.lastStreamCreditAt);
+  assert.equal(after.lastStreamCreditAt, after.updatedAt);
 });
 
 test("listGdCredits paginates and filters by status", async () => {

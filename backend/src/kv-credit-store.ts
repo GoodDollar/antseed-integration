@@ -84,7 +84,7 @@ export class KVCreditStore {
       totalOutstandingFundingMicroUsd: addDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd),
     }));
 
-    return entry;
+    return (await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${entryId}`))!;
   }
 
   async markFundingResult(entry: GdCreditEntry, result: { funded: boolean; id?: string; txHash?: string; error?: string }): Promise<GdCreditEntry> {

@@ -79,19 +79,19 @@ test("decodeBuyerFromUserData decodes abi-encoded address from Superfluid userDa
   assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(32)), undefined); // zero address
 });
 
-test("fetches GD price from reserve currentPriceCDAI", async () => {
-  const reserveAbi = new Interface(["function currentPriceCDAI() view returns (uint256)"]);
+test("fetches GD price from reserve currentPriceDAI", async () => {
+  const reserveAbi = new Interface(["function currentPriceDAI() view returns (uint256)"]);
   const previousFetch = globalThis.fetch;
   globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
     assert.equal(body.method, "eth_call");
     const callData = String(body.params[0].data);
-    const expectedSelector = reserveAbi.encodeFunctionData("currentPriceCDAI", []).slice(0, 10);
+    const expectedSelector = reserveAbi.encodeFunctionData("currentPriceDAI", []).slice(0, 10);
     assert.equal(callData.slice(0, 10), expectedSelector);
     return Response.json({
       jsonrpc: "2.0",
       id: body.id,
-      result: reserveAbi.encodeFunctionResult("currentPriceCDAI", [500000000000000000n])
+      result: reserveAbi.encodeFunctionResult("currentPriceDAI", [500000000000000000n])
     });
   }) as typeof fetch;
 

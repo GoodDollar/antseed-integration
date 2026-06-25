@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { Wallet, verifyTypedData } from "ethers";
 import {
   assertWithdrawTimestampFresh,
+  buildWithdrawPrincipalPayload,
   recoverWithdrawPrincipalSigner,
   withdrawPrincipalDomain,
   WITHDRAW_PRINCIPAL_TYPES,
@@ -61,6 +62,36 @@ test("recoverWithdrawPrincipalSigner matches ethers typed-data signing", async (
       { buyer: wallet.address, amount, recipient, timestamp },
       buyerSig
     ).toLowerCase(),
+    wallet.address.toLowerCase()
+  );
+});
+
+test("buildWithdrawPrincipalPayload matches wallet signTypedData", async () => {
+  const wallet = Wallet.createRandom();
+  const chainId = 8453;
+  const verifyingContract = "0x00000000000000000000000000000000000000aa";
+  const amount = 1_000_000n;
+  const recipient = "0x0000000000000000000000000000000000000bbb";
+  const timestamp = 1_700_000_000;
+
+  const payload = buildWithdrawPrincipalPayload(
+    chainId,
+    verifyingContract,
+    wallet.address,
+    amount,
+    recipient,
+    timestamp
+  );
+
+  const sig = await wallet.signTypedData(payload.domain, WITHDRAW_PRINCIPAL_TYPES, {
+    buyer: wallet.address,
+    amount,
+    recipient,
+    timestamp
+  });
+
+  assert.equal(
+    recoverWithdrawPrincipalSigner(chainId, verifyingContract, wallet.address, amount, recipient, BigInt(timestamp), sig).toLowerCase(),
     wallet.address.toLowerCase()
   );
 });
