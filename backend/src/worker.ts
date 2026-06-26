@@ -13,6 +13,7 @@ import { GdCreditEntry } from "./types.js";
 import { assertWithdrawTimestampFresh, buildWithdrawPrincipalPayload, recoverWithdrawPrincipalSigner } from "./withdraw-auth.js";
 import { recoverSetOperatorSigner } from "./operator-auth.js";
 import { quoteCreditToGd, quoteGdToCredit } from "./quote.js";
+import { STREAM_ACCRUAL_MAX_SECONDS, streamGdAmountWei } from "./stream-accrual.js";
 
 const CeloEventsRecordSchema = z.object({
   txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
@@ -58,10 +59,9 @@ const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superfluid.dev/
 
 type SuperfluidIncomingStream = {
   account: string;
-  gdAmountWei: string;
   flowRateWeiPerSecond: string;
+  updatedAtTimestamp: string;
   lastUpdateAt: string;
-  /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
   buyerAddress?: string;
 };
 
@@ -85,6 +85,12 @@ export default {
     const streams = await fetchSuperfluidIncomingStreams(cfg);
     const createdAt = new Date().toISOString();
     for (const stream of streams) {
+      const gdAmountWei = streamGdAmountWei(
+        BigInt(stream.flowRateWeiPerSecond),
+        stream.updatedAtTimestamp
+      );
+      if (gdAmountWei <= 0n) continue;
+
       const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
       const depositId = createStreamFundingId(stream.account, new Date(createdAt));
       const entry = await store.recordGdCredit({
@@ -92,7 +98,7 @@ export default {
         account: stream.account,
         rootAccount,
         source: "streamCron",
-        gdAmountWei: BigInt(stream.gdAmountWei),
+        gdAmountWei,
         flowRate: BigInt(stream.flowRateWeiPerSecond),
         isVerified: !!rootAccount, // if root acccount was found it is whitelisted
         gdPrice,
@@ -511,13 +517,24 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const lastCreditMs = Date.parse(profile.lastStreamCreditAt);
     const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));
 
-    if (elapsedSeconds < 60 * 60 * 24) { // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
-      return json({ account, streams: [], message: "stream credits were issued less than 60 seconds ago" });
+    if (elapsedSeconds < STREAM_ACCRUAL_MAX_SECONDS) {
+      const retryAfterSeconds = STREAM_ACCRUAL_MAX_SECONDS - elapsedSeconds;
+      return json({
+        account,
+        streams: [],
+        message: "stream credits were issued less than 24 hours ago",
+        retryAfterSeconds
+      });
     }
 
     const recorded = [];
     for (const stream of streams) {
-      const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
+      const sinceLastCredit = Math.min(elapsedSeconds, STREAM_ACCRUAL_MAX_SECONDS);
+      const gdAmountWei = streamGdAmountWei(
+        BigInt(stream.flowRateWeiPerSecond),
+        stream.updatedAtTimestamp,
+        sinceLastCredit
+      );
       if (gdAmountWei <= 0n) continue;
 
       const depositId = createStreamFundingId(account, now);
@@ -708,7 +725,6 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
 
       const batch = parsed.data.data.streams.map((stream) => {
         const flowRateWeiPerSecond = stream.currentFlowRate;
-        const gdAmountWei = (BigInt(flowRateWeiPerSecond) * 60n).toString();
         const updatedAtSeconds = Number(stream.updatedAtTimestamp);
         const lastUpdateAt = Number.isFinite(updatedAtSeconds)
           ? new Date(updatedAtSeconds * 1000).toISOString()
@@ -717,8 +733,8 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
         const buyerAddress = decodeBuyerFromUserData(rawUserData);
         return {
           account: stream.sender.id.toLowerCase(),
-          gdAmountWei,
           flowRateWeiPerSecond,
+          updatedAtTimestamp: stream.updatedAtTimestamp,
           lastUpdateAt,
           buyerAddress
         };
