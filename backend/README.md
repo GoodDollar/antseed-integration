@@ -8,7 +8,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - KV namespace binding: `ANTSEED_KV`
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
 - Optional Base `AntseedBuyerOperator` bridge client that calls `depositForWithId(buyer, amount, id)`
-- Cron trigger every minute for stream bonus settlement checks
+- Cron trigger daily (UTC midnight) for Superfluid stream settlement checks
 
 ## Endpoints
 
