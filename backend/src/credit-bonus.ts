@@ -17,7 +17,7 @@ const STREAMING_BONUS_BPS = 2_000n; // +20% for streaming sources
 const BPS = 10_000n;
 
 
-export function calculateCreditWithBonus(gdAmountWei: bigint, source: GdCreditEntry["source"], isVerified: boolean, gdPrice: bigint): CreditBonusResult {
+export function calculateCreditWithBonus(gdAmountWei: bigint, source: GdCreditEntry["source"], isVerified: boolean, gdPrice: number): CreditBonusResult {
   
   const principalMicroUsd = gdWeiToMicroUsd(gdAmountWei, gdPrice);
   let bonusMicroUsd = source.startsWith("stream") ? (principalMicroUsd * STREAMING_BONUS_BPS) / BPS : (principalMicroUsd * REGULAR_BONUS_BPS) / BPS;
@@ -32,12 +32,13 @@ export function calculateCreditWithBonus(gdAmountWei: bigint, source: GdCreditEn
   };
 }
 
-export function gdWeiToMicroUsd(gdAmountWei: bigint, gdMicroUsdPerToken: bigint): bigint {
-  return (gdAmountWei * gdMicroUsdPerToken) / 1_000_000_000_000_000_000n;
+export function gdWeiToMicroUsd(gdAmountWei: bigint, gdPrice: number): bigint {
+  const microUsdPerToken = BigInt(Math.round(gdPrice * 1e6));
+  return (gdAmountWei * microUsdPerToken) / 1_000_000_000_000_000_000n;
 }
 
-export function monthlyStreamMicroUsd(flowRateWeiPerSecond: bigint, gdMicroUsdPerToken: bigint): bigint {
-  return gdWeiToMicroUsd(flowRateWeiPerSecond * BigInt(30 * 24 * 60 * 60), gdMicroUsdPerToken);
+export function monthlyStreamMicroUsd(flowRateWeiPerSecond: bigint, gdPrice: number): bigint {
+  return gdWeiToMicroUsd(flowRateWeiPerSecond * BigInt(30 * 24 * 60 * 60), gdPrice);
 }
 
 export function monthKey(date = new Date()): string {

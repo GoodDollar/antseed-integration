@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { calculateCreditWithBonus, gdWeiToMicroUsd, monthlyStreamMicroUsd, monthKey } from "../src/credit-bonus.js";
 
-const GD_PRICE = 1_000_000n; // 1 G$ = $1
+const GD_PRICE = 1.0; // 1 G$ = $1.00 cUSD
 
 test("regular G$ deposit gets 10% USDC credit bonus for verified accounts", () => {
   const result = calculateCreditWithBonus(
@@ -55,9 +55,9 @@ test("unverified accounts get no bonus", () => {
 });
 
 test("G$ wei converts to micro-USD and monthly stream cap", () => {
-  assert.equal(gdWeiToMicroUsd(1_000_000_000_000_000_000n, 1_000_000n), 1_000_000n);
+  assert.equal(gdWeiToMicroUsd(1_000_000_000_000_000_000n, 1.0), 1_000_000n);
   const flowRate = 1_000_000_000_000_000_000n / BigInt(30 * 24 * 60 * 60);
-  assert.equal(monthlyStreamMicroUsd(flowRate, 1_000_000n) > 999_000n, true);
+  assert.equal(monthlyStreamMicroUsd(flowRate, 1.0) > 999_000n, true);
 });
 
 test("monthKey returns YYYY-MM format", () => {

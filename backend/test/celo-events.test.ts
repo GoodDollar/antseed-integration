@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface } from "ethers";
-import { encodeVaultEventLog, fetchCurrentGdMicroUsdPerToken, fetchGoodIdRoot, parseCeloVaultLogs, decodeBuyerFromUserData } from "../src/celo-events.js";
+import { encodeVaultEventLog, fetchCurrentGdPrice, fetchGoodIdRoot, parseCeloVaultLogs, decodeBuyerFromUserData } from "../src/celo-events.js";
 
 const vault = "0x0000000000000000000000000000000000000abc";
 const account = "0x0000000000000000000000000000000000000def";
@@ -38,7 +38,7 @@ test("fetches GoodID root with eth_call for root aggregation", async () => {
 
   try {
     const fetchedRoot = await fetchGoodIdRoot(account, {
-      GD_MICRO_USD_PER_TOKEN: 1_000_000n,
+      GD_CUSD_PRICE: 1.0,
       CELO_RPC_URL: "https://celo.example",
       CELO_GOODID_ADDRESS: "0x0000000000000000000000000000000000000abc",
       MAX_BONUS_CAP_MICRO_USD: 100_000_000n
@@ -79,30 +79,33 @@ test("decodeBuyerFromUserData decodes abi-encoded address from Superfluid userDa
   assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(32)), undefined); // zero address
 });
 
-test("fetches GD price from reserve currentPriceCDAI", async () => {
-  const reserveAbi = new Interface(["function currentPriceCDAI() view returns (uint256)"]);
+test("fetches GD price from StaticOracle quoteAllAvailablePoolsWithTimePeriod", async () => {
+  const oracleAbi = new Interface([
+    "function quoteAllAvailablePoolsWithTimePeriod(uint128 baseAmount, address baseToken, address quoteToken, uint32 period) view returns (uint256 quoteAmount, address[] queriedPools)"
+  ]);
+  const gdToken = "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A";
   const previousFetch = globalThis.fetch;
+  // oracle returns 1154299954649337 cUSD wei for 1 G$ ≈ 0.001154 cUSD
+  const quoteWei = 1154299954649337n;
   globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
     assert.equal(body.method, "eth_call");
-    const callData = String(body.params[0].data);
-    const expectedSelector = reserveAbi.encodeFunctionData("currentPriceCDAI", []).slice(0, 10);
-    assert.equal(callData.slice(0, 10), expectedSelector);
     return Response.json({
       jsonrpc: "2.0",
       id: body.id,
-      result: reserveAbi.encodeFunctionResult("currentPriceCDAI", [500000000000000000n])
+      result: oracleAbi.encodeFunctionResult("quoteAllAvailablePoolsWithTimePeriod", [quoteWei, []])
     });
   }) as typeof fetch;
 
   try {
-    const price = await fetchCurrentGdMicroUsdPerToken({
-      GD_MICRO_USD_PER_TOKEN: 1_000_000n,
+    const price = await fetchCurrentGdPrice({
+      GD_CUSD_PRICE: 0.001,
       CELO_RPC_URL: "https://celo.example",
-      CELO_RESERVE_PRICE_ORACLE_ADDRESS: "0x0000000000000000000000000000000000000abc",
+      CELO_GD_SUPERTOKEN_ADDRESS: gdToken,
       MAX_BONUS_CAP_MICRO_USD: 100_000_000n
     });
-    assert.equal(price, 500000n);
+    // 1154299954649337 / 1e18 ≈ 0.001154299...
+    assert.ok(price > 0.001154 && price < 0.001155, `expected ~0.001154 but got ${price}`);
   } finally {
     globalThis.fetch = previousFetch;
   }

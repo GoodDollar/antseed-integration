@@ -22,7 +22,7 @@ export class KVCreditStore {
     txHash?: string;
     logIndex?: number;
     date?: Date;
-    gdPrice: bigint;
+    gdPrice: number;
     flowRate?: bigint;
     maxBonusCapMicroUsd: bigint;
     buyerAddress?: string;
@@ -58,11 +58,11 @@ export class KVCreditStore {
       bonusMicroUsd: effectiveBonusMicroUsd.toString(),
       totalCreditMicroUsd: (bonus.principalMicroUsd + effectiveBonusMicroUsd).toString(),
       streamUpdateMonth: month,
-      txHash: input.txHash,
-      logIndex: input.logIndex,
+      ...(input.txHash !== undefined && { txHash: input.txHash }),
+      ...(input.logIndex !== undefined && { logIndex: input.logIndex }),
       fundingStatus: "pending",
       createdAt: now,
-      buyerAddress: input.buyerAddress ? input.buyerAddress.toLowerCase() : undefined
+      ...(input.buyerAddress && { buyerAddress: input.buyerAddress.toLowerCase() })
     };
 
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
@@ -183,7 +183,7 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalPrincipalMicroUsd: saved?.totalPrincipalMicroUsd ?? "0",
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingMicroUsd: saved?.totalOutstandingFundingMicroUsd ?? "0",
-    lastStreamCreditAt: saved?.lastStreamCreditAt ?? createdAt,
+    lastStreamCreditAt: saved?.lastStreamCreditAt ?? "1970-01-01T00:00:00.000Z",
   };
 }
 

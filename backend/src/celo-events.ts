@@ -1,6 +1,5 @@
 import { Interface, LogDescription, getAddress, isAddress, zeroPadValue } from "ethers";
 import { RuntimeConfig } from "./env.js";
-import { gdWeiToMicroUsd } from "./credit-bonus.js";
 
 const VAULT_EVENTS = new Interface([
   "event GdDeposited(address indexed account,address indexed buyer,uint256 gdAmount,bytes data)",
@@ -11,8 +10,11 @@ const GOODID_ABI = new Interface([
   "function getWhitelistedRoot(address account) view returns (address)"
 ]);
 
-const RESERVE_ORACLE_ABI = new Interface([
-  "function currentPrice(bytes32 exchangeId) view returns (uint256)"
+const DEFAULT_STATIC_ORACLE_ADDRESS = "0x00851A91a3c4E9a4c1B48df827Bacc1f884bdE28";
+const DEFAULT_CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
+
+const STATIC_ORACLE_ABI = new Interface([
+  "function quoteAllAvailablePoolsWithTimePeriod(uint128 baseAmount, address baseToken, address quoteToken, uint32 period) view returns (uint256 quoteAmount, address[] queriedPools)"
 ]);
 
 export type ParsedCeloVaultEvent =
@@ -75,19 +77,30 @@ export async function fetchCeloVaultEventsForAccount(
   return parseCeloVaultLogs(logs, cfg.CELO_VAULT_ADDRESS);
 }
 
-export async function fetchCurrentGdMicroUsdPerToken(cfg: RuntimeConfig): Promise<bigint> {
-  if (!cfg.CELO_RPC_URL || !cfg.CELO_RESERVE_PRICE_ORACLE_ADDRESS) return cfg.GD_MICRO_USD_PER_TOKEN;
-  const data = RESERVE_ORACLE_ABI.encodeFunctionData("currentPrice", []);
-  const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: cfg.CELO_RESERVE_PRICE_ORACLE_ADDRESS, data }, "latest"]);
-  if (!result || result === "0x") return cfg.GD_MICRO_USD_PER_TOKEN;
-  const [price] = RESERVE_ORACLE_ABI.decodeFunctionResult("currentPrice", result);
-  const reservePrice = BigInt(price.toString());
-  if (reservePrice > 0n) {
-    return reservePrice;
+/**
+ * Fetch the current G$ price in cUSD as a decimal number (e.g. 0.001154).
+ * Uses the StaticOracle `quoteAllAvailablePoolsWithTimePeriod` with a 60-second TWAP.
+ * Falls back to `cfg.GD_CUSD_PRICE` if the oracle is unavailable or returns zero.
+ */
+export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
+  if (!cfg.CELO_RPC_URL || !cfg.CELO_GD_SUPERTOKEN_ADDRESS) return cfg.GD_CUSD_PRICE;
+  const oracleAddress = cfg.CELO_STATIC_ORACLE_ADDRESS ?? DEFAULT_STATIC_ORACLE_ADDRESS;
+  const cusdAddress = cfg.CELO_CUSD_ADDRESS ?? DEFAULT_CUSD_ADDRESS;
+  const data = STATIC_ORACLE_ABI.encodeFunctionData("quoteAllAvailablePoolsWithTimePeriod", [
+    1_000_000_000_000_000_000n,
+    cfg.CELO_GD_SUPERTOKEN_ADDRESS,
+    cusdAddress,
+    60
+  ]);
+  try {
+    const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: oracleAddress, data }, "latest"]);
+    if (!result || result === "0x") return cfg.GD_CUSD_PRICE;
+    const [quoteAmount] = STATIC_ORACLE_ABI.decodeFunctionResult("quoteAllAvailablePoolsWithTimePeriod", result);
+    const price = Number(BigInt(quoteAmount.toString())) / 1e18;
+    return price > 0 ? price : cfg.GD_CUSD_PRICE;
+  } catch {
+    return cfg.GD_CUSD_PRICE;
   }
-
-
-  return cfg.GD_MICRO_USD_PER_TOKEN;
 }
 
 export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): ParsedCeloVaultEvent[] {

@@ -16,7 +16,7 @@ class MemoryKV {
   }
 }
 
-const GD_PRICE = 1_000_000n; // 1 G$ = $1
+const GD_PRICE = 1.0; // 1 G$ = $1.00 cUSD
 
 test("recordGdCredit persists entry and updates user profile", async () => {
   const store = new KVCreditStore(new MemoryKV() as never);
@@ -27,6 +27,7 @@ test("recordGdCredit persists entry and updates user profile", async () => {
     source: "deposit",
     gdAmountWei: 10_000_000_000_000_000_000n, // 10 G$
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
@@ -51,6 +52,7 @@ test("recordGdCredit is idempotent on duplicate id", async () => {
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
   const second = await store.recordGdCredit({
@@ -60,6 +62,7 @@ test("recordGdCredit is idempotent on duplicate id", async () => {
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
@@ -79,6 +82,7 @@ test("recordGdCredit gives streaming bonus (20%) for stream sources", async () =
     flowRate: 385_802_469_136n,
     rootAccount: "0xROOT",
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
@@ -99,6 +103,7 @@ test("recordGdCredit gives no bonus for unverified accounts", async () => {
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: false,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
@@ -119,6 +124,7 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: cap
   });
   assert.equal(first.bonusMicroUsd, "100000"); // full 10%
@@ -131,6 +137,7 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     source: "deposit",
     gdAmountWei: 10_000_000_000_000_000_000n, // 10 G$ → would be $1 bonus
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: cap
   });
   assert.equal(second.bonusMicroUsd, "400000"); // capped to remaining $0.40
@@ -143,6 +150,7 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: cap
   });
   assert.equal(third.bonusMicroUsd, "0");
@@ -157,6 +165,7 @@ test("markFundingResult updates entry status and user profile on success", async
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
@@ -181,6 +190,7 @@ test("markFundingResult records failure without updating user totals", async () 
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
@@ -202,6 +212,7 @@ test("markFundingResult is idempotent for already-funded entries", async () => {
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
@@ -219,6 +230,7 @@ test("recordGdCredit tracks credits under both wallet and root account", async (
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
@@ -258,13 +270,15 @@ test("markFundingResult updates lastStreamCreditAt for stream sources", async ()
     flowRate: 385_802_469_136n,
     rootAccount: "0xROOT",
     gdPrice: GD_PRICE,
+    isVerified: true,
     maxBonusCapMicroUsd: 100_000_000n
   });
 
-  const before = await store.getUser("0xABC");
+  assert.equal(entry.fundingStatus, "pending");
+  const before = (await store.getUser("0xABC")).createdAt;
   await store.markFundingResult(entry, { funded: true, txHash: "0xstream" });
   const after = await store.getUser("0xABC");
 
   // lastStreamCreditAt should be updated for stream sources
-  assert.notEqual(after.lastStreamCreditAt, before.createdAt);
+  assert.notEqual(after.lastStreamCreditAt, before);
 });

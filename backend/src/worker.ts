@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
-import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdMicroUsdPerToken, fetchGoodIdRoot, decodeBuyerFromUserData } from "./celo-events.js";
+import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdPrice, fetchGoodIdRoot, decodeBuyerFromUserData } from "./celo-events.js";
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
@@ -72,7 +72,7 @@ export default {
     const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
 
 
-    const gdPrice = await fetchCurrentGdMicroUsdPerToken(cfg);
+    const gdPrice = await fetchCurrentGdPrice(cfg);
     const streams = await fetchSuperfluidIncomingStreams(cfg);
     const createdAt = new Date().toISOString();
     for (const stream of streams) {
@@ -121,7 +121,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         rpcConfigured: Boolean(env.CELO_RPC_URL),
         vaultConfigured: Boolean(env.CELO_VAULT_ADDRESS),
         goodIdConfigured: Boolean(env.CELO_GOODID_ADDRESS),
-        reserveOracleConfigured: Boolean(env.CELO_RESERVE_PRICE_ORACLE_ADDRESS)
+        staticOracleConfigured: Boolean(env.CELO_STATIC_ORACLE_ADDRESS)
       },
       kvEnabled: true
     });
@@ -146,7 +146,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       ? await fetchCeloVaultEvents(parsed.data.txHash, cfg)
       : await fetchCeloVaultEventsForAccount(parsed.data.account!, cfg, parsed.data.fromBlock!, parsed.data.toBlock ?? "latest");
     const recorded = [];
-    const gdPrice = await fetchCurrentGdMicroUsdPerToken(cfg);
+    const gdPrice = await fetchCurrentGdPrice(cfg);
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
       if (event.kind === "deposit") {
@@ -221,7 +221,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       return json({ account, streams: [], message: "no active streams found" });
     }
 
-    const gdPrice = await fetchCurrentGdMicroUsdPerToken(cfg);
+    const gdPrice = await fetchCurrentGdPrice(cfg);
     const now = new Date();
     const lastCreditMs = Date.parse(profile.lastStreamCreditAt);
     const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));

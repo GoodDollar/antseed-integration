@@ -119,7 +119,7 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
     const body = await res.json() as { events: Array<{ id: string; source: string; fundingStatus: string; principalMicroUsd: string; buyerAddress?: string }> };
     assert.equal(body.events.length, 1);
     assert.equal(body.events[0].source, "deposit");
-    assert.equal(body.events[0].fundingStatus, "pending");
+    assert.equal(body.events[0].fundingStatus, "funded");
     assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
 
     // Verify credit was recorded
