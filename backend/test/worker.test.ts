@@ -208,3 +208,124 @@ test("OPTIONS returns CORS preflight", async () => {
   assert.equal(res.status, 204);
   assert.equal(res.headers.get("access-control-allow-origin"), "*");
 });
+
+const CHANNEL_ID = `0x${"a".repeat(64)}`;
+
+test("POST /v1/channels/:channelId/close returns enabled:false when vault not configured", async () => {
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json() as { channelId: string; action: string; bridge: { enabled: boolean } };
+  assert.equal(body.channelId, CHANNEL_ID);
+  assert.equal(body.action, "close");
+  assert.equal(body.bridge.enabled, false);
+});
+
+test("POST /v1/channels/:channelId/withdraw returns enabled:false when vault not configured", async () => {
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/withdraw`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json() as { channelId: string; action: string; bridge: { enabled: boolean } };
+  assert.equal(body.channelId, CHANNEL_ID);
+  assert.equal(body.action, "withdraw");
+  assert.equal(body.bridge.enabled, false);
+});
+
+test("POST /v1/channels/:channelId/close with optional sig fields passes validation", async () => {
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ timestamp: 1234567890, signature: `0x${"b".repeat(130)}` })
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json() as { bridge: { enabled: boolean } };
+  assert.equal(body.bridge.enabled, false);
+});
+
+test("POST /v1/channels/:channelId/close rejects invalid signature format", async () => {
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ signature: "not-a-hex-sig" })
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/withdraw`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/accounts/:account/withdraw returns 400 on invalid recipient address", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/withdraw`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        amount: "5000000",
+        recipient: "not-an-address",
+        timestamp: 1234567890,
+        signature: `0x${"b".repeat(130)}`
+      })
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/accounts/:account/withdraw returns enabled:false when vault not configured", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const recipient = "0x0000000000000000000000000000000000000def";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/withdraw`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        amount: "5000000",
+        recipient,
+        timestamp: 1234567890,
+        signature: `0x${"b".repeat(130)}`
+      })
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 200);
+  const body = await res.json() as { account: string; amountMicroUsd: string; bridge: { enabled: boolean } };
+  assert.equal(body.account, account);
+  assert.equal(body.amountMicroUsd, "5000000");
+  assert.equal(body.bridge.enabled, false);
+});

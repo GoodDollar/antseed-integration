@@ -52,7 +52,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     error ZeroAmount();
     error UnsupportedToken();
     error UnsupportedAgreement();
-    error NotGoodIDVerified();
     error NotSuperfluidHost();
     error WrongReceiver();
     error NegativeFlowRate();
@@ -65,7 +64,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     IERC20Like public immutable gdToken;
     address public immutable gdSuperToken;
     address public owner;
-    address public goodIdVerifier;
     address public superfluidHost;
     address public cfaV1;
     address public reservePriceOracle;
@@ -82,7 +80,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     uint256[50] private __gap;
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-    event GoodIDVerifierUpdated(address indexed verifier);
     event SuperfluidConfigUpdated(address indexed host, address indexed cfaV1);
     event ReservePriceOracleUpdated(address indexed reservePriceOracle);
     event MinimumsUpdated(uint256 minFirstDepositMicroUsd, uint256 minMonthlyStreamMicroUsd, uint256 fallbackGdMicroUsdPerToken);
@@ -113,10 +110,9 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         _disableInitializers();
     }
 
-    function initialize(address owner_, address goodIdVerifier_, address superfluidHost_, address cfaV1_) external initializer {
-        if (owner_ == address(0) || goodIdVerifier_ == address(0)) revert ZeroAddress();
+    function initialize(address owner_, address superfluidHost_, address cfaV1_) external initializer {
+        if (owner_ == address(0)) revert ZeroAddress();
         owner = owner_;
-        goodIdVerifier = goodIdVerifier_;
         superfluidHost = superfluidHost_;
         cfaV1 = cfaV1_;
         minFirstDepositMicroUsd = 1_000_000;
@@ -124,7 +120,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         fallbackGdMicroUsdPerToken = 1_000_000;
 
         emit OwnershipTransferred(address(0), owner_);
-        emit GoodIDVerifierUpdated(goodIdVerifier_);
         emit SuperfluidConfigUpdated(superfluidHost_, cfaV1_);
     }
 
@@ -134,12 +129,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         if (newOwner == address(0)) revert ZeroAddress();
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
-    }
-
-    function setGoodIdVerifier(address verifier) external onlyOwner {
-        if (verifier == address(0)) revert ZeroAddress();
-        goodIdVerifier = verifier;
-        emit GoodIDVerifierUpdated(verifier);
     }
 
     function setSuperfluidConfig(address host, address agreement) external onlyOwner {
@@ -174,7 +163,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     /// @param data ABI-encoded AntSeed buyer address: `abi.encode(buyerAddress)`. Required.
     function deposit(uint256 amount, bytes calldata data) external returns (uint256) {
         if (amount == 0) revert ZeroAmount();
-        _requireVerified(msg.sender);
         address buyer = _decodeBuyer(data);
         if (buyer == address(0)) revert MissingBuyerAddress();
         if (totalDepositedGd[msg.sender] == 0 && _gdWeiToMicroUsd(amount) < minFirstDepositMicroUsd) revert FirstDepositBelowMinimum();
@@ -250,7 +238,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
         bytes memory userData = ISuperfluidHostLike(superfluidHost).decodeCtx(ctx).userData;
         address buyer = _decodeBuyer(userData);
-        _recordStream(superToken, agreementClass, agreementData, cbdata, true, buyer);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer);
         return ctx;
     }
 
@@ -264,7 +252,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
         bytes memory userData = ISuperfluidHostLike(superfluidHost).decodeCtx(ctx).userData;
         address buyer = _decodeBuyer(userData);
-        _recordStream(superToken, agreementClass, agreementData, cbdata, true, buyer);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer);
         return ctx;
     }
 
@@ -276,27 +264,14 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        // Do not block stream termination if the user later lost GoodID status.
-        // The terminator need not re-supply the buyer; use the previously stored value.
         (address sender,) = abi.decode(agreementData, (address, address));
         address buyer = streamBuyer[sender];
-        _recordStream(superToken, agreementClass, agreementData, cbdata, false, buyer);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer);
         return ctx;
-    }
-
-    function isGoodIDVerified(address account) public view returns (bool) {
-        (bool ok, bytes memory result) = goodIdVerifier.staticcall(abi.encodeWithSignature("isWhitelisted(address)", account));
-        if (ok && result.length >= 32 && abi.decode(result, (bool))) return true;
-
-        (ok, result) = goodIdVerifier.staticcall(abi.encodeWithSignature("getWhitelistedRoot(address)", account));
-        if (ok && result.length >= 32 && abi.decode(result, (address)) != address(0)) return true;
-
-        return false;
     }
 
     function _recordTokenCallbackDeposit(address account, uint256 amount, bytes calldata data) private {
         if (amount == 0) revert ZeroAmount();
-        _requireVerified(account);
         address buyer = _decodeBuyer(data);
         if (buyer == address(0)) revert MissingBuyerAddress();
         if (totalDepositedGd[account] == 0 && _gdWeiToMicroUsd(amount) < minFirstDepositMicroUsd) revert FirstDepositBelowMinimum();
@@ -309,7 +284,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         address agreementClass,
         bytes calldata agreementData,
         bytes calldata cbdata,
-        bool enforceGoodID,
         address buyer
     ) private {
         if (superToken != gdSuperToken) revert UnsupportedToken();
@@ -317,10 +291,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
 
         (address sender, address receiver) = abi.decode(agreementData, (address, address));
         if (receiver != address(this)) revert WrongReceiver();
-        if (enforceGoodID) {
-            _requireVerified(sender);
-            if (buyer == address(0)) revert MissingBuyerAddress();
-        }
 
         streamBuyer[sender] = buyer;
 
@@ -369,10 +339,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     function _decodeFlowSnapshot(bytes calldata cbdata) private pure returns (uint256 previousTimestamp, int96 previousFlowRate) {
         if (cbdata.length != 64) return (0, 0);
         return abi.decode(cbdata, (uint256, int96));
-    }
-
-    function _requireVerified(address account) private view {
-        if (!isGoodIDVerified(account)) revert NotGoodIDVerified();
     }
 
     function _safeTransferFrom(address from, address to, uint256 amount) private {

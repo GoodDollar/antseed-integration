@@ -1,10 +1,3 @@
-/***
- * TODO
- * 1. keep list of user deposit/stream events when calling store.recordGdCredit, so it can be returned in the API response and used by frontend to correlate with on-chain events and show correct status in UI (eg. if funding failed, frontend can show "failed to credit" status on the specific deposit/stream event instead of just showing "0 G$ available" with no explanation)
- * 2. end point for user requesting credits for their active streams (if they want to trigger funding outside of the cron or deposit events)
- * 3. implement withdraw endpoint, user can withdraw their principal from the vault if they want to stop using antseed. any unused deposited bonus will be withdrawn back to the vault.
- * 4. implement max bonus cap per rootaccount to prevent abuse (eg. if someone creates 1000 accounts and deposits 1 GD in each to get 0.2 USD bonus on each deposit, we should have a cap like max 100 USD bonus per root account or something like that)
- */
 import { z } from "zod";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
 import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdMicroUsdPerToken, fetchGoodIdRoot, decodeBuyerFromUserData } from "./celo-events.js";
@@ -29,8 +22,15 @@ const StreamUpdateSchema = z.object({
   logIndex: z.number().int().nonnegative().optional()
 });
 
-const CloseChannelSchema = z.object({
-  channelId: z.string().regex(/^0x[0-9a-fA-F]{64}$/)
+const WithdrawPrincipalSchema = z.object({
+  amount: z.string().regex(/^\d+$/),
+  recipient: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+  timestamp: z.number().int().nonnegative(),
+  signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
+});
+const ChannelOpSchema = z.object({
+  timestamp: z.number().int().nonnegative().optional(),
+  signature: z.string().regex(/^0x[0-9a-fA-F]+$/).optional()
 });
 const SuperfluidStreamsResponseSchema = z.object({
   data: z.object({
@@ -257,12 +257,34 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ account, elapsedSeconds, streams: recorded });
   }
 
-  if (request.method === "POST" && url.pathname === "/v1/channels/close") {
+  const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);
+  if (request.method === "POST" && withdrawMatch) {
+    const account = decodeURIComponent(withdrawMatch[1]).toLowerCase();
     const body = await parseJson(request);
-    const parsed = CloseChannelSchema.safeParse(body);
+    const parsed = WithdrawPrincipalSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const bridge = await antseedFundingVault.requestClose(parsed.data.channelId);
-    return json({ channelId: parsed.data.channelId, bridge });
+    const bridge = await antseedFundingVault.withdrawPrincipalForBuyer(
+      account,
+      BigInt(parsed.data.amount),
+      parsed.data.recipient,
+      parsed.data.timestamp,
+      parsed.data.signature
+    );
+    return json({ account, amountMicroUsd: parsed.data.amount, bridge });
+  }
+
+  const channelOpMatch = url.pathname.match(/^\/v1\/channels\/(0x[0-9a-fA-F]{64})\/(close|withdraw)$/);
+  if (request.method === "POST" && channelOpMatch) {
+    const channelId = channelOpMatch[1];
+    const action = channelOpMatch[2];
+    const body = request.headers.get("content-length") !== "0" ? await parseJson(request) : {};
+    const parsed = ChannelOpSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const { timestamp, signature } = parsed.data;
+    const bridge = action === "close"
+      ? await antseedFundingVault.requestClose(channelId, timestamp, signature)
+      : await antseedFundingVault.withdrawFromChannel(channelId, timestamp, signature);
+    return json({ channelId, action, bridge });
   }
 
   return json({ error: "not found" }, 404);

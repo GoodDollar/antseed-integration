@@ -58,28 +58,22 @@ contract MockGdToken is IERC20Like {
         require(ok, "TOKENS_RECEIVED");
         return true;
     }
-}
 
-contract MockGoodID {
-    mapping(address => bool) public whitelisted;
-    mapping(address => address) public roots;
-
-    function setWhitelisted(address account, bool value) external {
-        whitelisted[account] = value;
-        roots[account] = value ? account : address(0);
+    function callTokenFallback(address target, address from, uint256 amount, bytes calldata data) external returns (bool) {
+        require(balanceOf[from] >= amount, "BALANCE");
+        balanceOf[from] -= amount;
+        balanceOf[target] += amount;
+        (bool ok,) = target.call(abi.encodeWithSignature("tokenFallback(address,uint256,bytes)", from, amount, data));
+        return ok;
     }
 
-    function setRoot(address account, address root) external {
-        whitelisted[account] = root != address(0);
-        roots[account] = root;
-    }
-
-    function isWhitelisted(address account) external view returns (bool) {
-        return whitelisted[account];
-    }
-
-    function getWhitelistedRoot(address account) external view returns (address) {
-        return roots[account];
+    /// @dev Calls vault's tokensReceived with a caller-supplied `to` to trigger WrongReceiver checks.
+    function callTokensReceivedWithTo(address target, address from, address to, uint256 amount, bytes calldata userData) external returns (bool) {
+        (bool ok,) = target.call(abi.encodeWithSignature(
+            "tokensReceived(address,address,address,uint256,bytes,bytes)",
+            address(this), from, to, amount, userData, bytes("")
+        ));
+        return ok;
     }
 }
 
@@ -207,10 +201,30 @@ contract HostProxy {
     }
 }
 
+contract FailingToken {
+    mapping(address => uint256) public balanceOf;
+
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+    function approve(address, uint256) external pure returns (bool) { return true; }
+    function transfer(address, uint256) external pure returns (bool) { return false; }
+    function transferFrom(address, address, uint256) external pure returns (bool) { return false; }
+}
+
+contract Outsider {
+    CeloGdAntSeedVault public vault;
+
+    constructor(CeloGdAntSeedVault vault_) { vault = vault_; }
+
+    function transferOwnership(address to) external { vault.transferOwnership(to); }
+    function setSuperfluidConfig(address h, address c) external { vault.setSuperfluidConfig(h, c); }
+    function setReserveConfig(address o, uint256 f) external { vault.setReserveConfig(o, f); }
+    function setMinimumUsdThresholds(uint256 a, uint256 b) external { vault.setMinimumUsdThresholds(a, b); }
+    function registerSuperApp(uint256 w) external { vault.registerSuperApp(w); }
+}
+
 contract CeloGdAntSeedVaultTest {
     MockGdToken token;
     MockGdToken superToken;
-    MockGoodID goodId;
     MockCFA cfa;
     MockSuperfluidHost host;
     CeloGdAntSeedVault vault;
@@ -221,21 +235,19 @@ contract CeloGdAntSeedVaultTest {
     function setUp() public {
         token = new MockGdToken();
         superToken = new MockGdToken();
-        goodId = new MockGoodID();
         cfa = new MockCFA();
         host = new MockSuperfluidHost(cfa);
         CeloGdAntSeedVault impl = new CeloGdAntSeedVault(address(token), address(superToken));
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
-            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(goodId), address(host), address(cfa)))
+            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(host), address(cfa)))
         );
         vault = CeloGdAntSeedVault(address(proxy));
         user = new UserProxy(token, vault, BUYER);
-        goodId.setWhitelisted(address(user), true);
         token.mint(address(user), 1_000 ether);
     }
 
-    function testClassicDepositRequiresGoodIDAndTransfersGd() public {
+    function testClassicDepositTransfersGd() public {
         setUp();
         user.approveVault(100 ether);
         user.deposit(100 ether);
@@ -257,14 +269,6 @@ contract CeloGdAntSeedVaultTest {
         require(token.balanceOf(address(vault)) == 30 ether, "vault funded");
     }
 
-    function testRejectsUnverifiedDeposit() public {
-        setUp();
-        goodId.setWhitelisted(address(user), false);
-        user.approveVault(1 ether);
-        (bool ok,) = address(user).call(abi.encodeWithSignature("deposit(uint256)", 1 ether));
-        require(!ok, "unverified deposit rejected");
-    }
-
     function testRejectsFirstDepositBelowOneUsdAndAllowsLaterSmallTopUps() public {
         setUp();
         user.approveVault(2 ether);
@@ -274,14 +278,6 @@ contract CeloGdAntSeedVaultTest {
         user.deposit(1 ether);
         user.deposit(0.25 ether);
         require(vault.totalDepositedGd(address(user)) == 1.25 ether, "subsequent top up allowed");
-    }
-
-    function testGoodIdRootAlsoVerifiesConnectedWallet() public {
-        setUp();
-        address root = address(0xA11CE);
-        goodId.setRoot(address(user), root);
-        user.transferAndCall(5 ether);
-        require(vault.totalDepositedGd(address(user)) == 5 ether, "root verified deposit recorded");
     }
 
     function testRegisterSuperAppCallsConfiguredHost() public {
@@ -322,7 +318,6 @@ contract CeloGdAntSeedVaultTest {
         require(vault.streamFlowRate(address(user)) == updatedFlowRate, "updated flow recorded");
         require(vault.streamBuyer(address(user)) == BUYER, "buyer preserved on update");
 
-        goodId.setWhitelisted(address(user), false);
         returnedCtx = host.terminateFlow(vault, address(superToken), address(user), ctx);
         require(keccak256(returnedCtx) == keccak256(ctx), "termination ctx preserved");
         require(vault.streamFlowRate(address(user)) == 0, "termination cleared flow");
@@ -373,23 +368,6 @@ contract CeloGdAntSeedVaultTest {
             ""
         ));
         require(!ok, "negative flow rejected");
-    }
-
-    function testSuperfluidCreateRequiresGoodIDButTerminationCanClear() public {
-        setUp();
-        goodId.setWhitelisted(address(user), false);
-        (bool ok,) = address(host).call(abi.encodeWithSignature(
-            "createFlow(address,address,address,int96,bytes)",
-            address(vault),
-            address(superToken),
-            address(user),
-            int96(10),
-            ""
-        ));
-        require(!ok, "unverified stream create rejected");
-
-        host.terminateFlow(vault, address(superToken), address(user), "");
-        require(vault.streamFlowRate(address(user)) == 0, "termination allowed");
     }
 
     function testRejectsMonthlyStreamBelowOneUsd() public {
@@ -460,7 +438,7 @@ contract CeloGdAntSeedVaultTest {
     function testCannotReinitialize() public {
         setUp();
         (bool ok,) = address(vault).call(
-            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(goodId), address(host), address(cfa)))
+            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(host), address(cfa)))
         );
         require(!ok, "double init rejected");
     }
@@ -477,6 +455,226 @@ contract CeloGdAntSeedVaultTest {
             abi.encodeWithSignature("upgrade(address,address)", address(vault), address(newImpl))
         );
         require(!ok, "non-owner upgrade rejected");
+    }
+
+    // --- ZeroAmount ---
+
+    function testDepositRejectsZeroAmount() public {
+        setUp();
+        (bool ok,) = address(vault).call(
+            abi.encodeWithSignature("deposit(uint256,bytes)", uint256(0), abi.encode(BUYER))
+        );
+        require(!ok, "zero amount deposit rejected");
+    }
+
+    // --- MissingBuyerAddress ---
+
+    function testDepositRejectsMissingBuyer() public {
+        setUp();
+        user.approveVault(1 ether);
+        (bool ok,) = address(vault).call(
+            abi.encodeWithSignature("deposit(uint256,bytes)", uint256(1 ether), bytes(""))
+        );
+        require(!ok, "missing buyer rejected");
+    }
+
+    // --- FirstDepositBelowMinimum and MissingBuyerAddress via ERC677 ---
+
+    function testErc677RejectsFirstDepositBelowMinimum() public {
+        setUp();
+        token.mint(address(this), 1 ether);
+        (bool ok,) = address(token).call(
+            abi.encodeWithSignature("transferAndCall(address,uint256,bytes)", address(vault), uint256(0.5 ether), abi.encode(BUYER))
+        );
+        require(!ok, "erc677 first deposit below minimum rejected");
+    }
+
+    function testErc677RejectsMissingBuyer() public {
+        setUp();
+        token.mint(address(this), 2 ether);
+        (bool ok,) = address(token).call(
+            abi.encodeWithSignature("transferAndCall(address,uint256,bytes)", address(vault), uint256(1 ether), bytes(""))
+        );
+        require(!ok, "erc677 missing buyer rejected");
+    }
+
+    // --- WrongReceiver in tokensReceived ---
+
+    function testErc777RejectsWrongReceiverInCallback() public {
+        setUp();
+        bool ok = token.callTokensReceivedWithTo(address(vault), address(user), address(0xBEEF), 1 ether, abi.encode(BUYER));
+        require(!ok, "wrong receiver in tokensReceived rejected");
+    }
+
+    // --- UnsupportedToken: onlyGdToken modifier ---
+
+    function testTokenCallbacksRejectNonGdToken() public {
+        setUp();
+        (bool ok,) = address(vault).call(
+            abi.encodeWithSignature("onTokenTransfer(address,uint256,bytes)", address(this), uint256(1 ether), abi.encode(BUYER))
+        );
+        require(!ok, "non-gd token onTokenTransfer rejected");
+
+        (ok,) = address(vault).call(
+            abi.encodeWithSignature("tokenFallback(address,uint256,bytes)", address(this), uint256(1 ether), abi.encode(BUYER))
+        );
+        require(!ok, "non-gd token tokenFallback rejected");
+    }
+
+    // --- tokenFallback happy path ---
+
+    function testTokenFallbackDeposit() public {
+        setUp();
+        token.mint(address(this), 50 ether);
+        bool ok = token.callTokenFallback(address(vault), address(this), 50 ether, abi.encode(BUYER));
+        require(ok, "tokenFallback deposit succeeded");
+        require(vault.totalDepositedGd(address(this)) == 50 ether, "tokenFallback deposit recorded");
+    }
+
+    // --- TransferFailed ---
+
+    function testTransferFailedRevertsDeposit() public {
+        setUp();
+        FailingToken failToken = new FailingToken();
+        CeloGdAntSeedVault failImpl = new CeloGdAntSeedVault(address(failToken), address(superToken));
+        ERC1967Proxy failProxy = new ERC1967Proxy(
+            address(failImpl),
+            abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(host), address(cfa)))
+        );
+        CeloGdAntSeedVault failVault = CeloGdAntSeedVault(address(failProxy));
+        failToken.mint(address(this), 1 ether);
+        (bool ok,) = address(failVault).call(
+            abi.encodeWithSignature("deposit(uint256,bytes)", uint256(1 ether), abi.encode(BUYER))
+        );
+        require(!ok, "deposit with failing transferFrom reverts");
+    }
+
+    // --- InvalidPriceConfig ---
+
+    function testSetReserveConfigRejectsInvalidPriceConfig() public {
+        setUp();
+        (bool ok,) = address(vault).call(
+            abi.encodeWithSignature("setReserveConfig(address,uint256)", address(0), uint256(0))
+        );
+        require(!ok, "invalid price config rejected");
+    }
+
+    // --- NotOwner for all admin functions ---
+
+    function testOnlyOwnerFunctionsRejectNonOwner() public {
+        setUp();
+        Outsider outsider = new Outsider(vault);
+
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("transferOwnership(address)", address(0xDEAD))
+        );
+        require(!ok, "non-owner transferOwnership rejected");
+
+        (ok,) = address(outsider).call(
+            abi.encodeWithSignature("setSuperfluidConfig(address,address)", address(0), address(0))
+        );
+        require(!ok, "non-owner setSuperfluidConfig rejected");
+
+        (ok,) = address(outsider).call(
+            abi.encodeWithSignature("setReserveConfig(address,uint256)", address(0xAB), uint256(0))
+        );
+        require(!ok, "non-owner setReserveConfig rejected");
+
+        (ok,) = address(outsider).call(
+            abi.encodeWithSignature("setMinimumUsdThresholds(uint256,uint256)", uint256(1), uint256(1))
+        );
+        require(!ok, "non-owner setMinimumUsdThresholds rejected");
+
+        (ok,) = address(outsider).call(
+            abi.encodeWithSignature("registerSuperApp(uint256)", uint256(1))
+        );
+        require(!ok, "non-owner registerSuperApp rejected");
+    }
+
+    // --- ZeroAddress in transferOwnership ---
+
+    function testTransferOwnershipRejectsZeroAddress() public {
+        setUp();
+        (bool ok,) = address(vault).call(
+            abi.encodeWithSignature("transferOwnership(address)", address(0))
+        );
+        require(!ok, "transferOwnership to zero rejected");
+    }
+
+    function testTransferOwnershipWorks() public {
+        setUp();
+        address newOwner = address(0xA1B2C3);
+        vault.transferOwnership(newOwner);
+        require(vault.owner() == newOwner, "ownership transferred");
+        // former owner can no longer call admin functions
+        (bool ok,) = address(vault).call(
+            abi.encodeWithSignature("setSuperfluidConfig(address,address)", address(host), address(cfa))
+        );
+        require(!ok, "former owner admin access revoked");
+    }
+
+    // --- ZeroAddress in registerSuperApp when host is address(0) ---
+
+    function testRegisterSuperAppRejectsZeroHost() public {
+        setUp();
+        vault.setSuperfluidConfig(address(0), address(cfa));
+        (bool ok,) = address(vault).call(
+            abi.encodeWithSignature("registerSuperApp(uint256)", uint256(12345))
+        );
+        require(!ok, "registerSuperApp with zero host rejected");
+    }
+
+    // --- NotSuperfluidHost for before* callbacks ---
+
+    function testBeforeCallbacksRequireHost() public {
+        setUp();
+        bytes memory agreementData = abi.encode(address(user), address(vault));
+
+        (bool ok,) = address(vault).call(abi.encodeWithSignature(
+            "beforeAgreementCreated(address,address,bytes32,bytes,bytes)",
+            address(superToken), address(cfa), bytes32(0), agreementData, bytes("")
+        ));
+        require(!ok, "beforeAgreementCreated non-host rejected");
+
+        (ok,) = address(vault).call(abi.encodeWithSignature(
+            "beforeAgreementUpdated(address,address,bytes32,bytes,bytes)",
+            address(superToken), address(cfa), bytes32(0), agreementData, bytes("")
+        ));
+        require(!ok, "beforeAgreementUpdated non-host rejected");
+
+        (ok,) = address(vault).call(abi.encodeWithSignature(
+            "beforeAgreementTerminated(address,address,bytes32,bytes,bytes)",
+            address(superToken), address(cfa), bytes32(0), agreementData, bytes("")
+        ));
+        require(!ok, "beforeAgreementTerminated non-host rejected");
+    }
+
+    // --- NotSuperfluidHost for afterAgreementUpdated and afterAgreementTerminated ---
+
+    function testAfterAgreementUpdatedAndTerminatedRequireHost() public {
+        setUp();
+        bytes memory agreementData = abi.encode(address(user), address(vault));
+
+        (bool ok,) = address(vault).call(abi.encodeWithSignature(
+            "afterAgreementUpdated(address,address,bytes32,bytes,bytes,bytes)",
+            address(superToken), address(cfa), bytes32(0), agreementData, bytes(""), bytes("")
+        ));
+        require(!ok, "afterAgreementUpdated non-host rejected");
+
+        (ok,) = address(vault).call(abi.encodeWithSignature(
+            "afterAgreementTerminated(address,address,bytes32,bytes,bytes,bytes)",
+            address(superToken), address(cfa), bytes32(0), agreementData, bytes(""), bytes("")
+        ));
+        require(!ok, "afterAgreementTerminated non-host rejected");
+    }
+
+    // --- setMinimumUsdThresholds happy path ---
+
+    function testSetMinimumUsdThresholds() public {
+        setUp();
+        vault.setMinimumUsdThresholds(2_000_000, 3_000_000);
+        require(vault.minFirstDepositMicroUsd() == 2_000_000, "min deposit threshold updated");
+        require(vault.minMonthlyStreamMicroUsd() == 3_000_000, "min stream threshold updated");
     }
 }
 

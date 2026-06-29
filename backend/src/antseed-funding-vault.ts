@@ -4,7 +4,9 @@ import { RuntimeConfig } from "./env.js";
 const FUNDING_VAULT_ABI = [
   "function depositFor(address buyer, uint256 principal, uint256 bonus)",
   "function depositForWithId(address buyer, uint256 principal, uint256 bonus, string id)",
-  "function requestClose(bytes32 channelId)",
+  "function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 timestamp, bytes buyerSig)",
+  "function requestClose(bytes32 channelId, uint256 timestamp, bytes buyerSig)",
+  "function withdrawChannel(bytes32 channelId, uint256 timestamp, bytes buyerSig)",
   "function usedDepositIds(bytes32 id) view returns (bool)"
 ] as const;
 
@@ -69,9 +71,23 @@ export class AntSeedFundingVaultClient {
     };
   }
 
-  async requestClose(channelId: string): Promise<{ enabled: boolean; txHash?: string }> {
+  async withdrawPrincipalForBuyer(buyer: string, amountMicroUsd: bigint, recipient: string, timestamp: number, signature: string): Promise<{ enabled: boolean; txHash?: string }> {
     if (!this.contract) return { enabled: false };
-    const tx = await this.contract.requestClose(channelId);
+    const tx = await this.contract.withdrawPrincipal(buyer, amountMicroUsd, recipient, timestamp, signature);
+    const receipt = await tx.wait();
+    return { enabled: true, txHash: receipt?.hash };
+  }
+
+  async requestClose(channelId: string, timestamp?: number, buyerSig?: string): Promise<{ enabled: boolean; txHash?: string }> {
+    if (!this.contract) return { enabled: false };
+    const tx = await this.contract.requestClose(channelId, timestamp ?? 0, buyerSig ?? "0x");
+    const receipt = await tx.wait();
+    return { enabled: true, txHash: receipt?.hash };
+  }
+
+  async withdrawFromChannel(channelId: string, timestamp?: number, buyerSig?: string): Promise<{ enabled: boolean; txHash?: string }> {
+    if (!this.contract) return { enabled: false };
+    const tx = await this.contract.withdrawChannel(channelId, timestamp ?? 0, buyerSig ?? "0x");
     const receipt = await tx.wait();
     return { enabled: true, txHash: receipt?.hash };
   }

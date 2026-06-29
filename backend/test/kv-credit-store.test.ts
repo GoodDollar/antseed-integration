@@ -23,9 +23,9 @@ test("recordGdCredit persists entry and updates user profile", async () => {
   const entry = await store.recordGdCredit({
     id: "deposit:1",
     account: "0xABC",
+    rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 10_000_000_000_000_000_000n, // 10 G$
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
@@ -47,18 +47,18 @@ test("recordGdCredit is idempotent on duplicate id", async () => {
   const first = await store.recordGdCredit({
     id: "deposit:dup",
     account: "0xABC",
+    rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
   const second = await store.recordGdCredit({
     id: "deposit:dup",
     account: "0xABC",
+    rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
@@ -77,7 +77,7 @@ test("recordGdCredit gives streaming bonus (20%) for stream sources", async () =
     source: "streamRequest",
     gdAmountWei: 1_000_000_000_000_000_000n, // 1 G$
     flowRate: 385_802_469_136n,
-    isVerified: true,
+    rootAccount: "0xROOT",
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
@@ -98,7 +98,6 @@ test("recordGdCredit gives no bonus for unverified accounts", async () => {
     account: "0xABC",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: false,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
@@ -119,7 +118,6 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: cap
   });
@@ -132,7 +130,6 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 10_000_000_000_000_000_000n, // 10 G$ → would be $1 bonus
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: cap
   });
@@ -145,7 +142,6 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: cap
   });
@@ -157,9 +153,9 @@ test("markFundingResult updates entry status and user profile on success", async
   const entry = await store.recordGdCredit({
     id: "deposit:fund1",
     account: "0xABC",
+    rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
@@ -181,9 +177,9 @@ test("markFundingResult records failure without updating user totals", async () 
   const entry = await store.recordGdCredit({
     id: "deposit:fail1",
     account: "0xABC",
+    rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
@@ -202,9 +198,9 @@ test("markFundingResult is idempotent for already-funded entries", async () => {
   const entry = await store.recordGdCredit({
     id: "deposit:idem",
     account: "0xABC",
+    rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
@@ -222,7 +218,6 @@ test("recordGdCredit tracks credits under both wallet and root account", async (
     rootAccount: "0xROOT",
     source: "deposit",
     gdAmountWei: 1_000_000_000_000_000_000n,
-    isVerified: true,
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });
@@ -261,7 +256,7 @@ test("markFundingResult updates lastStreamCreditAt for stream sources", async ()
     source: "streamCron",
     gdAmountWei: 1_000_000_000_000_000_000n,
     flowRate: 385_802_469_136n,
-    isVerified: true,
+    rootAccount: "0xROOT",
     gdPrice: GD_PRICE,
     maxBonusCapMicroUsd: 100_000_000n
   });

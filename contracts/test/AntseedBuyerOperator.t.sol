@@ -218,6 +218,28 @@ contract AntseedBuyerOperatorTest {
         return abi.encodePacked(r, s, v);
     }
 
+    function _signRequestClose(uint256 pk, bytes32 channelId, uint256 timestamp) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(
+            operator.REQUEST_CLOSE_TYPEHASH(),
+            channelId,
+            timestamp
+        ));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _signWithdrawChannel(uint256 pk, bytes32 channelId, uint256 timestamp) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(
+            operator.WITHDRAW_CHANNEL_TYPEHASH(),
+            channelId,
+            timestamp
+        ));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
     function testDepositForFundsBuyerWhenOperatorAccepted() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
@@ -250,18 +272,6 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "duplicate id rejected");
     }
 
-    function testWithdrawDepositedForSendsRecipient() public {
-        setUp();
-        usdc.mint(address(operator), 100_000_000);
-
-        operator.acceptBuyerOperator(buyer, 1, "");
-        operator.depositFor(buyer, 10_000_000, 2_345_678);
-        operator.withdrawDepositedFor(buyer, 2_345_678, recipient);
-
-        require(deposits.available(buyer) == 10_000_000, "buyer debited");
-        require(usdc.balanceOf(recipient) == 2_345_678, "recipient credited");
-    }
-
     function testDepositRevertsIfOperatorNotSet() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
@@ -280,8 +290,8 @@ contract AntseedBuyerOperatorTest {
         bytes32 channelId = keccak256("channel-1");
         channels.setChannelBuyer(channelId, buyer);
 
-        operator.requestClose(channelId);
-        operator.withdrawChannel(channelId);
+        operator.requestClose(channelId, 0, "");
+        operator.withdrawChannel(channelId, 0, "");
 
         OperatorCaller buyerCaller = new OperatorCaller(operator);
         channels.setChannelBuyer(channelId, address(buyerCaller));
@@ -349,6 +359,29 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "over-withdraw rejected");
     }
 
+    function testWithdrawPrincipalLeavesBonus() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 5_000_000, 2_000_000);
+
+        // Total in vault = 7_000_000; only 5_000_000 is principal and thus withdrawable
+        require(deposits.available(buyerAddr) == 7_000_000, "full deposit in vault");
+        require(operator.withdrawablePrincipal(buyerAddr) == 5_000_000, "only principal withdrawable");
+
+        uint256 ts = block.timestamp;
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, ts);
+        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, ts, sig);
+
+        // Recipient received only the principal
+        require(usdc.balanceOf(recipient) == 5_000_000, "recipient got principal");
+        // Bonus stays in the deposit vault
+        require(deposits.available(buyerAddr) == 2_000_000, "bonus remains in vault");
+        require(operator.withdrawablePrincipal(buyerAddr) == 0, "nothing left to withdraw");
+    }
+
     function testWithdrawPrincipalRejectsWrongSigner() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
@@ -390,6 +423,84 @@ contract AntseedBuyerOperatorTest {
         } catch {
             ok = false;
         }
+        require(!ok, "expired timestamp rejected");
+    }
+
+    function testRequestCloseWithBuyerSig() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-sig");
+        address buyerAddr = vm.addr(BUYER_PK);
+        channels.setChannelBuyer(channelId, buyerAddr);
+
+        uint256 ts = block.timestamp;
+        bytes memory sig = _signRequestClose(BUYER_PK, channelId, ts);
+        operator.requestClose(channelId, ts, sig);
+        require(channels.requestCloseCalls() == 1, "requestClose forwarded");
+    }
+
+    function testRequestCloseRejectsWrongSigner() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-sig");
+        address buyerAddr = vm.addr(BUYER_PK);
+        channels.setChannelBuyer(channelId, buyerAddr);
+
+        uint256 ts = block.timestamp;
+        bytes memory badSig = _signRequestClose(0xDEAD, channelId, ts);
+        bool ok;
+        try operator.requestClose(channelId, ts, badSig) { ok = true; } catch { ok = false; }
+        require(!ok, "wrong signer rejected");
+    }
+
+    function testRequestCloseRejectsExpiredTimestamp() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-sig");
+        address buyerAddr = vm.addr(BUYER_PK);
+        channels.setChannelBuyer(channelId, buyerAddr);
+
+        uint256 ts = block.timestamp;
+        bytes memory sig = _signRequestClose(BUYER_PK, channelId, ts);
+        vm.warp(ts + 6 minutes);
+        bool ok;
+        try operator.requestClose(channelId, ts, sig) { ok = true; } catch { ok = false; }
+        require(!ok, "expired timestamp rejected");
+    }
+
+    function testWithdrawChannelWithBuyerSig() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-sig");
+        address buyerAddr = vm.addr(BUYER_PK);
+        channels.setChannelBuyer(channelId, buyerAddr);
+
+        uint256 ts = block.timestamp;
+        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, ts);
+        operator.withdrawChannel(channelId, ts, sig);
+        require(channels.withdrawCalls() == 1, "withdrawChannel forwarded");
+    }
+
+    function testWithdrawChannelRejectsWrongSigner() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-sig");
+        address buyerAddr = vm.addr(BUYER_PK);
+        channels.setChannelBuyer(channelId, buyerAddr);
+
+        uint256 ts = block.timestamp;
+        bytes memory badSig = _signWithdrawChannel(0xDEAD, channelId, ts);
+        bool ok;
+        try operator.withdrawChannel(channelId, ts, badSig) { ok = true; } catch { ok = false; }
+        require(!ok, "wrong signer rejected");
+    }
+
+    function testWithdrawChannelRejectsExpiredTimestamp() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-sig");
+        address buyerAddr = vm.addr(BUYER_PK);
+        channels.setChannelBuyer(channelId, buyerAddr);
+
+        uint256 ts = block.timestamp;
+        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, ts);
+        vm.warp(ts + 6 minutes);
+        bool ok;
+        try operator.withdrawChannel(channelId, ts, sig) { ok = true; } catch { ok = false; }
         require(!ok, "expired timestamp rejected");
     }
 

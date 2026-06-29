@@ -30,6 +30,10 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     bytes32 public DOMAIN_SEPARATOR;
     bytes32 public constant WITHDRAW_TYPEHASH =
         keccak256("WithdrawPrincipal(address buyer,uint256 amount,address recipient,uint256 timestamp)");
+    bytes32 public constant REQUEST_CLOSE_TYPEHASH =
+        keccak256("RequestClose(bytes32 channelId,uint256 timestamp)");
+    bytes32 public constant WITHDRAW_CHANNEL_TYPEHASH =
+        keccak256("WithdrawChannel(bytes32 channelId,uint256 timestamp)");
 
     uint256[50] private __gap;
 
@@ -139,20 +143,6 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit BuyerDepositFundedWithId(buyer, principal, bonus, id);
     }
 
-    function withdrawDepositedFor(address buyer, uint256 amount, address recipient) external nonReentrant onlyOwner {
-        if (buyer == address(0) || recipient == address(0)) revert InvalidAddress();
-        if (amount == 0) revert InvalidAmount();
-        _requireDepositsOperator(buyer);
-
-        uint256 beforeBalance = usdc.balanceOf(address(this));
-        _deposits().withdraw(buyer, amount);
-        uint256 received = usdc.balanceOf(address(this)) - beforeBalance;
-        if (received < amount) revert InvalidAmount();
-
-        _safeTransfer(usdc, recipient, amount);
-        emit BuyerDepositWithdrawn(buyer, recipient, amount);
-    }
-
     /// @notice Withdraws principal on behalf of a buyer, authorized by their EIP-712 signature.
     /// @param buyer The buyer whose principal is being withdrawn.
     /// @param amount The amount in USDC micro-units to withdraw.
@@ -196,11 +186,39 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit BuyerOperatorTransferred(buyer, newOperator);
     }
 
+    function requestClose(bytes32 channelId, uint256 timestamp, bytes calldata buyerSig) public nonReentrant {
+        address buyer = _channelBuyer(channelId);
+        if (buyerSig.length > 0) {
+            if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
+            bytes32 structHash = keccak256(abi.encode(REQUEST_CLOSE_TYPEHASH, channelId, timestamp));
+            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+            if (_recoverSigner(digest, buyerSig) != buyer) revert InvalidSignature();
+        } else {
+            _requireBuyerOrOwner(buyer);
+        }
+        _channels().requestClose(channelId);
+        emit ChannelCloseRequested(channelId, buyer, msg.sender);
+    }
+
     function requestClose(bytes32 channelId) external nonReentrant {
         address buyer = _channelBuyer(channelId);
         _requireBuyerOrOwner(buyer);
         _channels().requestClose(channelId);
         emit ChannelCloseRequested(channelId, buyer, msg.sender);
+    }
+
+    function withdrawChannel(bytes32 channelId, uint256 timestamp, bytes calldata buyerSig) external nonReentrant {
+        address buyer = _channelBuyer(channelId);
+        if (buyerSig.length > 0) {
+            if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
+            bytes32 structHash = keccak256(abi.encode(WITHDRAW_CHANNEL_TYPEHASH, channelId, timestamp));
+            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+            if (_recoverSigner(digest, buyerSig) != buyer) revert InvalidSignature();
+        } else {
+            _requireBuyerOrOwner(buyer);
+        }
+        _channels().withdraw(channelId);
+        emit ChannelWithdrawn(channelId, buyer, msg.sender);
     }
 
     function withdrawChannel(bytes32 channelId) external nonReentrant {
@@ -210,7 +228,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit ChannelWithdrawn(channelId, buyer, msg.sender);
     }
 
-    function sweepToken(address token, address recipient, uint256 amount) external nonReentrant onlyOwner {
+    function sweepToken(address token, address recipient, uint256 amount) external onlyOwner {
         if (token == address(0) || recipient == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
         _safeTransfer(IERC20(token), recipient, amount);
