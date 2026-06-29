@@ -276,9 +276,104 @@ test("markFundingResult updates lastStreamCreditAt for stream sources", async ()
 
   assert.equal(entry.fundingStatus, "pending");
   const before = (await store.getUser("0xABC")).createdAt;
+  await new Promise((r) => setTimeout(r, 5));
+
   await store.markFundingResult(entry, { funded: true, txHash: "0xstream" });
   const after = await store.getUser("0xABC");
 
   // lastStreamCreditAt should be updated for stream sources
   assert.notEqual(after.lastStreamCreditAt, before);
+});
+
+test("updateUser sets updatedAt on recordGdCredit and changes it after markFundingResult", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const entry = await store.recordGdCredit({
+    id: "deposit:upd1",
+    account: "0xABC",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapMicroUsd: 100_000_000n
+  });
+
+  const afterRecord = await store.getUser("0xABC");
+  assert.ok(afterRecord.updatedAt, "updatedAt should be set after recordGdCredit");
+
+  // Small delay so the timestamp can differ
+  await new Promise((r) => setTimeout(r, 5));
+
+  await store.markFundingResult(entry, { funded: true, txHash: "0xupd" });
+  const afterFund = await store.getUser("0xABC");
+  assert.ok(
+    new Date(afterFund.updatedAt).getTime() >= new Date(afterRecord.updatedAt).getTime(),
+    "updatedAt should be updated after markFundingResult"
+  );
+});
+
+test("updateUser applies the same mutation to both wallet and root account profiles", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const entry = await store.recordGdCredit({
+    id: "deposit:upd2",
+    account: "0xWALLET",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 5_000_000_000_000_000_000n, // 5 G$ → $5 principal + $0.50 bonus
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapMicroUsd: 100_000_000n
+  });
+
+  await store.markFundingResult(entry, { funded: true, txHash: "0xupd2" });
+
+  const wallet = await store.getUser("0xWALLET");
+  const root = await store.getUser("0xROOT");
+
+  // Both profiles should reflect the same funded totals
+  assert.equal(wallet.totalPrincipalMicroUsd, root.totalPrincipalMicroUsd);
+  assert.equal(wallet.totalBonusMicroUsd, root.totalBonusMicroUsd);
+  assert.equal(wallet.totalOutstandingFundingMicroUsd, root.totalOutstandingFundingMicroUsd);
+  assert.equal(wallet.totalOutstandingFundingMicroUsd, "0");
+
+  // Root profile's account field should be the root address
+  assert.equal(root.account, "0xroot");
+  assert.equal(root.rootAccount, "0xroot");
+});
+
+test("updateUser accumulates totals correctly across multiple deposits", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+
+  const e1 = await store.recordGdCredit({
+    id: "deposit:acc1",
+    account: "0xABC",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 2_000_000_000_000_000_000n, // 2 G$ → $2 principal + $0.20 bonus
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapMicroUsd: 100_000_000n
+  });
+  const e2 = await store.recordGdCredit({
+    id: "deposit:acc2",
+    account: "0xABC",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 3_000_000_000_000_000_000n, // 3 G$ → $3 principal + $0.30 bonus
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapMicroUsd: 100_000_000n
+  });
+
+  // Both pending → outstanding = $2.20 + $3.30 = $5.50
+  const pending = await store.getUser("0xABC");
+  assert.equal(pending.totalOutstandingFundingMicroUsd, "5500000");
+
+  await store.markFundingResult(e1, { funded: true, txHash: "0xa1" });
+  await store.markFundingResult(e2, { funded: true, txHash: "0xa2" });
+
+  const done = await store.getUser("0xABC");
+  assert.equal(done.totalPrincipalMicroUsd, "5000000");
+  assert.equal(done.totalBonusMicroUsd, "500000");
+  assert.equal(done.totalOutstandingFundingMicroUsd, "0");
 });
