@@ -41,7 +41,7 @@ export async function fetchGoodIdRoot(account: string, cfg: RuntimeConfig): Prom
   if (!cfg.CELO_RPC_URL || !cfg.CELO_GOODID_ADDRESS) return normalizeAccount(account);
   const data = GOODID_ABI.encodeFunctionData("getWhitelistedRoot", [account]);
   const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: cfg.CELO_GOODID_ADDRESS, data }, "latest"]);
-  if (!result || result === "0x") return normalizeAccount(account);
+  if (!result || result === "0x") return undefined;
   const [root] = GOODID_ABI.decodeFunctionResult("getWhitelistedRoot", result);
   const rootString = String(root);
   return isAddress(rootString) && rootString !== "0x0000000000000000000000000000000000000000" ? normalizeAccount(rootString) : undefined;

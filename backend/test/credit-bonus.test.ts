@@ -38,7 +38,22 @@ test("streamCron source also gets 20% bonus", () => {
     GD_PRICE
   );
 
-  assert.equal(result.bonusUsd, 200_000n);
+  assert.equal(result.principalUsd, 1_000_000n);
+  assert.equal(result.bonusUsd, 200_000n); // 20%
+  assert.equal(result.totalCreditUsd, 1_200_000n);
+});
+
+test("streamUpdate source also gets 20% bonus for verified accounts", () => {
+  const result = calculateCreditWithBonus(
+    1_000_000_000_000_000_000n, // 1 G$
+    "streamUpdate",
+    true,
+    GD_PRICE
+  );
+
+  assert.equal(result.principalUsd, 1_000_000n);
+  assert.equal(result.bonusUsd, 200_000n); // 20%
+  assert.equal(result.totalCreditUsd, 1_200_000n);
 });
 
 test("unverified accounts get no bonus", () => {

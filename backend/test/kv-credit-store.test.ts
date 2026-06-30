@@ -95,6 +95,29 @@ test("recordGdCredit gives streaming bonus (20%) for stream sources", async () =
   assert.equal(user.streamFlowRateWeiPerSecond, "385802469136");
 });
 
+test("recordGdCredit gives streaming bonus (20%) for streamUpdate source", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const entry = await store.recordGdCredit({
+    id: "streamUpdate:2026-05:0xabc",
+    account: "0xABC",
+    source: "streamUpdate",
+    gdAmountWei: 5_000_000_000_000_000_000n, // 5 G$
+    flowRate: 1_929_012_345_679n,
+    rootAccount: "0xROOT",
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapUsd: 100_000_000n
+  });
+
+  assert.equal(entry.principalUsd, "5000000");
+  assert.equal(entry.bonusUsd, "1000000"); // 20% streaming bonus
+  assert.equal(entry.totalCreditUsd, "6000000");
+
+  const user = await store.getUser("0xABC");
+  assert.equal(user.totalGDStreamedWei, "5000000000000000000");
+  assert.equal(user.streamFlowRateWeiPerSecond, "1929012345679");
+});
+
 test("recordGdCredit gives no bonus for unverified accounts", async () => {
   const store = new KVCreditStore(new MemoryKV() as never);
   const entry = await store.recordGdCredit({

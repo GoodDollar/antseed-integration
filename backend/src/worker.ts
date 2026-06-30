@@ -4,6 +4,7 @@ import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdPri
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
+import { parseEther } from "ethers";
 
 const CeloEventsRecordSchema = z.object({
   txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
@@ -50,7 +51,6 @@ const MIN_STREAM_BONUS = parseEther("800"); // minimum G$ amount to issue a stre
 
 type SuperfluidIncomingStream = {
   account: string;
-  gdAmountWei: string;
   flowRateWeiPerSecond: string;
   lastUpdateAt: string;
   /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
@@ -77,6 +77,14 @@ export default {
     const streams = await fetchSuperfluidIncomingStreams(cfg);
     const createdAt = new Date().toISOString();
     for (const stream of streams) {
+      const profile = await store.getUser(stream.account);
+      const now = new Date();
+      const lastCreditMs = Date.parse(profile.lastStreamCreditAt);
+      const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));
+      const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
+      if (elapsedSeconds < 60 * 60 * 24 || gdAmountWei < MIN_STREAM_BONUS) { // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
+        continue;
+      }
       const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
       const depositId = createStreamFundingId(stream.account, new Date(createdAt));
       const entry = await store.recordGdCredit({
@@ -84,7 +92,7 @@ export default {
         account: stream.account,
         rootAccount,
         source: "streamCron",
-        gdAmountWei: BigInt(stream.gdAmountWei),
+        gdAmountWei: BigInt(gdAmountWei),
         flowRate: BigInt(stream.flowRateWeiPerSecond),
         isVerified: !!rootAccount, // if root acccount was found it is whitelisted
         gdPrice,
@@ -234,7 +242,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const recorded = [];
     for (const stream of streams) {
       const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
-      if (gdAmountWei <= 0n) continue;
+      if (gdAmountWei <= MIN_STREAM_BONUS) {
+        recorded.push({message: `stream credit amount ${gdAmountWei} is below minimum ${MIN_STREAM_BONUS}`});
+        continue;
+      }
 
       const depositId = createStreamFundingId(account, now);
       const entry = await store.recordGdCredit({
@@ -421,7 +432,6 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
 
       const batch = parsed.data.data.streams.map((stream) => {
         const flowRateWeiPerSecond = stream.currentFlowRate;
-        const gdAmountWei = (BigInt(flowRateWeiPerSecond) * 60n).toString();
         const updatedAtSeconds = Number(stream.updatedAtTimestamp);
         const lastUpdateAt = Number.isFinite(updatedAtSeconds)
           ? new Date(updatedAtSeconds * 1000).toISOString()
@@ -430,7 +440,6 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
         const buyerAddress = decodeBuyerFromUserData(rawUserData);
         return {
           account: stream.sender.id.toLowerCase(),
-          gdAmountWei,
           flowRateWeiPerSecond,
           lastUpdateAt,
           buyerAddress
