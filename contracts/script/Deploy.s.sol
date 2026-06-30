@@ -10,7 +10,6 @@ contract Deploy is Script {
     struct Config {
         address owner;
         address gdToken;
-        address gdSuperToken;
         address superfluidHost;
         address cfaV1;
         address antseedRegistry;
@@ -33,7 +32,6 @@ contract Deploy is Script {
     function _loadConfig() private view returns (Config memory config) {
         config.owner = vm.envAddress("OWNER_ADDRESS");
         config.gdToken = vm.envAddress("GD_TOKEN");
-        config.gdSuperToken = vm.envAddress("GD_SUPER_TOKEN");
         config.superfluidHost = vm.envAddress("SUPERFLUID_HOST");
         config.cfaV1 = vm.envAddress("CFA_V1");
         config.antseedRegistry = vm.envAddress("ANTSEED_REGISTRY");
@@ -45,10 +43,10 @@ contract Deploy is Script {
     {
         bytes memory vaultImplInitCode = abi.encodePacked(
             type(CeloGdAntSeedVault).creationCode,
-            abi.encode(config.gdToken, config.gdSuperToken)
+            abi.encode(config.gdToken)
         );
         bytes32 vaultImplSalt = keccak256(vaultImplInitCode);
-        vaultImpl = new CeloGdAntSeedVault{salt: vaultImplSalt}(config.gdToken, config.gdSuperToken);
+        vaultImpl = new CeloGdAntSeedVault{salt: vaultImplSalt}(config.gdToken);
 
         bytes memory vaultInitData = abi.encodeCall(
             CeloGdAntSeedVault.initialize,

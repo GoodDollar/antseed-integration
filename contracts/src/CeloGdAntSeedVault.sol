@@ -62,7 +62,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     error MissingBuyerAddress();
 
     IERC20Like public immutable gdToken;
-    address public immutable gdSuperToken;
     address public owner;
     address public superfluidHost;
     address public cfaV1;
@@ -103,10 +102,9 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         _;
     }
 
-    constructor(address gdToken_, address gdSuperToken_) {
+    constructor(address gdToken_) {
         if (gdToken_ == address(0)) revert ZeroAddress();
         gdToken = IERC20Like(gdToken_);
-        gdSuperToken = gdSuperToken_;
         _disableInitializers();
     }
 
@@ -286,7 +284,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         bytes calldata cbdata,
         address buyer
     ) private {
-        if (superToken != gdSuperToken) revert UnsupportedToken();
+        if (superToken != address(gdToken)) revert UnsupportedToken();
         if (agreementClass != cfaV1) revert UnsupportedAgreement();
 
         (address sender, address receiver) = abi.decode(agreementData, (address, address));
@@ -317,7 +315,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         view
         returns (bytes memory cbdata)
     {
-        if (superToken != gdSuperToken || agreementClass != cfaV1) {
+        if (superToken != address(gdToken) || agreementClass != cfaV1) {
             return abi.encode(uint256(0), int96(0));
         }
 

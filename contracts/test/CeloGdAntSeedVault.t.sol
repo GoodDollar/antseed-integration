@@ -224,7 +224,6 @@ contract Outsider {
 
 contract CeloGdAntSeedVaultTest {
     MockGdToken token;
-    MockGdToken superToken;
     MockCFA cfa;
     MockSuperfluidHost host;
     CeloGdAntSeedVault vault;
@@ -234,10 +233,9 @@ contract CeloGdAntSeedVaultTest {
 
     function setUp() public {
         token = new MockGdToken();
-        superToken = new MockGdToken();
         cfa = new MockCFA();
         host = new MockSuperfluidHost(cfa);
-        CeloGdAntSeedVault impl = new CeloGdAntSeedVault(address(token), address(superToken));
+        CeloGdAntSeedVault impl = new CeloGdAntSeedVault(address(token));
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
             abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(host), address(cfa)))
@@ -291,7 +289,7 @@ contract CeloGdAntSeedVaultTest {
         setUp();
         (bool ok,) = address(vault).call(abi.encodeWithSignature(
             "afterAgreementCreated(address,address,bytes32,bytes,bytes,bytes)",
-            address(superToken),
+            address(token),
             address(cfa),
             bytes32(0),
             abi.encode(address(user), address(vault)),
@@ -306,19 +304,19 @@ contract CeloGdAntSeedVaultTest {
         // ctx is treated as userData by MockSuperfluidHost.decodeCtx; pass abi.encode(buyer) so vault can decode it.
         bytes memory ctx = abi.encode(BUYER);
         int96 flowRate = 38580246913580; // ~100 G$ / 30 days at 18 decimals
-        bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), flowRate, ctx);
+        bytes memory returnedCtx = host.createFlow(vault, address(token), address(user), flowRate, ctx);
         require(keccak256(returnedCtx) == keccak256(ctx), "create ctx preserved");
         require(vault.streamFlowRate(address(user)) == flowRate, "flow recorded");
         require(vault.streamMonthlyGdAmount(address(user)) == uint256(uint96(flowRate)) * 30 days, "monthly amount recorded");
         require(vault.streamBuyer(address(user)) == BUYER, "buyer recorded");
 
         int96 updatedFlowRate = flowRate * 2;
-        returnedCtx = host.updateFlow(vault, address(superToken), address(user), updatedFlowRate, ctx);
+        returnedCtx = host.updateFlow(vault, address(token), address(user), updatedFlowRate, ctx);
         require(keccak256(returnedCtx) == keccak256(ctx), "update ctx preserved");
         require(vault.streamFlowRate(address(user)) == updatedFlowRate, "updated flow recorded");
         require(vault.streamBuyer(address(user)) == BUYER, "buyer preserved on update");
 
-        returnedCtx = host.terminateFlow(vault, address(superToken), address(user), ctx);
+        returnedCtx = host.terminateFlow(vault, address(token), address(user), ctx);
         require(keccak256(returnedCtx) == keccak256(ctx), "termination ctx preserved");
         require(vault.streamFlowRate(address(user)) == 0, "termination cleared flow");
         require(vault.streamMonthlyGdAmount(address(user)) == 0, "termination cleared monthly amount");
@@ -326,10 +324,11 @@ contract CeloGdAntSeedVaultTest {
 
     function testSuperAppRejectsWrongTokenAgreementReceiverAndNegativeFlow() public {
         setUp();
+        MockGdToken wrongToken = new MockGdToken();
         (bool ok,) = address(host).call(abi.encodeWithSignature(
             "createFlow(address,address,address,int96,bytes)",
             address(vault),
-            address(token),
+            address(wrongToken),
             address(user),
             int96(1),
             ""
@@ -341,7 +340,7 @@ contract CeloGdAntSeedVaultTest {
         (ok,) = address(host).call(abi.encodeWithSignature(
             "createFlow(address,address,address,int96,bytes)",
             address(vault),
-            address(superToken),
+            address(token),
             address(user),
             int96(1),
             ""
@@ -352,7 +351,7 @@ contract CeloGdAntSeedVaultTest {
         (ok,) = address(host).call(abi.encodeWithSignature(
             "createFlowWrongReceiver(address,address,address,address,int96)",
             address(vault),
-            address(superToken),
+            address(token),
             address(user),
             address(0xBEEF),
             int96(1)
@@ -362,7 +361,7 @@ contract CeloGdAntSeedVaultTest {
         (ok,) = address(host).call(abi.encodeWithSignature(
             "createFlow(address,address,address,int96,bytes)",
             address(vault),
-            address(superToken),
+            address(token),
             address(user),
             int96(-1),
             ""
@@ -375,7 +374,7 @@ contract CeloGdAntSeedVaultTest {
         (bool ok,) = address(host).call(abi.encodeWithSignature(
             "createFlow(address,address,address,int96,bytes)",
             address(vault),
-            address(superToken),
+            address(token),
             address(user),
             int96(1),
             ""
@@ -409,7 +408,7 @@ contract CeloGdAntSeedVaultTest {
         (bool ok,) = address(host).call(abi.encodeWithSignature(
             "createFlow(address,address,address,int96,bytes)",
             address(vault),
-            address(superToken),
+            address(token),
             address(user),
             lowFlow,
             ""
@@ -419,7 +418,7 @@ contract CeloGdAntSeedVaultTest {
         uint256 minFlowValue = (uint256(5 ether) + monthSeconds - 1) / monthSeconds;
         int96 minFlow = int96(int256(minFlowValue));
         bytes memory buyerCtx = abi.encode(BUYER);
-        bytes memory returnedCtx = host.createFlow(vault, address(superToken), address(user), minFlow, buyerCtx);
+        bytes memory returnedCtx = host.createFlow(vault, address(token), address(user), minFlow, buyerCtx);
         require(keccak256(returnedCtx) == keccak256(buyerCtx), "ctx passthrough");
         require(vault.streamFlowRate(address(user)) == minFlow, "stream at reserve-derived threshold succeeds");
     }
@@ -445,7 +444,7 @@ contract CeloGdAntSeedVaultTest {
 
     function testOnlyOwnerCanUpgrade() public {
         setUp();
-        CeloGdAntSeedVault newImpl = new CeloGdAntSeedVault(address(token), address(superToken));
+        CeloGdAntSeedVault newImpl = new CeloGdAntSeedVault(address(token));
         // owner (address(this)) can call upgradeToAndCall
         vault.upgradeToAndCall(address(newImpl), "");
 
@@ -536,7 +535,7 @@ contract CeloGdAntSeedVaultTest {
     function testTransferFailedRevertsDeposit() public {
         setUp();
         FailingToken failToken = new FailingToken();
-        CeloGdAntSeedVault failImpl = new CeloGdAntSeedVault(address(failToken), address(superToken));
+        CeloGdAntSeedVault failImpl = new CeloGdAntSeedVault(address(failToken));
         ERC1967Proxy failProxy = new ERC1967Proxy(
             address(failImpl),
             abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(host), address(cfa)))
@@ -632,19 +631,19 @@ contract CeloGdAntSeedVaultTest {
 
         (bool ok,) = address(vault).call(abi.encodeWithSignature(
             "beforeAgreementCreated(address,address,bytes32,bytes,bytes)",
-            address(superToken), address(cfa), bytes32(0), agreementData, bytes("")
+            address(token), address(cfa), bytes32(0), agreementData, bytes("")
         ));
         require(!ok, "beforeAgreementCreated non-host rejected");
 
         (ok,) = address(vault).call(abi.encodeWithSignature(
             "beforeAgreementUpdated(address,address,bytes32,bytes,bytes)",
-            address(superToken), address(cfa), bytes32(0), agreementData, bytes("")
+            address(token), address(cfa), bytes32(0), agreementData, bytes("")
         ));
         require(!ok, "beforeAgreementUpdated non-host rejected");
 
         (ok,) = address(vault).call(abi.encodeWithSignature(
             "beforeAgreementTerminated(address,address,bytes32,bytes,bytes)",
-            address(superToken), address(cfa), bytes32(0), agreementData, bytes("")
+            address(token), address(cfa), bytes32(0), agreementData, bytes("")
         ));
         require(!ok, "beforeAgreementTerminated non-host rejected");
     }
@@ -657,13 +656,13 @@ contract CeloGdAntSeedVaultTest {
 
         (bool ok,) = address(vault).call(abi.encodeWithSignature(
             "afterAgreementUpdated(address,address,bytes32,bytes,bytes,bytes)",
-            address(superToken), address(cfa), bytes32(0), agreementData, bytes(""), bytes("")
+            address(token), address(cfa), bytes32(0), agreementData, bytes(""), bytes("")
         ));
         require(!ok, "afterAgreementUpdated non-host rejected");
 
         (ok,) = address(vault).call(abi.encodeWithSignature(
             "afterAgreementTerminated(address,address,bytes32,bytes,bytes,bytes)",
-            address(superToken), address(cfa), bytes32(0), agreementData, bytes(""), bytes("")
+            address(token), address(cfa), bytes32(0), agreementData, bytes(""), bytes("")
         ));
         require(!ok, "afterAgreementTerminated non-host rejected");
     }
