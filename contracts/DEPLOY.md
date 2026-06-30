@@ -42,7 +42,6 @@ OWNER_ADDRESS=0x<multisig-or-owner-address>
 
 # ── Celo (CeloGdAntSeedVault) ────────────────────────────────────────────────
 GD_TOKEN=0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c14       # G$ ERC-20 on Celo mainnet
-GD_SUPER_TOKEN=0x<gd-supertoken-celo>                      # G$ Superfluid SuperToken
 SUPERFLUID_HOST=0x<superfluid-host-celo>                   # Superfluid Host on Celo
 CFA_V1=0x<cfa-v1-celo>                                     # ConstantFlowAgreementV1 on Celo
 
@@ -54,8 +53,7 @@ CELO_RPC_URL=https://forno.celo.org
 BASE_RPC_URL=https://mainnet.base.org
 
 # ── Block explorer API keys (optional, for --verify) ─────────────────────────
-CELOSCAN_API_KEY=<your-celoscan-api-key>
-BASESCAN_API_KEY=<your-basescan-api-key>
+ETHERSCAN_API_KEY=<your-celoscan-api-key>
 ```
 
 Load the variables into your shell:
@@ -71,26 +69,21 @@ set -a && source .env && set +a
 ## 3. Deploy `CeloGdAntSeedVault` on Celo
 
 ```bash
-forge script contracts/script/Deploy.s.sol:Deploy \
+forge script contracts/script/Deploy.s.sol:DeployCelo \
   --rpc-url "$CELO_RPC_URL" \
   --broadcast \
   --verify \
-  --etherscan-api-key "$CELOSCAN_API_KEY" \
   -vvvv
 ```
 
-On success, Foundry writes proxy and implementation addresses to `deploy-output.json`:
+On success, Foundry writes addresses to `contracts/deploy-celo-output.json`:
 
 ```json
 {
   "vaultImplementation": "0x…",
-  "vaultProxy": "0x…",
-  "operatorImplementation": "0x…",
-  "operatorProxy": "0x…"
+  "vaultProxy": "0x…"
 }
 ```
-
-> **Note:** The deploy script deploys **both** contracts. Because `CeloGdAntSeedVault` is a Celo contract and `AntseedBuyerOperator` is a Base contract, the script currently targets one chain at a time. Deploy each separately if your RPC endpoints differ (see step 4).
 
 Record the `vaultProxy` address — you will need it in the Worker configuration.
 
@@ -98,15 +91,21 @@ Record the `vaultProxy` address — you will need it in the Worker configuration
 
 ## 4. Deploy `AntseedBuyerOperator` on Base
 
-If you need to deploy only the Base operator (e.g., the vault is already live on Celo), run:
-
 ```bash
-forge script contracts/script/Deploy.s.sol:Deploy \
+forge script contracts/script/Deploy.s.sol:DeployBase \
   --rpc-url "$BASE_RPC_URL" \
   --broadcast \
   --verify \
-  --etherscan-api-key "$BASESCAN_API_KEY" \
   -vvvv
+```
+
+On success, Foundry writes addresses to `contracts/deploy-base-output.json`:
+
+```json
+{
+  "operatorImplementation": "0x…",
+  "operatorProxy": "0x…"
+}
 ```
 
 Record the `operatorProxy` address.
@@ -136,7 +135,7 @@ cast send <operatorProxy> "setAdmin(address)" <admin-address> \
 
 ### 5.3 Update the backend Worker config
 
-Edit `backend/wrangler.toml` and set `CELO_VAULT_ADDRESS` to the `vaultProxy` address from `deploy-output.json`. Then set the Base operator secrets (see `backend/DEPLOY.md`, step 3):
+Edit `backend/wrangler.toml` and set `CELO_VAULT_ADDRESS` to the `vaultProxy` address from `deploy-celo-output.json`. Then set the Base operator secrets (see `backend/DEPLOY.md`, step 3):
 
 ```bash
 cd backend
@@ -180,7 +179,7 @@ Both contracts use UUPS proxies. To upgrade:
 forge create contracts/src/CeloGdAntSeedVault.sol:CeloGdAntSeedVault \
   --rpc-url "$CELO_RPC_URL" \
   --private-key "$DEPLOYER_PRIVATE_KEY" \
-  --constructor-args <gdToken> <gdSuperToken>
+  --constructor-args <gdToken>
 ```
 
 3. Call `upgradeToAndCall` from the owner:

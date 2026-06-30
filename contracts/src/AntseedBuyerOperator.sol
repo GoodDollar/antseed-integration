@@ -62,7 +62,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     error ExpiredSignature();
 
     modifier onlyOwner() {
-        if (msg.sender != owner || msg.sender != admin) revert NotOwner();
+        if (msg.sender != owner && msg.sender != admin) revert NotOwner();
         _;
     }
 
@@ -109,7 +109,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         ));
     }
 
-    function _authorizeUpgrade(address) internal override onlyOwner {}
+    function _authorizeUpgrade(address) internal override onlyAdmin {}
 
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert InvalidAddress();

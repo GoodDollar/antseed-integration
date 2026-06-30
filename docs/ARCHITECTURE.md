@@ -28,7 +28,7 @@ A Celo-side G$ vault for credit issuance without a bridge. It supports:
 - ERC777 `tokensReceived` single-transaction deposits
 - classic ERC-20 `deposit` fallback
 - GoodID check (backend only): the backend calls `getWhitelistedRoot(account)` on `CELO_GOODID_ADDRESS`; a non-zero root enables bonus credits and root-account aggregation; GoodID is **not** enforced at the contract level
-- minimum USD thresholds enforced on-chain: `minFirstDepositMicroUsd` (first deposit) and `minMonthlyStreamMicroUsd` (stream rate); converted using `reservePriceOracle.currentPrice(bytes32)` or a configurable `fallbackGdMicroUsdPerToken`
+- minimum USD thresholds enforced on-chain: `minFirstDepositUsd` (first deposit) and `minMonthlyStreamUsd` (stream rate); converted using `reservePriceOracle.currentPrice(bytes32)` or a configurable `fallbackGdUsdPerToken`
 - Superfluid SuperApp `afterAgreementCreated`, `afterAgreementUpdated`, and `afterAgreementTerminated` callbacks
 - stream state events for Worker-side bonus accounting
 
@@ -62,14 +62,14 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - returns the user's `UserCreditProfile` and list of `GdCreditEntry` records
 
 **Outstanding funding** (`GET /v1/accounts/:account/outstanding`):
-- returns `totalOutstandingFundingMicroUsd` and all `GdCreditEntry` records with `fundingStatus = "pending"` or `"failed"`
+- returns `totalOutstandingFundingUsd` and all `GdCreditEntry` records with `fundingStatus = "pending"` or `"failed"`
 
 **Channel close** (`POST /v1/channels/close`):
 - calls `AntseedBuyerOperator.requestClose(channelId)`
 
 **Funding path** (`fundCredit`):
 - calls `AntSeedFundingVaultClient.depositForBuyerWithId(buyer, principal, bonus, id)` — uses the `buyer` from the credit entry, or falls back to `account`
-- on success: marks entry `funded`, decrements `totalOutstandingFundingMicroUsd`
+- on success: marks entry `funded`, decrements `totalOutstandingFundingUsd`
 - on failure: marks entry `failed`, preserves `fundingError`
 
 ### AntSeed payment boundary
@@ -80,13 +80,13 @@ Future payment mechanisms (sponsorships, org budgets, subscriptions, multi-buyer
 
 ## Accounting model
 
-- G$ amounts are converted to micro-USD principal using the on-chain reserve oracle price (`currentPrice(bytes32)`) or the fallback `GD_MICRO_USD_PER_TOKEN`
+- G$ amounts are converted to micro-USD principal using the on-chain reserve oracle price (`currentPrice(bytes32)`) or the fallback `GD_USD_PER_TOKEN`
 - regular bonus = `principal * 10%` (deposit and non-stream sources)
 - streaming bonus = `principal * 20%` (sources: `streamUpdate`, `streamRequest`, `streamCron`)
 - unverified accounts (no GoodID root): bonus = 0
-- monthly bonus cap: the effective bonus is capped to `MAX_BONUS_CAP_MICRO_USD - monthlyBonusUsed` for the root account; cap is tracked in `monthly-bonus:<rootAccount>:YYYY-MM`
-- total credit = `principalMicroUsd + effectiveBonusMicroUsd`
-- `totalOutstandingFundingMicroUsd` tracks credit not yet successfully funded to `AntseedBuyerOperator`; decremented when `fundingStatus` transitions to `"funded"`
+- monthly bonus cap: the effective bonus is capped to `MAX_BONUS_CAP_USD - monthlyBonusUsed` for the root account; cap is tracked in `monthly-bonus:<rootAccount>:YYYY-MM`
+- total credit = `principalUsd + effectiveBonusUsd`
+- `totalOutstandingFundingUsd` tracks credit not yet successfully funded to `AntseedBuyerOperator`; decremented when `fundingStatus` transitions to `"funded"`
 
 ## Non-goals
 
@@ -100,9 +100,9 @@ Future payment mechanisms (sponsorships, org budgets, subscriptions, multi-buyer
 
 The Worker binds `ANTSEED_KV` and persists:
 
-- `user:<account>` — `UserCreditProfile` aggregate, written for both the depositor wallet and the GoodID root wallet when they differ; tracks `totalGdDepositedWei`, `totalPrincipalMicroUsd`, `totalBonusMicroUsd`, `totalGDStreamedWei`, `totalOutstandingFundingMicroUsd`, `streamFlowRateWeiPerSecond`, `lastStreamCreditAt`
+- `user:<account>` — `UserCreditProfile` aggregate, written for both the depositor wallet and the GoodID root wallet when they differ; tracks `totalGdDepositedWei`, `totalPrincipalUsd`, `totalBonusUsd`, `totalGDStreamedWei`, `totalOutstandingFundingUsd`, `streamFlowRateWeiPerSecond`, `lastStreamCreditAt`
 - `user-gd-credits:<account>` — bounded list (last 500) of `gd-credit` entry IDs for the account
 - `gd-credit:<id>` — individual `GdCreditEntry`: source, amounts, `fundingStatus` (`pending` → `funded` or `failed`), `fundingTxHash`, `fundingError`, `buyerAddress`
-- `monthly-bonus:<rootAccount>:YYYY-MM` — cumulative bonus issued to the root account in that calendar month; used to enforce `MAX_BONUS_CAP_MICRO_USD`
+- `monthly-bonus:<rootAccount>:YYYY-MM` — cumulative bonus issued to the root account in that calendar month; used to enforce `MAX_BONUS_CAP_USD`
 
 KV is used for long-term user data. High-concurrency balance enforcement for the AntSeed buyer deposit is handled on-chain by `AntseedBuyerOperator`; KV is eventually consistent.

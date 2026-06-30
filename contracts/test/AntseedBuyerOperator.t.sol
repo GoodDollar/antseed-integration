@@ -512,18 +512,255 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "double init rejected");
     }
 
-    function testOnlyOwnerCanUpgrade() public {
+    function testOnlyAdminCanUpgrade() public {
         setUp();
         AntseedBuyerOperator newImpl = new AntseedBuyerOperator(address(registry));
-        // owner (address(this)) can call upgradeToAndCall
+
+        // admin (equals owner at init) can upgrade
         operator.upgradeToAndCall(address(newImpl), "");
 
-        // non-owner cannot
+        // outsider cannot upgrade
         OperatorUpgradeHelper outsider = new OperatorUpgradeHelper();
         (bool ok,) = address(outsider).call(
             abi.encodeWithSignature("upgrade(address,address)", address(operator), address(newImpl))
         );
-        require(!ok, "non-owner upgrade rejected");
+        require(!ok, "outsider upgrade rejected");
+
+        // transfer admin away; address(this) remains owner but loses admin role
+        AdminActor newAdminActor = new AdminActor(operator);
+        operator.transferAdmin(address(newAdminActor));
+
+        // owner-without-admin is now blocked by onlyAdmin
+        (ok,) = address(operator).call(
+            abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), bytes(""))
+        );
+        require(!ok, "owner-without-admin upgrade rejected");
+    }
+
+    // ─── transferOwnership ───
+
+    function testTransferOwnershipWorks() public {
+        setUp();
+        address newOwner = address(0xA11CE);
+        operator.transferOwnership(newOwner);
+        require(operator.owner() == newOwner, "owner updated");
+    }
+
+    function testTransferOwnershipRejectsZeroAddress() public {
+        setUp();
+        (bool ok,) = address(operator).call(
+            abi.encodeWithSignature("transferOwnership(address)", address(0))
+        );
+        require(!ok, "zero-address transferOwnership rejected");
+    }
+
+    function testTransferOwnershipRejectedByOutsider() public {
+        setUp();
+        AdminActor outsider = new AdminActor(operator);
+        // outsider is neither owner nor admin
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("callTransferOwnership(address)", address(outsider))
+        );
+        require(!ok, "outsider cannot transferOwnership");
+    }
+
+    // ─── transferAdmin ───
+
+    function testTransferAdminWorks() public {
+        setUp();
+        AdminActor newAdminActor = new AdminActor(operator);
+        operator.transferAdmin(address(newAdminActor));
+        require(operator.admin() == address(newAdminActor), "admin updated");
+        // new admin can exercise onlyAdmin — sweep a token
+        usdc.mint(address(operator), 1_000_000);
+        newAdminActor.callSweepToken(address(usdc), recipient, 1_000_000);
+        require(usdc.balanceOf(recipient) == 1_000_000, "new admin swept token");
+    }
+
+    function testTransferAdminRejectsZeroAddress() public {
+        setUp();
+        (bool ok,) = address(operator).call(
+            abi.encodeWithSignature("transferAdmin(address)", address(0))
+        );
+        require(!ok, "zero-address transferAdmin rejected");
+    }
+
+    function testTransferAdminOnlyCallableByAdmin() public {
+        setUp();
+        AdminActor outsider = new AdminActor(operator);
+        // outsider (neither owner nor admin) cannot call transferAdmin
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("callTransferAdmin(address)", address(outsider))
+        );
+        require(!ok, "outsider cannot transferAdmin");
+    }
+
+    function testOwnerAfterAdminTransferCannotCallOnlyAdmin() public {
+        setUp();
+        // Transfer admin away; address(this) remains owner but is no longer admin.
+        AdminActor newAdminActor = new AdminActor(operator);
+        operator.transferAdmin(address(newAdminActor));
+
+        usdc.mint(address(operator), 1_000_000);
+
+        // address(this) can no longer call onlyAdmin functions
+        (bool ok,) = address(operator).call(
+            abi.encodeWithSignature(
+                "sweepToken(address,address,uint256)",
+                address(usdc), recipient, uint256(1_000_000)
+            )
+        );
+        require(!ok, "owner-without-admin cannot sweepToken");
+
+        (ok,) = address(operator).call(
+            abi.encodeWithSignature("transferAdmin(address)", address(this))
+        );
+        require(!ok, "owner-without-admin cannot transferAdmin");
+    }
+
+    // ─── onlyOwner: admin can also call ───
+
+    function testAdminCanCallOnlyOwnerFunctions() public {
+        setUp();
+        AdminActor adminActor = new AdminActor(operator);
+        operator.transferAdmin(address(adminActor));
+        usdc.mint(address(operator), 100_000_000);
+
+        // acceptBuyerOperator via admin
+        adminActor.callAcceptBuyerOperator(buyer, 1);
+        // depositFor via admin
+        adminActor.callDepositFor(buyer, 500_000, 100_000);
+        require(deposits.available(buyer) == 600_000, "admin funded buyer");
+        require(operator.totalPrincipalDeposited(buyer) == 500_000, "principal tracked via admin");
+        require(operator.totalBonusDeposited(buyer) == 100_000, "bonus tracked via admin");
+    }
+
+    function testAdminCanUpgrade() public {
+        setUp();
+        AntseedBuyerOperator newImpl = new AntseedBuyerOperator(address(registry));
+        AdminActor adminActor = new AdminActor(operator);
+        operator.transferAdmin(address(adminActor));
+        // admin (not owner) should be able to trigger upgradeToAndCall
+        adminActor.callUpgrade(address(operator), address(newImpl));
+        require(operator.admin() == address(adminActor), "admin preserved after admin-initiated upgrade");
+    }
+
+    // ─── onlyOwner: outsider rejected ───
+
+    function testOnlyOwnerFunctionsRejectOutsider() public {
+        setUp();
+        AdminActor outsider = new AdminActor(operator);
+
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("callAcceptBuyerOperator(address,uint256)", buyer, uint256(1))
+        );
+        require(!ok, "outsider cannot acceptBuyerOperator");
+
+        (ok,) = address(outsider).call(
+            abi.encodeWithSignature("callDepositFor(address,uint256,uint256)", buyer, uint256(1), uint256(0))
+        );
+        require(!ok, "outsider cannot depositFor");
+
+        (ok,) = address(outsider).call(
+            abi.encodeWithSignature("callApproveCurrentDeposits()")
+        );
+        require(!ok, "outsider cannot approveCurrentDeposits");
+
+        (ok,) = address(outsider).call(
+            abi.encodeWithSignature("callTransferBuyerOperator(address,address)", buyer, address(outsider))
+        );
+        require(!ok, "outsider cannot transferBuyerOperator");
+    }
+
+    // ─── sweepToken ───
+
+    function testSweepTokenWorks() public {
+        setUp();
+        usdc.mint(address(operator), 5_000_000);
+        operator.sweepToken(address(usdc), recipient, 5_000_000);
+        require(usdc.balanceOf(recipient) == 5_000_000, "token swept to recipient");
+    }
+
+    function testSweepTokenRejectsInvalidArgs() public {
+        setUp();
+        usdc.mint(address(operator), 1_000_000);
+
+        (bool ok,) = address(operator).call(
+            abi.encodeWithSignature("sweepToken(address,address,uint256)", address(0), recipient, uint256(1))
+        );
+        require(!ok, "zero token address rejected");
+
+        (ok,) = address(operator).call(
+            abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), address(0), uint256(1))
+        );
+        require(!ok, "zero recipient rejected");
+
+        (ok,) = address(operator).call(
+            abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), recipient, uint256(0))
+        );
+        require(!ok, "zero amount rejected");
+    }
+
+    // ─── approveCurrentDeposits ───
+
+    function testApproveCurrentDepositsOnlyOwner() public {
+        setUp();
+        // owner can call
+        operator.approveCurrentDeposits();
+
+        // outsider cannot
+        AdminActor outsider = new AdminActor(operator);
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("callApproveCurrentDeposits()")
+        );
+        require(!ok, "outsider cannot approveCurrentDeposits");
+    }
+
+    // ─── transferBuyerOperator ───
+
+    function testTransferBuyerOperatorWorks() public {
+        setUp();
+        operator.acceptBuyerOperator(buyer, 1, "");
+        address newOp = address(0xC0DE);
+        operator.transferBuyerOperator(buyer, newOp);
+        require(deposits.getOperator(buyer) == newOp, "operator transferred");
+    }
+
+    function testTransferBuyerOperatorOnlyOwner() public {
+        setUp();
+        operator.acceptBuyerOperator(buyer, 1, "");
+        AdminActor outsider = new AdminActor(operator);
+        (bool ok,) = address(outsider).call(
+            abi.encodeWithSignature("callTransferBuyerOperator(address,address)", buyer, address(outsider))
+        );
+        require(!ok, "outsider cannot transferBuyerOperator");
+    }
+}
+
+/// @dev Helper that forwards calls as a separate msg.sender so tests can simulate
+///      an admin or outsider address distinct from address(this).
+contract AdminActor {
+    AntseedBuyerOperator public operator;
+
+    constructor(AntseedBuyerOperator op) { operator = op; }
+
+    function callTransferOwnership(address to) external { operator.transferOwnership(to); }
+    function callTransferAdmin(address to) external { operator.transferAdmin(to); }
+    function callAcceptBuyerOperator(address buyer_, uint256 nonce) external {
+        operator.acceptBuyerOperator(buyer_, nonce, "");
+    }
+    function callDepositFor(address buyer_, uint256 principal, uint256 bonus) external {
+        operator.depositFor(buyer_, principal, bonus);
+    }
+    function callSweepToken(address token_, address recipient_, uint256 amount) external {
+        operator.sweepToken(token_, recipient_, amount);
+    }
+    function callApproveCurrentDeposits() external { operator.approveCurrentDeposits(); }
+    function callTransferBuyerOperator(address buyer_, address newOp) external {
+        operator.transferBuyerOperator(buyer_, newOp);
+    }
+    function callUpgrade(address proxy, address newImpl) external {
+        AntseedBuyerOperator(proxy).upgradeToAndCall(newImpl, "");
     }
 }
 

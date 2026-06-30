@@ -151,15 +151,28 @@ contract MockSuperfluidHost {
     }
 }
 
-contract MockReservePriceOracle {
-    uint256 public priceDai;
+contract MockStaticOracle {
+    uint256 public quoteResult;
 
-    function setCurrentPriceDAI(uint256 value) external {
-        priceDai = value;
+    function setQuoteResult(uint256 value) external {
+        quoteResult = value;
     }
 
-    function currentPriceDAI() external view returns (uint256) {
-        return priceDai;
+    function quoteAllAvailablePoolsWithTimePeriod(
+        uint128 baseAmount,
+        address,
+        address,
+        uint32
+    ) external view returns (uint256 quoteAmount, address[] memory queriedPools) {
+        return (quoteResult * baseAmount / 1e18, new address[](0));
+    }
+}
+
+contract MockRevertingOracle {
+    function quoteAllAvailablePoolsWithTimePeriod(uint128, address, address, uint32)
+        external pure returns (uint256, address[] memory)
+    {
+        revert("oracle failure");
     }
 }
 
@@ -217,7 +230,7 @@ contract Outsider {
 
     function transferOwnership(address to) external { vault.transferOwnership(to); }
     function setSuperfluidConfig(address h, address c) external { vault.setSuperfluidConfig(h, c); }
-    function setReserveConfig(address o, uint256 f) external { vault.setReserveConfig(o, f); }
+    function setStaticOracleConfig(address o, address c, uint256 f) external { vault.setStaticOracleConfig(o, c, f); }
     function setMinimumUsdThresholds(uint256 a, uint256 b) external { vault.setMinimumUsdThresholds(a, b); }
     function registerSuperApp(uint256 w) external { vault.registerSuperApp(w); }
 }
@@ -241,6 +254,8 @@ contract CeloGdAntSeedVaultTest {
             abi.encodeCall(CeloGdAntSeedVault.initialize, (address(this), address(host), address(cfa)))
         );
         vault = CeloGdAntSeedVault(address(proxy));
+        // Set fallback to 1e18 so 1 G$ wei = 1 USD wei; makes minimum math trivial in basic tests.
+        vault.setStaticOracleConfig(address(0), address(0), 1e18);
         user = new UserProxy(token, vault, BUYER);
         token.mint(address(user), 1_000 ether);
     }
@@ -382,25 +397,25 @@ contract CeloGdAntSeedVaultTest {
         require(!ok, "monthly stream below minimum rejected");
     }
 
-    function testUsesReserveCurrentPriceForFirstDepositThreshold() public {
+    function testUsesStaticOracleForFirstDepositThreshold() public {
         setUp();
-        MockReservePriceOracle reserve = new MockReservePriceOracle();
-        reserve.setCurrentPriceDAI(5e17); // 0.5 DAI per G$
-        vault.setReserveConfig(address(reserve), 0);
+        MockStaticOracle oracle = new MockStaticOracle();
+        oracle.setQuoteResult(5e17); // 0.5 cUSD per G$
+        vault.setStaticOracleConfig(address(oracle), address(0xCCCC), 0);
 
         user.approveVault(2 ether);
         (bool ok,) = address(user).call(abi.encodeWithSignature("deposit(uint256)", 1.5 ether));
         require(!ok, "first deposit below $1 reserve equivalent rejected");
 
         user.deposit(2 ether);
-        require(vault.totalDepositedGd(address(user)) == 2 ether, "deposit at reserve-derived threshold succeeds");
+        require(vault.totalDepositedGd(address(user)) == 2 ether, "deposit at oracle-derived threshold succeeds");
     }
 
-    function testUsesReserveCurrentPriceForStreamMinimum() public {
+    function testUsesStaticOracleForStreamMinimum() public {
         setUp();
-        MockReservePriceOracle reserve = new MockReservePriceOracle();
-        reserve.setCurrentPriceDAI(2e17); // 0.2 DAI per G$
-        vault.setReserveConfig(address(reserve), 0);
+        MockStaticOracle oracle = new MockStaticOracle();
+        oracle.setQuoteResult(2e17); // 0.2 cUSD per G$
+        vault.setStaticOracleConfig(address(oracle), address(0xCCCC), 0);
         uint256 monthSeconds = uint256(30 days);
 
         uint256 lowFlowValue = uint256(4 ether) / monthSeconds;
@@ -423,11 +438,11 @@ contract CeloGdAntSeedVaultTest {
         require(vault.streamFlowRate(address(user)) == minFlow, "stream at reserve-derived threshold succeeds");
     }
 
-    function testAcceptsHighReservePriceWithoutReasonableBoundsFallback() public {
+    function testAcceptsHighStaticOraclePriceWithoutReasonableBoundsFallback() public {
         setUp();
-        MockReservePriceOracle reserve = new MockReservePriceOracle();
-        reserve.setCurrentPriceDAI(2e21); // 2000 DAI per G$ -> above the old max-reasonable bound path
-        vault.setReserveConfig(address(reserve), 0);
+        MockStaticOracle oracle = new MockStaticOracle();
+        oracle.setQuoteResult(2e21); // 2000 cUSD per G$ -> above the old max-reasonable bound path
+        vault.setStaticOracleConfig(address(oracle), address(0xCCCC), 0);
 
         user.approveVault(1 ether);
         user.deposit(0.001 ether);
@@ -550,10 +565,10 @@ contract CeloGdAntSeedVaultTest {
 
     // --- InvalidPriceConfig ---
 
-    function testSetReserveConfigRejectsInvalidPriceConfig() public {
+    function testSetStaticOracleConfigRejectsInvalidPriceConfig() public {
         setUp();
         (bool ok,) = address(vault).call(
-            abi.encodeWithSignature("setReserveConfig(address,uint256)", address(0), uint256(0))
+            abi.encodeWithSignature("setStaticOracleConfig(address,address,uint256)", address(0), address(0), uint256(0))
         );
         require(!ok, "invalid price config rejected");
     }
@@ -575,9 +590,9 @@ contract CeloGdAntSeedVaultTest {
         require(!ok, "non-owner setSuperfluidConfig rejected");
 
         (ok,) = address(outsider).call(
-            abi.encodeWithSignature("setReserveConfig(address,uint256)", address(0xAB), uint256(0))
+            abi.encodeWithSignature("setStaticOracleConfig(address,address,uint256)", address(0xAB), address(0xAB), uint256(0))
         );
-        require(!ok, "non-owner setReserveConfig rejected");
+        require(!ok, "non-owner setStaticOracleConfig rejected");
 
         (ok,) = address(outsider).call(
             abi.encodeWithSignature("setMinimumUsdThresholds(uint256,uint256)", uint256(1), uint256(1))
@@ -672,8 +687,48 @@ contract CeloGdAntSeedVaultTest {
     function testSetMinimumUsdThresholds() public {
         setUp();
         vault.setMinimumUsdThresholds(2_000_000, 3_000_000);
-        require(vault.minFirstDepositMicroUsd() == 2_000_000, "min deposit threshold updated");
-        require(vault.minMonthlyStreamMicroUsd() == 3_000_000, "min stream threshold updated");
+        require(vault.minFirstDepositUsd() == 2_000_000, "min deposit threshold updated");
+        require(vault.minMonthlyStreamUsd() == 3_000_000, "min stream threshold updated");
+    }
+
+    // --- gdUsdPerToken ---
+
+    function testGdUsdPerTokenReturnsFallbackWhenOracleNotSet() public {
+        setUp();
+        // No oracle configured; should return the fallback set at init.
+        require(vault.gdUsdPerToken(1e18) == vault.fallbackGdUsdPerToken(), "returns fallback when no oracle");
+    }
+
+    function testGdUsdPerTokenReturnsOraclePrice() public {
+        setUp();
+        MockStaticOracle oracle = new MockStaticOracle();
+        oracle.setQuoteResult(5e17); // 0.5 cUSD per G$
+        vault.setStaticOracleConfig(address(oracle), address(0xCCCC), 0);
+        require(vault.gdUsdPerToken(1e18) == 5e17, "returns oracle quote directly");
+    }
+
+    function testGdUsdPerTokenFallsBackWhenOracleReturnsZero() public {
+        setUp();
+        MockStaticOracle oracle = new MockStaticOracle();
+        oracle.setQuoteResult(0); // oracle returns 0
+        vault.setStaticOracleConfig(address(oracle), address(0xCCCC), 1_000_000);
+        require(vault.gdUsdPerToken(1e18) == uint256(1e18) * 1e18 / vault.fallbackGdUsdPerToken(), "falls back when oracle returns zero");
+    }
+
+    function testGdUsdPerTokenFallsBackWhenOracleReverts() public {
+        setUp();
+        MockRevertingOracle badOracle = new MockRevertingOracle();
+        vault.setStaticOracleConfig(address(badOracle), address(0xCCCC), 999_999);
+        require(vault.gdUsdPerToken(1e18) == uint256(1e18) * 1e18 / vault.fallbackGdUsdPerToken(), "falls back when oracle reverts");
+    }
+
+    function testGdUsdPerTokenFallsBackWhenCusdIsZero() public {
+        setUp();
+        MockStaticOracle oracle = new MockStaticOracle();
+        oracle.setQuoteResult(5e17);
+        // staticOracleCusd is zero (not configured) — oracle path must be skipped
+        vault.setStaticOracleConfig(address(0), address(0), 777_777);
+        require(vault.gdUsdPerToken(1e18) == uint256(1e18) * 1e18 / vault.fallbackGdUsdPerToken(), "falls back when cusd not set");
     }
 }
 

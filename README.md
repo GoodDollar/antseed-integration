@@ -36,7 +36,7 @@ See [`docs/PAYMENT_FLOW.md`](docs/PAYMENT_FLOW.md) for the current payment-layer
 2. A GoodID-verified user can also stream G$ to the vault through Superfluid; the vault reacts to SuperApp stream callbacks and emits stream-cap events.
 3. The Worker verifies Celo vault logs, resolves the GoodID root with `getWhitelistedRoot(account)`, persists wallet-level and root-level user data in KV, and issues USDC-denominated AntSeed credits.
 4. Standard deposits receive +10% credits. Streaming users receive +20% on principal up to their monthly stream speed; amounts above that cap receive the regular +10%.
-5. The Worker bridges each credited user amount to Base by calling `AntseedBuyerOperator.depositFor(user, amountMicroUsd)`.
+5. The Worker bridges each credited user amount to Base by calling `AntseedBuyerOperator.depositFor(user, amountUsd)`.
 6. On Base, `AntseedBuyerOperator` is the configured deposits operator and can manage channel timeout actions for the buyer when needed.
 
 ## Quick start

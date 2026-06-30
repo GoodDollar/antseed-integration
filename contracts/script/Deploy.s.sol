@@ -6,81 +6,95 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {CeloGdAntSeedVault} from "../src/CeloGdAntSeedVault.sol";
 import {AntseedBuyerOperator} from "../src/AntseedBuyerOperator.sol";
 
-contract Deploy is Script {
-    struct Config {
-        address owner;
-        address gdToken;
-        address superfluidHost;
-        address cfaV1;
-        address antseedRegistry;
-    }
-
+/// @notice Deploy CeloGdAntSeedVault on Celo.
+/// forge script script/Deploy.s.sol:DeployCelo --rpc-url $CELO_RPC_URL --broadcast --verify --etherscan-api-key $CELOSCAN_API_KEY -vvvv
+contract DeployCelo is Script {
     function run() external {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
-        Config memory config = _loadConfig();
+        address deployer = vm.addr(deployerKey);
+        address owner = vm.envAddress("OWNER_ADDRESS");
+        address gdToken = vm.envAddress("GD_TOKEN");
+        address superfluidHost = vm.envAddress("SUPERFLUID_HOST");
+        address cfaV1 = vm.envAddress("CFA_V1");
 
-        vm.startBroadcast(deployerKey);
-
-        (CeloGdAntSeedVault vaultImpl, ERC1967Proxy vaultProxy) = _deployVault(config);
-        (AntseedBuyerOperator opImpl, ERC1967Proxy opProxy) = _deployOperator(config);
-
-        vm.stopBroadcast();
-
-        _writeDeploymentJson(vaultImpl, vaultProxy, opImpl, opProxy);
-    }
-
-    function _loadConfig() private view returns (Config memory config) {
-        config.owner = vm.envAddress("OWNER_ADDRESS");
-        config.gdToken = vm.envAddress("GD_TOKEN");
-        config.superfluidHost = vm.envAddress("SUPERFLUID_HOST");
-        config.cfaV1 = vm.envAddress("CFA_V1");
-        config.antseedRegistry = vm.envAddress("ANTSEED_REGISTRY");
-    }
-
-    function _deployVault(Config memory config)
-        private
-        returns (CeloGdAntSeedVault vaultImpl, ERC1967Proxy vaultProxy)
-    {
+        // Pre-compute CREATE2 addresses so we can skip already-deployed contracts.
         bytes memory vaultImplInitCode = abi.encodePacked(
             type(CeloGdAntSeedVault).creationCode,
-            abi.encode(config.gdToken)
+            abi.encode(gdToken)
         );
         bytes32 vaultImplSalt = keccak256(vaultImplInitCode);
-        vaultImpl = new CeloGdAntSeedVault{salt: vaultImplSalt}(config.gdToken);
+        address vaultImplAddr = vm.computeCreate2Address(vaultImplSalt, keccak256(vaultImplInitCode), deployer);
 
         bytes memory vaultInitData = abi.encodeCall(
             CeloGdAntSeedVault.initialize,
-            (config.owner, config.superfluidHost, config.cfaV1)
+            (owner, superfluidHost, cfaV1)
         );
-        vaultProxy = new ERC1967Proxy{salt: keccak256("CELOGD_VAULT")}(address(vaultImpl), vaultInitData);
-    }
-
-    function _deployOperator(Config memory config)
-        private
-        returns (AntseedBuyerOperator opImpl, ERC1967Proxy opProxy)
-    {
-        bytes memory opImplInitCode = abi.encodePacked(
-            type(AntseedBuyerOperator).creationCode,
-            abi.encode(config.antseedRegistry)
+        bytes32 vaultProxySalt = keccak256("CELOGD_VAULT_PROD");
+        bytes memory vaultProxyInitCode = abi.encodePacked(
+            type(ERC1967Proxy).creationCode,
+            abi.encode(vaultImplAddr, vaultInitData)
         );
-        bytes32 opImplSalt = keccak256(opImplInitCode);
-        opImpl = new AntseedBuyerOperator{salt: opImplSalt}(config.antseedRegistry);
+        address vaultProxyAddr = vm.computeCreate2Address(vaultProxySalt, keccak256(vaultProxyInitCode), deployer);
 
-        bytes memory opInitData = abi.encodeCall(AntseedBuyerOperator.initialize, (config.owner));
-        opProxy = new ERC1967Proxy{salt: keccak256("ANTSEED_VAULT")}(address(opImpl), opInitData);
-    }
+        vm.startBroadcast(deployerKey);
 
-    function _writeDeploymentJson(
-        CeloGdAntSeedVault vaultImpl,
-        ERC1967Proxy vaultProxy,
-        AntseedBuyerOperator opImpl,
-        ERC1967Proxy opProxy
-    ) private {
+        CeloGdAntSeedVault vaultImpl = vaultImplAddr.code.length == 0
+            ? new CeloGdAntSeedVault{salt: vaultImplSalt}(gdToken)
+            : CeloGdAntSeedVault(vaultImplAddr);
+
+        ERC1967Proxy vaultProxy = vaultProxyAddr.code.length == 0
+            ? new ERC1967Proxy{salt: vaultProxySalt}(address(vaultImpl), vaultInitData)
+            : ERC1967Proxy(payable(vaultProxyAddr));
+
+        vm.stopBroadcast();
+
         string memory json = "deploy";
         vm.serializeAddress(json, "vaultImplementation", address(vaultImpl));
-        vm.serializeAddress(json, "vaultProxy", address(vaultProxy));
+        string memory finalJson = vm.serializeAddress(json, "vaultProxy", address(vaultProxy));
+        vm.writeJson(finalJson, "./deploy-celo-output.json");
+    }
+}
+
+/// @notice Deploy AntseedBuyerOperator on Base.
+/// forge script script/Deploy.s.sol:DeployBase --rpc-url $BASE_RPC_URL --broadcast --verify --etherscan-api-key $BASESCAN_API_KEY -vvvv
+contract DeployBase is Script {
+    function run() external {
+        uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
+        address deployer = vm.addr(deployerKey);
+        address owner = vm.envAddress("OWNER_ADDRESS");
+        address antseedRegistry = vm.envAddress("ANTSEED_REGISTRY");
+
+        // Pre-compute CREATE2 addresses so we can skip already-deployed contracts.
+        bytes memory opImplInitCode = abi.encodePacked(
+            type(AntseedBuyerOperator).creationCode,
+            abi.encode(antseedRegistry)
+        );
+        bytes32 opImplSalt = keccak256(opImplInitCode);
+        address opImplAddr = vm.computeCreate2Address(opImplSalt, keccak256(opImplInitCode), deployer);
+
+        bytes memory opInitData = abi.encodeCall(AntseedBuyerOperator.initialize, (owner));
+        bytes32 opProxySalt = keccak256("ANTSEED_VAULT_PROD");
+        bytes memory opProxyInitCode = abi.encodePacked(
+            type(ERC1967Proxy).creationCode,
+            abi.encode(opImplAddr, opInitData)
+        );
+        address opProxyAddr = vm.computeCreate2Address(opProxySalt, keccak256(opProxyInitCode), deployer);
+
+        vm.startBroadcast(deployerKey);
+
+        AntseedBuyerOperator opImpl = opImplAddr.code.length == 0
+            ? new AntseedBuyerOperator{salt: opImplSalt}(antseedRegistry)
+            : AntseedBuyerOperator(opImplAddr);
+
+        ERC1967Proxy opProxy = opProxyAddr.code.length == 0
+            ? new ERC1967Proxy{salt: opProxySalt}(address(opImpl), opInitData)
+            : ERC1967Proxy(payable(opProxyAddr));
+
+        vm.stopBroadcast();
+
+        string memory json = "deploy";
         vm.serializeAddress(json, "operatorImplementation", address(opImpl));
         string memory finalJson = vm.serializeAddress(json, "operatorProxy", address(opProxy));
-        vm.writeJson(finalJson, "./deploy-output.json");
+        vm.writeJson(finalJson, "./deploy-base-output.json");
     }
 }

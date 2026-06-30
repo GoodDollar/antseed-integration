@@ -44,7 +44,7 @@ GoodDollar AntSeed credits add a GoodDollar-native credit layer:
    - One-time G$ deposits receive **+10%** credits.
    - Active G$ streamers receive **+20%** credits.
    - Wallets without GoodID verification receive no bonus.
-   - A per-root-account monthly bonus cap applies (`MAX_BONUS_CAP_MICRO_USD`).
+   - A per-root-account monthly bonus cap applies (`MAX_BONUS_CAP_USD`).
 
 2. **GoodID-based bonus eligibility**
    - Any wallet can deposit or stream G$ without needing GoodID.
@@ -67,15 +67,15 @@ GoodDollar AntSeed credits add a GoodDollar-native credit layer:
 All backend accounting is USDC-denominated in micro-USD units.
 
 ```text
-principal = gdAmount * gdMicroUsdPerToken
+principal = gdAmount * gdUsdPerToken
 bonus     = principal * 10%   (deposit)
           = principal * 20%   (stream)
           = 0                  (unverified wallet)
-effectiveBonus = min(bonus, MAX_BONUS_CAP_MICRO_USD - monthlyBonusUsed)
+effectiveBonus = min(bonus, MAX_BONUS_CAP_USD - monthlyBonusUsed)
 totalCredits = principal + effectiveBonus
 ```
 
-The G$ → USD price comes from the reserve oracle (`currentPrice`) when configured, otherwise the `GD_MICRO_USD_PER_TOKEN` env var.
+The G$ → USD price comes from the reserve oracle (`currentPrice`) when configured, otherwise the `GD_USD_PER_TOKEN` env var.
 
 Examples (assuming verified wallet, bonus cap not yet reached):
 
@@ -189,7 +189,7 @@ To see credits that have not yet been funded to the AntSeed buyer deposit:
 curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/outstanding"
 ```
 
-This returns `outstandingFundingMicroUsd` and the list of `failed` or `pending` credit entries. Submitting the same `txHash` to `/v1/celo/events/record` again is safe — idempotency prevents double-funding.
+This returns `outstandingFundingUsd` and the list of `failed` or `pending` credit entries. Submitting the same `txHash` to `/v1/celo/events/record` again is safe — idempotency prevents double-funding.
 
 To manually trigger stream credits outside of the cron (24-hour cooldown applies):
 

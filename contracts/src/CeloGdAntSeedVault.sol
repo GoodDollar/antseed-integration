@@ -36,8 +36,13 @@ interface IConstantFlowAgreementV1Like {
         returns (uint256 timestamp, int96 flowRate, uint256 deposit, uint256 owedDeposit);
 }
 
-interface IReservePriceOracleLike {
-    function currentPriceDAI() external view returns (uint256);
+interface IStaticOracleLike {
+    function quoteAllAvailablePoolsWithTimePeriod(
+        uint128 baseAmount,
+        address baseToken,
+        address quoteToken,
+        uint32 period
+    ) external view returns (uint256 quoteAmount, address[] memory queriedPools);
 }
 
 /// @title CeloGdAntSeedVault
@@ -45,8 +50,7 @@ interface IReservePriceOracleLike {
 /// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
 ///      and Superfluid SuperApp stream callbacks. Backend converts G$ events into USDC-denominated credits.
 contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
-    uint256 private constant MICRO_USD_PER_USD = 1_000_000;
-    uint256 private constant RESERVE_PRICE_DECIMALS = 1e18;
+
     error NotOwner();
     error ZeroAddress();
     error ZeroAmount();
@@ -65,23 +69,25 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     address public owner;
     address public superfluidHost;
     address public cfaV1;
-    address public reservePriceOracle;
-    uint256 public minFirstDepositMicroUsd;
-    uint256 public minMonthlyStreamMicroUsd;
-    uint256 public fallbackGdMicroUsdPerToken;
+    address public staticOracle;
+    uint256 public minFirstDepositUsd;
+    uint256 public minMonthlyStreamUsd;
+    uint256 public fallbackGdUsdPerToken;
 
     mapping(address => uint256) public totalDepositedGd;
     mapping(address => int96) public streamFlowRate;
     mapping(address => uint256) public streamMonthlyGdAmount;
     /// @notice AntSeed buyer account funded when stream credits are settled for each sender.
     mapping(address => address) public streamBuyer;
+    /// @notice cUSD quote token address used by the static oracle.
+    address public staticOracleCusd;
 
-    uint256[50] private __gap;
+    uint256[49] private __gap;
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event SuperfluidConfigUpdated(address indexed host, address indexed cfaV1);
-    event ReservePriceOracleUpdated(address indexed reservePriceOracle);
-    event MinimumsUpdated(uint256 minFirstDepositMicroUsd, uint256 minMonthlyStreamMicroUsd, uint256 fallbackGdMicroUsdPerToken);
+    event StaticOracleUpdated(address indexed staticOracle, address indexed staticOracleCusd);
+    event MinimumsUpdated(uint256 minFirstDepositUsd, uint256 minMonthlyStreamUsd, uint256 fallbackGdUsdPerToken);
     /// @dev `buyer` is the AntSeed buyer account to credit, decoded from the `data` payload (abi.encode(buyerAddress)).
     event GdDeposited(address indexed account, address indexed buyer, uint256 gdAmount, bytes data);
     /// @dev `buyer` is the AntSeed buyer account decoded from Superfluid userdata (abi.encode(buyerAddress)).
@@ -113,9 +119,9 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         owner = owner_;
         superfluidHost = superfluidHost_;
         cfaV1 = cfaV1_;
-        minFirstDepositMicroUsd = 1_000_000;
-        minMonthlyStreamMicroUsd = 1_000_000;
-        fallbackGdMicroUsdPerToken = 1_000_000;
+        minFirstDepositUsd = 1e18;
+        minMonthlyStreamUsd = 1e18;
+        fallbackGdUsdPerToken = 9000e18; // 1$ = 9000 G$ (0.0001111 USD per G$)
 
         emit OwnershipTransferred(address(0), owner_);
         emit SuperfluidConfigUpdated(superfluidHost_, cfaV1_);
@@ -135,18 +141,19 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         emit SuperfluidConfigUpdated(host, agreement);
     }
 
-    function setReserveConfig(address reservePriceOracle_, uint256 fallbackGdMicroUsdPerToken_) external onlyOwner {
-        if (reservePriceOracle_ == address(0) && fallbackGdMicroUsdPerToken_ == 0) revert InvalidPriceConfig();
-        reservePriceOracle = reservePriceOracle_;
-        if (fallbackGdMicroUsdPerToken_ > 0) fallbackGdMicroUsdPerToken = fallbackGdMicroUsdPerToken_;
-        emit ReservePriceOracleUpdated(reservePriceOracle_);
-        emit MinimumsUpdated(minFirstDepositMicroUsd, minMonthlyStreamMicroUsd, fallbackGdMicroUsdPerToken);
+    function setStaticOracleConfig(address staticOracle_, address staticOracleCusd_, uint256 fallbackGdUsdPerToken_) external onlyOwner {
+        if ((staticOracle_ == address(0) || staticOracleCusd_ == address(0)) && fallbackGdUsdPerToken_ == 0) revert InvalidPriceConfig();
+        staticOracle = staticOracle_;
+        staticOracleCusd = staticOracleCusd_;
+        if (fallbackGdUsdPerToken_ > 0) fallbackGdUsdPerToken = fallbackGdUsdPerToken_;
+        emit StaticOracleUpdated(staticOracle_, staticOracleCusd_);
+        emit MinimumsUpdated(minFirstDepositUsd, minMonthlyStreamUsd, fallbackGdUsdPerToken);
     }
 
-    function setMinimumUsdThresholds(uint256 minFirstDepositMicroUsd_, uint256 minMonthlyStreamMicroUsd_) external onlyOwner {
-        minFirstDepositMicroUsd = minFirstDepositMicroUsd_;
-        minMonthlyStreamMicroUsd = minMonthlyStreamMicroUsd_;
-        emit MinimumsUpdated(minFirstDepositMicroUsd, minMonthlyStreamMicroUsd, fallbackGdMicroUsdPerToken);
+    function setMinimumUsdThresholds(uint256 minFirstDepositUsd_, uint256 minMonthlyStreamUsd_) external onlyOwner {
+        minFirstDepositUsd = minFirstDepositUsd_;
+        minMonthlyStreamUsd = minMonthlyStreamUsd_;
+        emit MinimumsUpdated(minFirstDepositUsd, minMonthlyStreamUsd, fallbackGdUsdPerToken);
     }
 
     /// @notice Optional registration helper for deployments that want the vault registered as a SuperApp.
@@ -163,7 +170,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         if (amount == 0) revert ZeroAmount();
         address buyer = _decodeBuyer(data);
         if (buyer == address(0)) revert MissingBuyerAddress();
-        if (totalDepositedGd[msg.sender] == 0 && _gdWeiToMicroUsd(amount) < minFirstDepositMicroUsd) revert FirstDepositBelowMinimum();
+        if (totalDepositedGd[msg.sender] == 0 && gdUsdPerToken(uint128(amount)) < minFirstDepositUsd) revert FirstDepositBelowMinimum();
         totalDepositedGd[msg.sender] += amount;
         _safeTransferFrom(msg.sender, address(this), amount);
         emit GdDeposited(msg.sender, buyer, amount, data);
@@ -272,7 +279,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         if (amount == 0) revert ZeroAmount();
         address buyer = _decodeBuyer(data);
         if (buyer == address(0)) revert MissingBuyerAddress();
-        if (totalDepositedGd[account] == 0 && _gdWeiToMicroUsd(amount) < minFirstDepositMicroUsd) revert FirstDepositBelowMinimum();
+        if (totalDepositedGd[account] == 0 && gdUsdPerToken(uint128(amount)) < minFirstDepositUsd) revert FirstDepositBelowMinimum();
         totalDepositedGd[account] += amount;
         emit GdDeposited(account, buyer, amount, data);
     }
@@ -298,7 +305,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
 
         streamFlowRate[sender] = flowRate;
         uint256 monthlyAmount = uint256(uint96(flowRate)) * 30 days;
-        if (monthlyAmount > 0 && _gdWeiToMicroUsd(monthlyAmount) < minMonthlyStreamMicroUsd) revert StreamRateBelowMinimum();
+        if (monthlyAmount > 0 && gdUsdPerToken(uint128(monthlyAmount)) < minMonthlyStreamUsd) revert StreamRateBelowMinimum();
         streamMonthlyGdAmount[sender] = monthlyAmount;
 
         uint256 elapsedSeconds = currentTimestamp > previousTimestamp ? currentTimestamp - previousTimestamp : 0;
@@ -344,20 +351,31 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
     }
 
-    function _gdWeiToMicroUsd(uint256 gdAmountWei) private view returns (uint256) {
-        return (gdAmountWei * _gdMicroUsdPerToken()) / 1e18;
-    }
 
-    function _gdMicroUsdPerToken() private view returns (uint256) {
-        address oracle = reservePriceOracle;
-        if (oracle != address(0)) {
-            (bool ok, bytes memory data) = oracle.staticcall(abi.encodeWithSelector(IReservePriceOracleLike.currentPriceDAI.selector));
+
+    /// @notice Returns the current G$ price in USD units (same denomination as minFirstDepositUsd).
+    ///         Queries the static oracle if configured; falls back to fallbackGdUsdPerToken.
+    function gdUsdPerToken(uint128 amount) public view returns (uint256) {
+        address oracle = staticOracle;
+        address cusd = staticOracleCusd;
+        if (oracle != address(0) && cusd != address(0)) {
+            (bool ok, bytes memory data) = oracle.staticcall(
+                abi.encodeWithSelector(
+                    IStaticOracleLike.quoteAllAvailablePoolsWithTimePeriod.selector,
+                    uint128(amount),
+                    address(gdToken),
+                    cusd,
+                    uint32(60)
+                )
+            );
             if (ok && data.length >= 32) {
-                uint256 reservePriceDai = abi.decode(data, (uint256));
-                uint256 price = (reservePriceDai * MICRO_USD_PER_USD) / RESERVE_PRICE_DECIMALS;
-                return price;
+                uint256 quoteAmount;
+                assembly { quoteAmount := mload(add(data, 32)) }
+                if (quoteAmount > 0) {
+                    return quoteAmount;
+                }
             }
         }
-        return fallbackGdMicroUsdPerToken;
+        return amount * 1e18/ fallbackGdUsdPerToken;
     }
 }
