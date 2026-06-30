@@ -19,7 +19,6 @@ npm-debug.log*
 contracts/out/
 contracts/cache/
 contracts/broadcast/
-contracts/lib/
 
 # misc
 .DS_Store
