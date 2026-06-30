@@ -13,7 +13,7 @@ export interface Env {
   CELO_STATIC_ORACLE_ADDRESS?: string;
   CELO_CUSD_ADDRESS?: string;
   SUPERFLUID_SUBGRAPH_URL?: string;
-  MAX_BONUS_CAP_MICRO_USD?: string;
+  MAX_BONUS_CAP_USD?: string;
 }
 
 export type RuntimeConfig = {
@@ -29,7 +29,7 @@ export type RuntimeConfig = {
   CELO_STATIC_ORACLE_ADDRESS?: string;
   CELO_CUSD_ADDRESS?: string;
   SUPERFLUID_SUBGRAPH_URL?: string;
-  MAX_BONUS_CAP_MICRO_USD: bigint;
+  MAX_BONUS_CAP_USD: bigint;
 };
 
 export function configFromEnv(env: Env): RuntimeConfig {
@@ -45,7 +45,7 @@ export function configFromEnv(env: Env): RuntimeConfig {
     CELO_STATIC_ORACLE_ADDRESS: env.CELO_STATIC_ORACLE_ADDRESS,
     CELO_CUSD_ADDRESS: env.CELO_CUSD_ADDRESS,
     SUPERFLUID_SUBGRAPH_URL: env.SUPERFLUID_SUBGRAPH_URL,
-    MAX_BONUS_CAP_MICRO_USD: bigintEnv(env.MAX_BONUS_CAP_MICRO_USD, 100_000_000n)
+    MAX_BONUS_CAP_USD: bigintEnv(env.MAX_BONUS_CAP_USD, 100_000_000n)
   };
 }
 

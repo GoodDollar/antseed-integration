@@ -7,9 +7,9 @@ export type CreditReservation = {
   requestId: string;
   account: string;
   rootAccount?: string;
-  maxCostMicroUsd: string;
+  maxCostUsd: string;
   status: "reserved" | "settled" | "released";
-  actualCostMicroUsd?: string;
+  actualCostUsd?: string;
   providerReceiptHash?: string;
   vaultReserveTxHash?: string;
   vaultSettleTxHash?: string;
@@ -24,10 +24,10 @@ export type UserCreditProfile = {
   createdAt: string;
   updatedAt: string;
   totalGdDepositedWei: string;
-  totalPrincipalMicroUsd: string;
-  totalBonusMicroUsd: string;
+  totalPrincipalUsd: string;
+  totalBonusUsd: string;
   totalGDStreamedWei: string;
-  totalOutstandingFundingMicroUsd: string;
+  totalOutstandingFundingUsd: string;
   streamFlowRateWeiPerSecond: string;
   lastStreamCreditAt: string;
 };
@@ -38,9 +38,9 @@ export type GdCreditEntry = {
   rootAccount: string;
   source: "deposit" | "streamUpdate" | "streamRequest" | "streamCron";
   gdAmountWei: string;
-  principalMicroUsd: string;
-  bonusMicroUsd: string;
-  totalCreditMicroUsd: string;
+  principalUsd: string;
+  bonusUsd: string;
+  totalCreditUsd: string;
   txHash?: string;
   logIndex?: number;
   fundingStatus: "pending" | "funded" | "failed";
@@ -57,7 +57,7 @@ export type StreamState = {
   rootAccount: string;
   flowRateWeiPerSecond: string;
   monthlyGdAmountWei: string;
-  monthlyMicroUsd: string;
+  monthlyUsd: string;
   active: boolean;
   lastBonusPaidAt: string;
   txHash?: string;

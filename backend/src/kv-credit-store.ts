@@ -24,7 +24,7 @@ export class KVCreditStore {
     date?: Date;
     gdPrice: number;
     flowRate?: bigint;
-    maxBonusCapMicroUsd: bigint;
+    maxBonusCapUsd: bigint;
     buyerAddress?: string;
   }): Promise<GdCreditEntry> {
     const account = normalizeAccount(input.account);
@@ -36,14 +36,14 @@ export class KVCreditStore {
     const bonus = calculateCreditWithBonus(input.gdAmountWei, input.source, input.isVerified, input.gdPrice);
 
     // Enforce per-root-account monthly bonus cap
-    let effectiveBonusMicroUsd = bonus.bonusMicroUsd;
-    if (effectiveBonusMicroUsd > 0n && input.maxBonusCapMicroUsd > 0n) {
+    let effectiveBonusUsd = bonus.bonusUsd;
+    if (effectiveBonusUsd > 0n && input.maxBonusCapUsd > 0n) {
       const monthlyBonusUsed = await this.getMonthlyBonusUsed(rootAccount, month);
-      const remainingCap = input.maxBonusCapMicroUsd > monthlyBonusUsed
-        ? input.maxBonusCapMicroUsd - monthlyBonusUsed
+      const remainingCap = input.maxBonusCapUsd > monthlyBonusUsed
+        ? input.maxBonusCapUsd - monthlyBonusUsed
         : 0n;
-      if (effectiveBonusMicroUsd > remainingCap) {
-        effectiveBonusMicroUsd = remainingCap;
+      if (effectiveBonusUsd > remainingCap) {
+        effectiveBonusUsd = remainingCap;
       }
     }
 
@@ -54,9 +54,9 @@ export class KVCreditStore {
       rootAccount,
       source: input.source,
       gdAmountWei: input.gdAmountWei.toString(),
-      principalMicroUsd: bonus.principalMicroUsd.toString(),
-      bonusMicroUsd: effectiveBonusMicroUsd.toString(),
-      totalCreditMicroUsd: (bonus.principalMicroUsd + effectiveBonusMicroUsd).toString(),
+      principalUsd: bonus.principalUsd.toString(),
+      bonusUsd: effectiveBonusUsd.toString(),
+      totalCreditUsd: (bonus.principalUsd + effectiveBonusUsd).toString(),
       streamUpdateMonth: month,
       ...(input.txHash !== undefined && { txHash: input.txHash }),
       ...(input.logIndex !== undefined && { logIndex: input.logIndex }),
@@ -70,8 +70,8 @@ export class KVCreditStore {
     if (rootAccount && rootAccount !== account) {
       await this.addGdCreditToAccount(rootAccount, entry.id);
     }
-    if (effectiveBonusMicroUsd > 0n) {
-      await this.addMonthlyBonusUsed(rootAccount, month, effectiveBonusMicroUsd);
+    if (effectiveBonusUsd > 0n) {
+      await this.addMonthlyBonusUsed(rootAccount, month, effectiveBonusUsd);
     }
     await this.updateUser(account, rootAccount, (current) => ({
       ...current,
@@ -81,7 +81,7 @@ export class KVCreditStore {
       streamFlowRateWeiPerSecond: input.flowRate ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
       totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
       totalGDStreamedWei: input.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
-      totalOutstandingFundingMicroUsd: addDecimalStrings(current.totalOutstandingFundingMicroUsd, entry.totalCreditMicroUsd),
+      totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd),
     }));
 
     return entry;
@@ -98,15 +98,15 @@ export class KVCreditStore {
     if (result.funded) {
       const now = new Date().toISOString();
       await this.updateUser(entry.account, entry.rootAccount, (current) => {
-        const outstanding = BigInt(current.totalOutstandingFundingMicroUsd);
-        const creditAmount = BigInt(entry.totalCreditMicroUsd);
+        const outstanding = BigInt(current.totalOutstandingFundingUsd);
+        const creditAmount = BigInt(entry.totalCreditUsd);
         return {
           ...current,
           updatedAt: now,
           lastStreamCreditAt: entry.source.startsWith("stream") ? now : current.lastStreamCreditAt,
-          totalPrincipalMicroUsd: (BigInt(current.totalPrincipalMicroUsd) + BigInt(entry.principalMicroUsd)).toString(),
-          totalBonusMicroUsd: (BigInt(current.totalBonusMicroUsd) + BigInt(entry.bonusMicroUsd)).toString(),
-          totalOutstandingFundingMicroUsd: (outstanding > creditAmount ? outstanding - creditAmount : 0n).toString(),
+          totalPrincipalUsd: (BigInt(current.totalPrincipalUsd) + BigInt(entry.principalUsd)).toString(),
+          totalBonusUsd: (BigInt(current.totalBonusUsd) + BigInt(entry.bonusUsd)).toString(),
+          totalOutstandingFundingUsd: (outstanding > creditAmount ? outstanding - creditAmount : 0n).toString(),
         };
       });
     }
@@ -178,11 +178,11 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     createdAt,
     updatedAt: saved?.updatedAt ?? createdAt,
     totalGdDepositedWei: saved?.totalGdDepositedWei ?? "0",
-    totalBonusMicroUsd: saved?.totalBonusMicroUsd ?? "0",
+    totalBonusUsd: saved?.totalBonusUsd ?? "0",
     streamFlowRateWeiPerSecond: saved?.streamFlowRateWeiPerSecond ?? "0",
-    totalPrincipalMicroUsd: saved?.totalPrincipalMicroUsd ?? "0",
+    totalPrincipalUsd: saved?.totalPrincipalUsd ?? "0",
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
-    totalOutstandingFundingMicroUsd: saved?.totalOutstandingFundingMicroUsd ?? "0",
+    totalOutstandingFundingUsd: saved?.totalOutstandingFundingUsd ?? "0",
     lastStreamCreditAt: saved?.lastStreamCreditAt ?? "1970-01-01T00:00:00.000Z",
   };
 }

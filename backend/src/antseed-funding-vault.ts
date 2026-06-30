@@ -13,7 +13,7 @@ const FUNDING_VAULT_ABI = [
 export type AntSeedFundingResult = {
   enabled: boolean;
   buyer: string;
-  amountMicroUsd: string;
+  amountUsd: string;
   txHash?: string;
   error?: string;
 };
@@ -39,41 +39,41 @@ export class AntSeedFundingVaultClient {
     }
   }
 
-  async depositForBuyer(buyer: string, principalMicroUsd: bigint, bonusMicroUsd: bigint): Promise<AntSeedFundingResult> {
-    const total = principalMicroUsd + bonusMicroUsd;
-    if (!this.contract) return { enabled: false, buyer, amountMicroUsd: total.toString() };
-    const tx = await this.contract.depositFor(buyer, principalMicroUsd, bonusMicroUsd);
+  async depositForBuyer(buyer: string, principalUsd: bigint, bonusUsd: bigint): Promise<AntSeedFundingResult> {
+    const total = principalUsd + bonusUsd;
+    if (!this.contract) return { enabled: false, buyer, amountUsd: total.toString() };
+    const tx = await this.contract.depositFor(buyer, principalUsd, bonusUsd);
     const receipt = await tx.wait();
     return {
       enabled: true,
       buyer,
-      amountMicroUsd: total.toString(),
+      amountUsd: total.toString(),
       txHash: receipt?.hash
     };
   }
 
-  async depositForBuyerWithId(buyer: string, principalMicroUsd: bigint, bonusMicroUsd: bigint, id: string): Promise<AntSeedFundingResult> {
-    const total = principalMicroUsd + bonusMicroUsd;
-    if (!this.contract) return { enabled: false, buyer, amountMicroUsd: total.toString() };
+  async depositForBuyerWithId(buyer: string, principalUsd: bigint, bonusUsd: bigint, id: string): Promise<AntSeedFundingResult> {
+    const total = principalUsd + bonusUsd;
+    if (!this.contract) return { enabled: false, buyer, amountUsd: total.toString() };
 
     const alreadyUsed = await this.contract.usedDepositIds(this.toBytes32Id(id));
     if (alreadyUsed) {
-      return { enabled: true, buyer, amountMicroUsd: total.toString() };
+      return { enabled: true, buyer, amountUsd: total.toString() };
     }
 
-    const tx = await this.contract.depositForWithId(buyer, principalMicroUsd, bonusMicroUsd, id);
+    const tx = await this.contract.depositForWithId(buyer, principalUsd, bonusUsd, id);
     const receipt = await tx.wait();
     return {
       enabled: true,
       buyer,
-      amountMicroUsd: total.toString(),
+      amountUsd: total.toString(),
       txHash: receipt?.hash
     };
   }
 
-  async withdrawPrincipalForBuyer(buyer: string, amountMicroUsd: bigint, recipient: string, timestamp: number, signature: string): Promise<{ enabled: boolean; txHash?: string }> {
+  async withdrawPrincipalForBuyer(buyer: string, amountUsd: bigint, recipient: string, timestamp: number, signature: string): Promise<{ enabled: boolean; txHash?: string }> {
     if (!this.contract) return { enabled: false };
-    const tx = await this.contract.withdrawPrincipal(buyer, amountMicroUsd, recipient, timestamp, signature);
+    const tx = await this.contract.withdrawPrincipal(buyer, amountUsd, recipient, timestamp, signature);
     const receipt = await tx.wait();
     return { enabled: true, txHash: receipt?.hash };
   }

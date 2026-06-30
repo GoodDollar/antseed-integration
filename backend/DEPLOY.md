@@ -81,7 +81,7 @@ Update the `[vars]` section with production values:
 | `CELO_GD_SUPERTOKEN_ADDRESS` | G$ SuperToken (Superfluid) on Celo | `0x…` |
 | `SUPERFLUID_SUBGRAPH_URL` | Superfluid subgraph endpoint for stream data | `https://…` |
 | `GD_CUSD_PRICE` | Current G$/cUSD exchange rate (decimal) | `0.001154` |
-| `MAX_BONUS_CAP_MICRO_USD` | Monthly per-root bonus cap in micro-USD | `100000000` (= $100) |
+| `MAX_BONUS_CAP_USD` | Monthly per-root bonus cap in micro-USD | `100000000` (= $100) |
 
 > **Note:** `GD_CUSD_PRICE` should be updated whenever the G$ price drifts significantly. A future cron-based price update is planned.
 

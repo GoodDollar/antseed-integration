@@ -1,5 +1,5 @@
 # Local wrangler dev values. Copy to .dev.vars and never commit real secrets.
-GD_MICRO_USD_PER_TOKEN=1000000
+GD_USD_PER_TOKEN=1000000
 CELO_RPC_URL=https://forno.celo.org
 CELO_VAULT_ADDRESS=0x
 CELO_GOODID_ADDRESS=0xC361A6E67822a0EDc17D899227dd9FC50BD62F42

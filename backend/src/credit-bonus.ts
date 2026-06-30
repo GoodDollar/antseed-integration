@@ -1,15 +1,15 @@
 import { GdCreditEntry } from "./types";
 
 export type CreditBonusInput = {
-  principalMicroUsd: bigint;
-  monthlyStreamCapMicroUsd: bigint;
-  streamingBonusUsedMicroUsd: bigint;
+  principalUsd: bigint;
+  monthlyStreamCapUsd: bigint;
+  streamingBonusUsedUsd: bigint;
 };
 
 export type CreditBonusResult = {
-  principalMicroUsd: bigint;
-  bonusMicroUsd: bigint;
-  totalCreditMicroUsd: bigint;
+  principalUsd: bigint;
+  bonusUsd: bigint;
+  totalCreditUsd: bigint;
 };
 
 const REGULAR_BONUS_BPS = 1_000n; // +10%
@@ -19,26 +19,26 @@ const BPS = 10_000n;
 
 export function calculateCreditWithBonus(gdAmountWei: bigint, source: GdCreditEntry["source"], isVerified: boolean, gdPrice: number): CreditBonusResult {
   
-  const principalMicroUsd = gdWeiToMicroUsd(gdAmountWei, gdPrice);
-  let bonusMicroUsd = source.startsWith("stream") ? (principalMicroUsd * STREAMING_BONUS_BPS) / BPS : (principalMicroUsd * REGULAR_BONUS_BPS) / BPS;
+  const principalUsd = gdWeiToUsd(gdAmountWei, gdPrice);
+  let bonusUsd = source.startsWith("stream") ? (principalUsd * STREAMING_BONUS_BPS) / BPS : (principalUsd * REGULAR_BONUS_BPS) / BPS;
   if(!isVerified) {
-    bonusMicroUsd = 0n;
+    bonusUsd = 0n;
   }
 
   return {
-    principalMicroUsd,
-    bonusMicroUsd,
-    totalCreditMicroUsd: principalMicroUsd + bonusMicroUsd,
+    principalUsd,
+    bonusUsd,
+    totalCreditUsd: principalUsd + bonusUsd,
   };
 }
 
-export function gdWeiToMicroUsd(gdAmountWei: bigint, gdPrice: number): bigint {
-  const microUsdPerToken = BigInt(Math.round(gdPrice * 1e6));
-  return (gdAmountWei * microUsdPerToken) / 1_000_000_000_000_000_000n;
+export function gdWeiToUsd(gdAmountWei: bigint, gdPrice: number): bigint {
+  const usdPerToken = BigInt(Math.round(gdPrice * 1e6));
+  return (gdAmountWei * usdPerToken) / 1_000_000_000_000_000_000n;
 }
 
-export function monthlyStreamMicroUsd(flowRateWeiPerSecond: bigint, gdPrice: number): bigint {
-  return gdWeiToMicroUsd(flowRateWeiPerSecond * BigInt(30 * 24 * 60 * 60), gdPrice);
+export function monthlyStreamUsd(flowRateWeiPerSecond: bigint, gdPrice: number): bigint {
+  return gdWeiToUsd(flowRateWeiPerSecond * BigInt(30 * 24 * 60 * 60), gdPrice);
 }
 
 export function monthKey(date = new Date()): string {

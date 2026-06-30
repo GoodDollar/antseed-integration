@@ -67,9 +67,9 @@ test("GET /v1/accounts/:account/outstanding returns outstanding funding info", a
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as { account: string; outstandingFundingMicroUsd: string; failedFundingCredits: unknown[] };
+  const body = await res.json() as { account: string; outstandingFundingUsd: string; failedFundingCredits: unknown[] };
   assert.equal(body.account, account);
-  assert.equal(body.outstandingFundingMicroUsd, "0");
+  assert.equal(body.outstandingFundingUsd, "0");
   assert.equal(body.failedFundingCredits.length, 0);
 });
 
@@ -116,7 +116,7 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
       body: JSON.stringify({ txHash })
     }), testEnv, {} as ExecutionContext);
     assert.equal(res.status, 200);
-    const body = await res.json() as { events: Array<{ id: string; source: string; fundingStatus: string; principalMicroUsd: string; buyerAddress?: string }> };
+    const body = await res.json() as { events: Array<{ id: string; source: string; fundingStatus: string; principalUsd: string; buyerAddress?: string }> };
     assert.equal(body.events.length, 1);
     assert.equal(body.events[0].source, "deposit");
     assert.equal(body.events[0].fundingStatus, "funded");
@@ -324,8 +324,8 @@ test("POST /v1/accounts/:account/withdraw returns enabled:false when vault not c
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as { account: string; amountMicroUsd: string; bridge: { enabled: boolean } };
+  const body = await res.json() as { account: string; amountUsd: string; bridge: { enabled: boolean } };
   assert.equal(body.account, account);
-  assert.equal(body.amountMicroUsd, "5000000");
+  assert.equal(body.amountUsd, "5000000");
   assert.equal(body.bridge.enabled, false);
 });

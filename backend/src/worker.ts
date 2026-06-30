@@ -46,6 +46,7 @@ const SuperfluidStreamsResponseSchema = z.object({
 });
 
 const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superfluid.dev/celo-mainnet/protocol-v1";
+const MIN_STREAM_BONUS = parseEther("800"); // minimum G$ amount to issue a stream credit, to avoid spam and abuse
 
 type SuperfluidIncomingStream = {
   account: string;
@@ -87,7 +88,7 @@ export default {
         flowRate: BigInt(stream.flowRateWeiPerSecond),
         isVerified: !!rootAccount, // if root acccount was found it is whitelisted
         gdPrice,
-        maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD,
+        maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
         buyerAddress: stream.buyerAddress
       });
       ctx.waitUntil(fundCredit(entry, store, antseedFundingVault));
@@ -161,7 +162,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           logIndex: event.logIndex,
           isVerified: !!rootAccount, // if root acccount was found it is whitelisted
           gdPrice,
-          maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD,
+          maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
           buyerAddress: event.buyer
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
@@ -179,7 +180,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           logIndex: event.logIndex,
           isVerified: !!rootAccount, // if root acccount was found it is whitelisted
           gdPrice,
-          maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD,
+          maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
           buyerAddress: event.buyer
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
@@ -205,7 +206,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const outstandingFundingCredits = gdCredits.filter((entry) => entry.fundingStatus === "failed" || entry.fundingStatus === "pending");
     return json({
       account: profile.account,
-      outstandingFundingMicroUsd: profile.totalOutstandingFundingMicroUsd,
+      outstandingFundingUsd: profile.totalOutstandingFundingUsd,
       failedFundingCredits: outstandingFundingCredits
     });
   }
@@ -245,7 +246,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         flowRate: BigInt(stream.flowRateWeiPerSecond),
         isVerified,
         gdPrice,
-        maxBonusCapMicroUsd: cfg.MAX_BONUS_CAP_MICRO_USD,
+        maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
         buyerAddress: stream.buyerAddress
       });
       const res = await fundCredit(entry, store, antseedFundingVault);
@@ -270,7 +271,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       parsed.data.timestamp,
       parsed.data.signature
     );
-    return json({ account, amountMicroUsd: parsed.data.amount, bridge });
+    return json({ account, amountUsd: parsed.data.amount, bridge });
   }
 
   const channelOpMatch = url.pathname.match(/^\/v1\/channels\/(0x[0-9a-fA-F]{64})\/(close|withdraw)$/);
@@ -325,8 +326,8 @@ async function fundCredit(
   try {
     const bridge = await antseedFundingVault.depositForBuyerWithId(
       buyer,
-      BigInt(entry.principalMicroUsd),
-      BigInt(entry.bonusMicroUsd),
+      BigInt(entry.principalUsd),
+      BigInt(entry.bonusUsd),
       entry.id
     );
     const updated = await store.markFundingResult(entry, { funded: true, txHash: bridge.txHash });
@@ -341,7 +342,7 @@ async function fundCredit(
       bridge: {
         enabled: antseedFundingVault.enabled,
         buyer,
-        amountMicroUsd: entry.totalCreditMicroUsd,
+        amountUsd: entry.totalCreditUsd,
         error: message
       }
     };

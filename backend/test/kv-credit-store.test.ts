@@ -28,19 +28,19 @@ test("recordGdCredit persists entry and updates user profile", async () => {
     gdAmountWei: 10_000_000_000_000_000_000n, // 10 G$
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   assert.equal(entry.account, "0xabc");
   assert.equal(entry.source, "deposit");
-  assert.equal(entry.principalMicroUsd, "10000000");
-  assert.equal(entry.bonusMicroUsd, "1000000"); // 10% bonus for deposit
-  assert.equal(entry.totalCreditMicroUsd, "11000000");
+  assert.equal(entry.principalUsd, "10000000");
+  assert.equal(entry.bonusUsd, "1000000"); // 10% bonus for deposit
+  assert.equal(entry.totalCreditUsd, "11000000");
   assert.equal(entry.fundingStatus, "pending");
 
   const user = await store.getUser("0xABC");
   assert.equal(user.totalGdDepositedWei, "10000000000000000000");
-  assert.equal(user.totalOutstandingFundingMicroUsd, "11000000");
+  assert.equal(user.totalOutstandingFundingUsd, "11000000");
 });
 
 test("recordGdCredit is idempotent on duplicate id", async () => {
@@ -53,7 +53,7 @@ test("recordGdCredit is idempotent on duplicate id", async () => {
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
   const second = await store.recordGdCredit({
     id: "deposit:dup",
@@ -63,7 +63,7 @@ test("recordGdCredit is idempotent on duplicate id", async () => {
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   assert.deepEqual(first, second);
@@ -83,12 +83,12 @@ test("recordGdCredit gives streaming bonus (20%) for stream sources", async () =
     rootAccount: "0xROOT",
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
-  assert.equal(entry.principalMicroUsd, "1000000");
-  assert.equal(entry.bonusMicroUsd, "200000"); // 20% streaming bonus
-  assert.equal(entry.totalCreditMicroUsd, "1200000");
+  assert.equal(entry.principalUsd, "1000000");
+  assert.equal(entry.bonusUsd, "200000"); // 20% streaming bonus
+  assert.equal(entry.totalCreditUsd, "1200000");
 
   const user = await store.getUser("0xABC");
   assert.equal(user.totalGDStreamedWei, "1000000000000000000");
@@ -104,12 +104,12 @@ test("recordGdCredit gives no bonus for unverified accounts", async () => {
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: false,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
-  assert.equal(entry.principalMicroUsd, "1000000");
-  assert.equal(entry.bonusMicroUsd, "0");
-  assert.equal(entry.totalCreditMicroUsd, "1000000");
+  assert.equal(entry.principalUsd, "1000000");
+  assert.equal(entry.bonusUsd, "0");
+  assert.equal(entry.totalCreditUsd, "1000000");
 });
 
 test("recordGdCredit enforces monthly bonus cap per root account", async () => {
@@ -125,9 +125,9 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: cap
+    maxBonusCapUsd: cap
   });
-  assert.equal(first.bonusMicroUsd, "100000"); // full 10%
+  assert.equal(first.bonusUsd, "100000"); // full 10%
 
   // Second deposit from different wallet same root: bonus clamped
   const second = await store.recordGdCredit({
@@ -138,9 +138,9 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     gdAmountWei: 10_000_000_000_000_000_000n, // 10 G$ → would be $1 bonus
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: cap
+    maxBonusCapUsd: cap
   });
-  assert.equal(second.bonusMicroUsd, "400000"); // capped to remaining $0.40
+  assert.equal(second.bonusUsd, "400000"); // capped to remaining $0.40
 
   // Third deposit: no bonus left
   const third = await store.recordGdCredit({
@@ -151,9 +151,9 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: cap
+    maxBonusCapUsd: cap
   });
-  assert.equal(third.bonusMicroUsd, "0");
+  assert.equal(third.bonusUsd, "0");
 });
 
 test("markFundingResult updates entry status and user profile on success", async () => {
@@ -166,7 +166,7 @@ test("markFundingResult updates entry status and user profile on success", async
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   assert.equal(entry.fundingStatus, "pending");
@@ -176,9 +176,9 @@ test("markFundingResult updates entry status and user profile on success", async
   assert.equal(funded.fundingTxHash, "0xfund123");
 
   const user = await store.getUser("0xABC");
-  assert.equal(user.totalPrincipalMicroUsd, "1000000");
-  assert.equal(user.totalBonusMicroUsd, "100000");
-  assert.equal(user.totalOutstandingFundingMicroUsd, "0");
+  assert.equal(user.totalPrincipalUsd, "1000000");
+  assert.equal(user.totalBonusUsd, "100000");
+  assert.equal(user.totalOutstandingFundingUsd, "0");
 });
 
 test("markFundingResult records failure without updating user totals", async () => {
@@ -191,7 +191,7 @@ test("markFundingResult records failure without updating user totals", async () 
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   const failed = await store.markFundingResult(entry, { funded: false, error: "tx reverted" });
@@ -199,8 +199,8 @@ test("markFundingResult records failure without updating user totals", async () 
   assert.equal(failed.fundingError, "tx reverted");
 
   const user = await store.getUser("0xABC");
-  assert.equal(user.totalPrincipalMicroUsd, "0"); // not updated on failure
-  assert.equal(user.totalOutstandingFundingMicroUsd, "1100000"); // still outstanding
+  assert.equal(user.totalPrincipalUsd, "0"); // not updated on failure
+  assert.equal(user.totalOutstandingFundingUsd, "1100000"); // still outstanding
 });
 
 test("markFundingResult is idempotent for already-funded entries", async () => {
@@ -213,7 +213,7 @@ test("markFundingResult is idempotent for already-funded entries", async () => {
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   const funded = await store.markFundingResult(entry, { funded: true, txHash: "0xfirst" });
@@ -231,7 +231,7 @@ test("recordGdCredit tracks credits under both wallet and root account", async (
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   const walletCredits = await store.getGdCredits("0xWALLET");
@@ -254,9 +254,9 @@ test("getUser returns default profile for unknown account", async () => {
   const user = await store.getUser("0xNOBODY");
   assert.equal(user.account, "0xnobody");
   assert.equal(user.totalGdDepositedWei, "0");
-  assert.equal(user.totalPrincipalMicroUsd, "0");
-  assert.equal(user.totalBonusMicroUsd, "0");
-  assert.equal(user.totalOutstandingFundingMicroUsd, "0");
+  assert.equal(user.totalPrincipalUsd, "0");
+  assert.equal(user.totalBonusUsd, "0");
+  assert.equal(user.totalOutstandingFundingUsd, "0");
   assert.equal(user.streamFlowRateWeiPerSecond, "0");
 });
 
@@ -271,7 +271,7 @@ test("markFundingResult updates lastStreamCreditAt for stream sources", async ()
     rootAccount: "0xROOT",
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   assert.equal(entry.fundingStatus, "pending");
@@ -295,7 +295,7 @@ test("updateUser sets updatedAt on recordGdCredit and changes it after markFundi
     gdAmountWei: 1_000_000_000_000_000_000n,
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   const afterRecord = await store.getUser("0xABC");
@@ -322,7 +322,7 @@ test("updateUser applies the same mutation to both wallet and root account profi
     gdAmountWei: 5_000_000_000_000_000_000n, // 5 G$ → $5 principal + $0.50 bonus
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   await store.markFundingResult(entry, { funded: true, txHash: "0xupd2" });
@@ -331,10 +331,10 @@ test("updateUser applies the same mutation to both wallet and root account profi
   const root = await store.getUser("0xROOT");
 
   // Both profiles should reflect the same funded totals
-  assert.equal(wallet.totalPrincipalMicroUsd, root.totalPrincipalMicroUsd);
-  assert.equal(wallet.totalBonusMicroUsd, root.totalBonusMicroUsd);
-  assert.equal(wallet.totalOutstandingFundingMicroUsd, root.totalOutstandingFundingMicroUsd);
-  assert.equal(wallet.totalOutstandingFundingMicroUsd, "0");
+  assert.equal(wallet.totalPrincipalUsd, root.totalPrincipalUsd);
+  assert.equal(wallet.totalBonusUsd, root.totalBonusUsd);
+  assert.equal(wallet.totalOutstandingFundingUsd, root.totalOutstandingFundingUsd);
+  assert.equal(wallet.totalOutstandingFundingUsd, "0");
 
   // Root profile's account field should be the root address
   assert.equal(root.account, "0xroot");
@@ -352,7 +352,7 @@ test("updateUser accumulates totals correctly across multiple deposits", async (
     gdAmountWei: 2_000_000_000_000_000_000n, // 2 G$ → $2 principal + $0.20 bonus
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
   const e2 = await store.recordGdCredit({
     id: "deposit:acc2",
@@ -362,18 +362,18 @@ test("updateUser accumulates totals correctly across multiple deposits", async (
     gdAmountWei: 3_000_000_000_000_000_000n, // 3 G$ → $3 principal + $0.30 bonus
     gdPrice: GD_PRICE,
     isVerified: true,
-    maxBonusCapMicroUsd: 100_000_000n
+    maxBonusCapUsd: 100_000_000n
   });
 
   // Both pending → outstanding = $2.20 + $3.30 = $5.50
   const pending = await store.getUser("0xABC");
-  assert.equal(pending.totalOutstandingFundingMicroUsd, "5500000");
+  assert.equal(pending.totalOutstandingFundingUsd, "5500000");
 
   await store.markFundingResult(e1, { funded: true, txHash: "0xa1" });
   await store.markFundingResult(e2, { funded: true, txHash: "0xa2" });
 
   const done = await store.getUser("0xABC");
-  assert.equal(done.totalPrincipalMicroUsd, "5000000");
-  assert.equal(done.totalBonusMicroUsd, "500000");
-  assert.equal(done.totalOutstandingFundingMicroUsd, "0");
+  assert.equal(done.totalPrincipalUsd, "5000000");
+  assert.equal(done.totalBonusUsd, "500000");
+  assert.equal(done.totalOutstandingFundingUsd, "0");
 });
