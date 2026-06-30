@@ -20,7 +20,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     IERC20 public immutable usdc;
 
     address public owner;
-    address public pendingOwner;
+    address public admin;
     bool private locked;
     mapping(bytes32 => bool) public usedDepositIds;
     mapping(address => uint256) public totalPrincipalDeposited;
@@ -38,6 +38,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     uint256[50] private __gap;
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
     event BuyerOperatorAccepted(address indexed buyer, uint256 nonce);
     event BuyerDepositFunded(address indexed buyer, uint256 principal, uint256 bonus);
     event BuyerDepositFundedWithId(address indexed buyer, uint256 principal, uint256 bonus, string id);
@@ -61,7 +62,12 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     error ExpiredSignature();
 
     modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
+        if (msg.sender != owner || msg.sender != admin) revert NotOwner();
+        _;
+    }
+
+    modifier onlyAdmin() {
+        if (msg.sender != admin) revert NotOwner();
         _;
     }
 
@@ -88,6 +94,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     function initialize(address owner_) external initializer {
         if (owner_ == address(0)) revert InvalidAddress();
         owner = owner_;
+        admin = owner_;
         emit OwnershipTransferred(address(0), owner_);
 
         address depositsAddress = registry.deposits();
@@ -108,6 +115,12 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         if (newOwner == address(0)) revert InvalidAddress();
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
+    }
+
+    function transferAdmin(address newAdmin) external onlyAdmin {
+        if (newAdmin == address(0)) revert InvalidAddress();
+        emit AdminTransferred(admin, newAdmin);
+        admin = newAdmin;
     }
 
     function acceptBuyerOperator(address buyer, uint256 nonce, bytes calldata buyerSig) external nonReentrant onlyOwner {
@@ -228,7 +241,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit ChannelWithdrawn(channelId, buyer, msg.sender);
     }
 
-    function sweepToken(address token, address recipient, uint256 amount) external onlyOwner {
+    function sweepToken(address token, address recipient, uint256 amount) external onlyAdmin {
         if (token == address(0) || recipient == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
         _safeTransfer(IERC20(token), recipient, amount);
