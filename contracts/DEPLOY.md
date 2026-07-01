@@ -123,17 +123,43 @@ The `AntseedBuyerOperator` calls `IAntseedDeposits.deposit` on behalf of buyers.
 cast call <usdc-address-base> "balanceOf(address)(uint256)" <operator-wallet>
 ```
 
-### 5.2 Set the operator `admin` (optional)
-
+### 5.2 Set the operator `owner` (optional)
+Owner is the day to day operator. Admin has funds and upgrade permissions.
 By default the deployer `owner` is the admin. To designate a separate hot-wallet admin:
 
 ```bash
-cast send <operatorProxy> "setAdmin(address)" <admin-address> \
+cast send <operatorProxy> "transferOwnership(address)" <admin-address> \
   --rpc-url "$BASE_RPC_URL" \
   --private-key "$DEPLOYER_PRIVATE_KEY"
 ```
 
-### 5.3 Update the backend Worker config
+### 5.3 Register the vault as a Superfluid SuperApp (Celo)
+
+The vault implements Superfluid SuperApp callbacks (`beforeAgreement*` / `afterAgreement*`) for stream ingestion. It must be registered with the Superfluid Host before any stream can flow to it.
+
+The `configWord` encodes the app level and which callback NOOPs are active. Since the vault implements **all six** callbacks, no NOOP bits are needed. Use `APP_LEVEL_FINAL = 1` unless the Celo deployment of the Superfluid Host requires a different value.
+** THIS MUST BE CALLED BY AN ACCOUNT WITH PERMISSIONS TO REGISTER SUPERAPPS **
+
+```bash
+# configWord = 1 (APP_LEVEL_FINAL, all callbacks implemented — no NOOP bits)
+cast send <vaultProxy> "registerSuperApp(uint256)" 1 \
+  --rpc-url "$CELO_RPC_URL" \
+  --private-key "$DEPLOYER_PRIVATE_KEY"
+```
+
+Verify registration:
+
+```bash
+cast call "$SUPERFLUID_HOST" "isApp(address)(bool)" <vaultProxy> \
+  --rpc-url "$CELO_RPC_URL"
+# Expected: true
+```
+
+> **Note:** `configWord` is network/version-specific. Consult the [Superfluid `SuperAppDefinitions`](https://github.com/superfluid-finance/protocol-monorepo/blob/dev/packages/ethereum-contracts/contracts/apps/SuperAppBase.sol) for the correct value if registering on a non-mainnet Celo network.
+
+---
+
+### 5.4 Update the backend Worker config
 
 Edit `backend/wrangler.toml` and set `CELO_VAULT_ADDRESS` to the `vaultProxy` address from `deploy-celo-output.json`. Then set the Base operator secrets (see `backend/DEPLOY.md`, step 3):
 
@@ -179,7 +205,7 @@ Both contracts use UUPS proxies. To upgrade:
 forge create contracts/src/CeloGdAntSeedVault.sol:CeloGdAntSeedVault \
   --rpc-url "$CELO_RPC_URL" \
   --private-key "$DEPLOYER_PRIVATE_KEY" \
-  --constructor-args <gdToken>
+  --constructor-args "$GD_TOKEN"
 ```
 
 3. Call `upgradeToAndCall` from the owner:
