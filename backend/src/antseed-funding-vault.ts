@@ -1,7 +1,5 @@
 import { ethers } from "ethers";
 import { RuntimeConfig } from "./env.js";
-import { buildSetOperatorPayload } from "./operator-auth.js";
-import type { Eip712SigningPayload } from "./operator-auth.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 
 const FUNDING_VAULT_ABI = [
@@ -21,10 +19,7 @@ const REGISTRY_ABI = [
 ] as const;
 
 const DEPOSITS_ABI = [
-  "function getOperator(address buyer) view returns (address)",
-  "function eip712Domain() view returns (bytes1 fields, string name, string version, uint256 chainId, address verifyingContract, bytes32 salt, uint256[] extensions)",
-  "function operatorNonces(address buyer) view returns (uint256)",
-  "function nonces(address buyer) view returns (uint256)"
+  "function eip712Domain() view returns (bytes1 fields, string name, string version, uint256 chainId, address verifyingContract, bytes32 salt, uint256[] extensions)"
 ] as const;
 
 export type AntSeedFundingResult = {
@@ -33,16 +28,6 @@ export type AntSeedFundingResult = {
   amountUsd: string;
   txHash?: string;
   error?: string;
-};
-
-export type BuyerOperatorStatus = {
-  enabled: boolean;
-  account: string;
-  buyerAddress: string;
-  operatorAddress?: string;
-  currentOperator: string;
-  operatorAccepted: boolean;
-  consentNonce: string;
 };
 
 export class AntSeedFundingVaultClient {
@@ -130,85 +115,8 @@ export class AntSeedFundingVaultClient {
     return this.depositsDomainPromise;
   }
 
-  async getOperatorNonce(buyer: string): Promise<bigint> {
-    const deposits = await this.getDepositsContract();
-    const normalizedBuyer = buyer.toLowerCase();
-    try {
-      const nonce = await deposits.operatorNonces(normalizedBuyer);
-      return BigInt(nonce.toString());
-    } catch {
-      const nonce = await deposits.nonces(normalizedBuyer);
-      return BigInt(nonce.toString());
-    }
-  }
-
-  async getBuyerOperatorStatus(account: string, buyerAddress?: string): Promise<BuyerOperatorStatus> {
-    const buyer = (buyerAddress ?? account).toLowerCase();
-    const accountNormalized = account.toLowerCase();
-    if (!this.contract || !this.vaultAddress) {
-      return {
-        enabled: false,
-        account: accountNormalized,
-        buyerAddress: buyer,
-        currentOperator: ethers.ZeroAddress,
-        operatorAccepted: false,
-        consentNonce: "0"
-      };
-    }
-
-    const deposits = await this.getDepositsContract();
-    const currentOperator = String(await deposits.getOperator(buyer)).toLowerCase();
-    const operatorAddress = this.vaultAddress.toLowerCase();
-    const consentNonce = await this.getOperatorNonce(buyer);
-
-    return {
-      enabled: true,
-      account: accountNormalized,
-      buyerAddress: buyer,
-      operatorAddress,
-      currentOperator,
-      operatorAccepted: currentOperator === operatorAddress,
-      consentNonce: consentNonce.toString()
-    };
-  }
-
   async getDepositsSigningDomain(): Promise<{ name: string; version: string }> {
     return this.getDepositsEip712Domain();
-  }
-
-  async buildOperatorConsentPayload(account: string, buyerAddress?: string): Promise<{
-    enabled: boolean;
-    account: string;
-    buyerAddress: string;
-    typedData?: Eip712SigningPayload;
-  }> {
-    const status = await this.getBuyerOperatorStatus(account, buyerAddress);
-    if (!status.enabled || !status.operatorAddress) {
-      return {
-        enabled: false,
-        account: status.account,
-        buyerAddress: status.buyerAddress
-      };
-    }
-
-    const [chainId, depositsAddress, domain] = await Promise.all([
-      this.getChainId(),
-      this.getDepositsAddress(),
-      this.getDepositsEip712Domain()
-    ]);
-
-    return {
-      enabled: true,
-      account: status.account,
-      buyerAddress: status.buyerAddress,
-      typedData: buildSetOperatorPayload(
-        chainId,
-        depositsAddress,
-        status.operatorAddress,
-        BigInt(status.consentNonce),
-        domain
-      )
-    };
   }
 
   async acceptBuyerOperator(

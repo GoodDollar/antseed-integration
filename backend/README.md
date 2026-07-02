@@ -14,39 +14,34 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 
 - `GET /health`
 - `GET /config/status`
-- `GET /v1/quote/gd-to-credit` — G$ → AI credits via oracle (no bonus; bonus applied at record time)
-- `GET /v1/quote/credit-to-gd` — AI credits → G$ via oracle (no bonus)
-- `GET /v1/accounts/:account/status` — dashboard: profile, linked `buyer`, operator consent, withdrawable, outstanding
 - `GET /v1/accounts/:account/credit`
 - `GET /v1/accounts/:account/outstanding`
 - `GET /v1/accounts/:account/transactions` — paginated `gdCredits` history (`status`, `limit`, `cursor`)
-- `GET /v1/accounts/:account/operator` — buyer operator consent status (`?buyer=` optional, defaults to account)
-- `GET /v1/accounts/:account/operator/consent-payload` — EIP-712 typed data for operator consent (includes nonce)
-- `POST /v1/accounts/:account/operator/accept` — submit buyer signature → `acceptBuyerOperator` on Base
-- `GET /v1/accounts/:account/withdrawable` — on-chain `withdrawablePrincipal` (`?buyer=` optional)
-- `GET /v1/accounts/:account/withdraw/payload` — EIP-712 typed data for withdraw (`amountUsd`, `recipient`, optional `?buyer=`)
+- `POST /v1/accounts/:account/operator/accept` — submit buyer `SetOperator` signature → `acceptBuyerOperator` on Base
 - `POST /v1/accounts/:account/withdraw` — buyer EIP-712 sig → `withdrawPrincipalForBuyer` on Base
 - `POST /v1/accounts/:account/stream-credits`
 - `POST /v1/celo/events/record`
 - `POST /v1/channels/:channelId/close`
 - `POST /v1/channels/:channelId/withdraw`
 
+On-chain reads (operator status, withdrawable balance, oracle quotes, EIP-712 signing payloads) are handled in the UI via direct chain RPC calls, not proxied through this Worker.
+
 `POST /v1/celo/events/record` accepts either:
 - `{ "txHash": "0x..." }`
 - `{ "account": "0x...", "fromBlock": "0x...", "toBlock": "latest" }`
 
 `POST /v1/accounts/:account/operator/accept` body:
-- `{ "buyerSig": "0x...", "buyerAddress": "0x..." }` — `buyerAddress` optional (defaults to account)
+- `{ "nonce": "0", "buyerSig": "0x...", "buyerAddress": "0x..." }` — `buyerAddress` optional (defaults to account)
 
 `POST /v1/accounts/:account/withdraw` body:
 - `{ "buyerAddress": "0x...", "amountUsd": "1000000", "recipient": "0x...", "timestamp": 1700000000, "buyerSig": "0x..." }`
 
-## Widget flow (no Base chain details in UI)
+## Widget flow
 
-1. `GET /v1/accounts/:account/status` — check `operator.operatorAccepted`
-2. If false: `GET .../operator/consent-payload` → wallet signs `typedData` → `POST .../operator/accept`
-3. Celo deposit → `POST /v1/celo/events/record`
-4. Withdraw: `GET .../withdraw/payload?amountUsd=...&recipient=0x...` → sign → `POST .../withdraw`
+1. UI reads operator consent state and builds/signs `SetOperator` EIP-712 locally → `POST /v1/accounts/:account/operator/accept`
+2. Celo deposit → `POST /v1/celo/events/record`
+3. UI reads withdrawable principal on-chain, builds/signs withdraw EIP-712 locally → `POST /v1/accounts/:account/withdraw`
+4. Credit history and outstanding funding: `GET /v1/accounts/:account/credit`, `/outstanding`, `/transactions`
 
 ## Setup
 

@@ -5,9 +5,8 @@ import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
 import { parseEther } from "ethers";
-import { assertWithdrawTimestampFresh, buildWithdrawPrincipalPayload, recoverWithdrawPrincipalSigner } from "./withdraw-auth.js";
+import { assertWithdrawTimestampFresh, recoverWithdrawPrincipalSigner } from "./withdraw-auth.js";
 import { recoverSetOperatorSigner } from "./operator-auth.js";
-import { quoteCreditToGd, quoteGdToCredit } from "./quote.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 
 const CeloEventsRecordSchema = z.object({
@@ -36,9 +35,9 @@ const WithdrawSchema = z.object({
 });
 const OperatorAcceptSchema = z.object({
   buyerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional(),
+  nonce: z.string().regex(/^\d+$/),
   buyerSig: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
-const addressParam = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
 const ChannelOpSchema = z.object({
   timestamp: z.number().int().nonnegative().optional(),
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/).optional()
@@ -193,20 +192,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     });
   }
 
-  if (request.method === "GET" && url.pathname === "/v1/quote/gd-to-credit") {
-    const gdAmountWei = parseQuoteAmount(url.searchParams.get("gdAmountWei"), "gdAmountWei");
-    if (typeof gdAmountWei === "string") return json({ error: gdAmountWei }, 400);
-    const gdPrice = await fetchCurrentGdPrice(cfg);
-    return json(quoteGdToCredit({ gdAmountWei, gdPrice }));
-  }
-
-  if (request.method === "GET" && url.pathname === "/v1/quote/credit-to-gd") {
-    const creditUsd = parseQuoteAmount(url.searchParams.get("creditUsd"), "creditUsd");
-    if (typeof creditUsd === "string") return json({ error: creditUsd }, 400);
-    const gdPrice = await fetchCurrentGdPrice(cfg);
-    return json(quoteCreditToGd({ creditUsd, gdPrice }));
-  }
-
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
   if (request.method === "GET" && accountMatch) {
     const account = decodeURIComponent(accountMatch[1]);
@@ -215,44 +200,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       store.getGdCredits(account)
     ]);
     return json({ account: profile.account, profile, gdCredits });
-  }
-
-  const statusMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/status$/);
-  if (request.method === "GET" && statusMatch) {
-    const account = decodeURIComponent(statusMatch[1]).toLowerCase();
-    const [profile, gdCredits] = await Promise.all([
-      store.getUser(account),
-      store.getGdCredits(account),
-    ]);
-    const buyer = profile.buyer ?? account;
-    const [operator, withdrawable] = await Promise.all([
-      antseedFundingVault.getBuyerOperatorStatus(account, buyer),
-      antseedFundingVault.getWithdrawablePrincipal(buyer),
-    ]);
-    const outstandingFundingCredits = gdCredits.filter((entry) => entry.fundingStatus === "failed" || entry.fundingStatus === "pending");
-    return json({
-      account,
-      buyer: profile.buyer ?? null,
-      profile,
-      operator,
-      withdrawableUsd: withdrawable.withdrawableUsd,
-      outstandingFundingUsd: profile.totalOutstandingFundingUsd,
-      outstandingFundingCount: outstandingFundingCredits.length
-    });
-  }
-
-  const operatorConsentPayloadMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator\/consent-payload$/);
-  if (request.method === "GET" && operatorConsentPayloadMatch) {
-    const account = decodeURIComponent(operatorConsentPayloadMatch[1]).toLowerCase();
-    const buyerQuery = url.searchParams.get("buyer");
-    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
-      ? buyerQuery.toLowerCase()
-      : account;
-    const payload = await antseedFundingVault.buildOperatorConsentPayload(account, buyerAddress);
-    if (!payload.enabled) {
-      return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
-    }
-    return json(payload);
   }
 
   const operatorAcceptMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator\/accept$/);
@@ -267,16 +214,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
     }
 
-    const operatorStatus = await antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress);
-    if (operatorStatus.operatorAccepted) {
-      return json({ account, buyerAddress, operator: operatorStatus, message: "operator already accepted" });
-    }
-
-    const [chainId, depositsAddress, domain, nonce] = await Promise.all([
+    const nonce = BigInt(parsed.data.nonce);
+    const [chainId, depositsAddress, domain] = await Promise.all([
       antseedFundingVault.getChainId(),
       antseedFundingVault.getDepositsAddress(),
-      antseedFundingVault.getDepositsSigningDomain(),
-      antseedFundingVault.getOperatorNonce(buyerAddress)
+      antseedFundingVault.getDepositsSigningDomain()
     ]);
 
     let signer: string;
@@ -284,7 +226,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       signer = recoverSetOperatorSigner(
         chainId,
         depositsAddress,
-        operatorStatus.operatorAddress!,
+        antseedFundingVault.vaultAddress,
         nonce,
         parsed.data.buyerSig,
         domain
@@ -301,23 +243,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       const bridge = await antseedFundingVault.acceptBuyerOperator(buyerAddress, nonce, parsed.data.buyerSig);
       const rootAccount = await fetchGoodIdRoot(account, cfg);
       await store.setBuyer(account, buyerAddress, rootAccount ?? account);
-      const operator = await antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress);
-      return json({ account, buyerAddress, operator, bridge });
+      return json({ account, buyerAddress, bridge });
     } catch (error) {
       const message = error instanceof Error ? error.message : "operator accept failed";
       return json({ error: message, account, buyerAddress }, 502);
     }
-  }
-
-  const operatorMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator$/);
-  if (request.method === "GET" && operatorMatch) {
-    const account = decodeURIComponent(operatorMatch[1]).toLowerCase();
-    const buyerQuery = url.searchParams.get("buyer");
-    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
-      ? buyerQuery.toLowerCase()
-      : account;
-    const operator = await antseedFundingVault.getBuyerOperatorStatus(account, buyerAddress);
-    return json(operator);
   }
 
 
@@ -448,68 +378,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       cursor
     });
     return json({ account: account.toLowerCase(), ...page });
-  }
-
-  const withdrawableMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdrawable$/);
-  if (request.method === "GET" && withdrawableMatch) {
-    const account = decodeURIComponent(withdrawableMatch[1]).toLowerCase();
-    const buyerQuery = url.searchParams.get("buyer");
-    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
-      ? buyerQuery.toLowerCase()
-      : account;
-    const result = await antseedFundingVault.getWithdrawablePrincipal(buyerAddress);
-    return json({ account, buyerAddress, ...result });
-  }
-
-  const withdrawPayloadMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw\/payload$/);
-  if (request.method === "GET" && withdrawPayloadMatch) {
-    const account = decodeURIComponent(withdrawPayloadMatch[1]).toLowerCase();
-    const buyerQuery = url.searchParams.get("buyer");
-    const buyerAddress = buyerQuery && addressParam.safeParse(buyerQuery).success
-      ? buyerQuery.toLowerCase()
-      : account;
-    const amountParam = url.searchParams.get("amountUsd");
-    const recipientParam = url.searchParams.get("recipient");
-    if (!amountParam || !/^\d+$/.test(amountParam)) {
-      return json({ error: "amountUsd query param required" }, 400);
-    }
-    const recipientParsed = recipientParam ? addressParam.safeParse(recipientParam) : { success: false as const };
-    if (!recipientParsed.success) {
-      return json({ error: "recipient query param required" }, 400);
-    }
-    const amountUsd = BigInt(amountParam);
-    if (amountUsd <= 0n) {
-      return json({ error: "amountUsd must be greater than zero" }, 400);
-    }
-    if (!antseedFundingVault.enabled || !antseedFundingVault.vaultAddress) {
-      return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
-    }
-    const [chainId, withdrawable] = await Promise.all([
-      antseedFundingVault.getChainId(),
-      antseedFundingVault.getWithdrawablePrincipal(buyerAddress)
-    ]);
-    if (amountUsd > BigInt(withdrawable.withdrawableUsd)) {
-      return json({
-        error: "amount exceeds withdrawable principal",
-        withdrawableUsd: withdrawable.withdrawableUsd
-      }, 400);
-    }
-    const timestamp = Math.floor(Date.now() / 1000);
-    return json({
-      account,
-      buyerAddress,
-      recipient: recipientParsed.data.toLowerCase(),
-      amountUsd: amountUsd.toString(),
-      timestamp,
-      typedData: buildWithdrawPrincipalPayload(
-        chainId,
-        antseedFundingVault.vaultAddress,
-        buyerAddress,
-        amountUsd,
-        recipientParsed.data,
-        timestamp
-      )
-    });
   }
 
   const streamCreditsMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/stream-credits$/);
@@ -729,11 +597,6 @@ function cors(response: Response): Response {
 function createStreamFundingId(account: string, date: Date): string {
   const day = date.toISOString().slice(0, 10);
   return `stream:${day}:${account.toLowerCase()}`;
-}
-
-function parseQuoteAmount(value: string | null, field: string): bigint | string {
-  if (!value || !/^\d+$/.test(value)) return `${field} must be a non-negative integer string`;
-  return BigInt(value);
 }
 
 async function fundCredit(
