@@ -7,9 +7,9 @@ export type CreditReservation = {
   requestId: string;
   account: string;
   rootAccount?: string;
-  maxCostMicroUsd: string;
+  maxCostUsd: string;
   status: "reserved" | "settled" | "released";
-  actualCostMicroUsd?: string;
+  actualCostUsd?: string;
   providerReceiptHash?: string;
   vaultReserveTxHash?: string;
   vaultSettleTxHash?: string;
@@ -23,36 +23,33 @@ export type UserCreditProfile = {
   rootAccount: string;
   createdAt: string;
   updatedAt: string;
-  totalRequests: number;
-  totalReservedMicroUsd: string;
-  totalSettledMicroUsd: string;
-  creditBalanceMicroUsd: string;
-  reservedCreditMicroUsd: string;
   totalGdDepositedWei: string;
-  totalGdPrincipalMicroUsd: string;
-  totalGdCreditsIssuedMicroUsd: string;
-  totalRegularBonusMicroUsd: string;
-  totalStreamingBonusMicroUsd: string;
+  totalPrincipalUsd: string;
+  totalBonusUsd: string;
+  totalGDStreamedWei: string;
+  totalOutstandingFundingUsd: string;
   streamFlowRateWeiPerSecond: string;
-  streamMonthlyMicroUsd: string;
-  lastRequestId?: string;
+  lastStreamCreditAt: string | undefined;
 };
 
 export type GdCreditEntry = {
   id: string;
   account: string;
   rootAccount: string;
-  source: "erc677" | "erc777" | "erc20" | "stream" | "manual";
+  source: "deposit" | "streamUpdate" | "streamRequest" | "streamCron";
   gdAmountWei: string;
-  principalMicroUsd: string;
-  regularBonusMicroUsd: string;
-  streamingBonusMicroUsd: string;
-  totalCreditMicroUsd: string;
-  streamingBonusPrincipalAppliedMicroUsd: string;
-  month: string;
+  principalUsd: string;
+  bonusUsd: string;
+  totalCreditUsd: string;
   txHash?: string;
   logIndex?: number;
+  fundingStatus: "pending" | "funded" | "failed";
+  fundingTxHash?: string;
+  fundingError?: string;
   createdAt: string;
+  streamUpdateMonth: string;
+  /** AntSeed buyer account address to which credits are funded. */
+  buyerAddress?: string;
 };
 
 export type StreamState = {
@@ -60,7 +57,9 @@ export type StreamState = {
   rootAccount: string;
   flowRateWeiPerSecond: string;
   monthlyGdAmountWei: string;
-  monthlyMicroUsd: string;
+  monthlyUsd: string;
+  active: boolean;
+  lastBonusPaidAt: string;
   txHash?: string;
   logIndex?: number;
   updatedAt: string;

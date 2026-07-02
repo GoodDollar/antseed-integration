@@ -1,21 +1,20 @@
 # GoodDollar AntSeed Credits User Guide
 
-Use G$ on Celo to buy AntSeed AI compute credits, then point your **local developer tools** at the GoodDollar AntSeed API.
+Use G$ on Celo to buy AntSeed AI compute credits.
 
-This is an end-user setup guide. You do **not** need to clone or contribute to this repository to use AntSeed from VS Code, local coding agents, or OpenAI-compatible clients.
+This guide covers on-chain deposit/stream setup and credit balance checking. Developer-tool integration (API key auth and the OpenAI-compatible proxy) is coming in a future phase.
 
 ## Quick mental model
 
 ```text
-G$ on Celo -> CeloGdAntSeedVault -> Worker verifies tx -> credit balance -> AntSeed AI models -> your local dev tool
+G$ on Celo -> CeloGdAntSeedVault -> Worker verifies tx -> credit balance -> AntSeed buyer deposit funded
 ```
 
 - You deposit or stream G$ to the Celo vault.
 - The Worker verifies the vault transaction on Celo.
 - Your credits are recorded by wallet address and by your GoodID root wallet.
-- Your developer tool calls the Worker as an OpenAI-compatible AI endpoint.
-- The Worker reserves GoodDollar credits, forwards your prompt to the AntSeed buyer gateway, then settles actual usage.
-- Today the upstream AntSeed payment path is deposit-backed: the buyer signs EIP-712 reserve/settle authorization and the AntSeed deposits contract deducts from the deposit balance.
+- The Worker funds the backend AntSeed buyer deposit on Base via `AntseedBuyerOperator`.
+- Today the upstream AntSeed payment path is deposit-backed: the buyer operator calls `IAntseedDeposits.deposit` and the AntSeed protocol settles providers from that balance.
 
 ## What you need
 
@@ -24,10 +23,7 @@ Ask the GoodDollar/AntSeed operator for these production values:
 ```bash
 export GOODDOLLAR_ANTSEED_API="https://YOUR_GOODDOLLAR_ANTSEED_WORKER"
 export GOODDOLLAR_ACCOUNT="0xYOUR_GOODID_WALLET"
-export GOODDOLLAR_ANTSEED_MODEL="qwen3-235b-instruct"
 ```
-
-You will also create a GoodDollar AntSeed API key by signing a wallet message. Developer tools use that API key; they do not use your wallet private key.
 
 Check that the API is alive:
 
@@ -36,7 +32,7 @@ curl "$GOODDOLLAR_ANTSEED_API/health"
 curl "$GOODDOLLAR_ANTSEED_API/config/status"
 ```
 
-`/config/status` shows the OpenAI-compatible path, configured model, Celo integration flags, and supported account selector formats.
+`/config/status` shows Celo integration flags, bridge mode, and whether the Base buyer operator is enabled.
 
 ## Why use G$ credits instead of paying USDC directly?
 
@@ -46,15 +42,18 @@ GoodDollar AntSeed credits add a GoodDollar-native credit layer:
 
 1. **Bonus credits**
    - One-time G$ deposits receive **+10%** credits.
-   - Active G$ streamers receive **+20%** credits up to their monthly stream-speed cap.
+   - Active G$ streamers receive **+20%** credits.
+   - Wallets without GoodID verification receive no bonus.
+   - A per-root-account monthly bonus cap applies (`MAX_BONUS_CAP_USD`).
 
-2. **GoodID-gated access**
-   - Deposits and stream creation require a GoodID-verified wallet.
-   - Connected wallets are aggregated under `getWhitelistedRoot(account)`, so linked wallets can share a user-level credit history.
+2. **GoodID-based bonus eligibility**
+   - Any wallet can deposit or stream G$ without needing GoodID.
+   - GoodID-verified wallets earn bonus credits; unverified wallets receive principal only.
+   - Connected wallets are aggregated under `getWhitelistedRoot(account)`, so linked wallets share a credit history and monthly bonus cap.
 
 3. **Monthly stream budget**
-   - You can stream G$ monthly instead of topping up manually.
-   - Example: if your stream speed equals `$1/month` worth of G$, up to `$1` of monthly principal receives `$1.20` of credits. Additional principal receives `$1.10` per `$1`.
+   - You can stream G$ continuously instead of topping up manually.
+   - Stream credits are issued by a cron job (every minute) or on demand via `POST /v1/accounts/:account/stream-credits` (24-hour cooldown per account).
 
 4. **On-chain proof of funding**
    - Credits come from Celo vault events, not a centralized off-chain payment button.
@@ -68,32 +67,30 @@ GoodDollar AntSeed credits add a GoodDollar-native credit layer:
 All backend accounting is USDC-denominated in micro-USD units.
 
 ```text
-regularBonus = principal * 10%
-streamingExtraBonus = min(principal, remainingMonthlyStreamCap) * 10%
-totalCredits = principal + regularBonus + streamingExtraBonus
+principal = gdAmount * gdUsdPerToken
+bonus     = principal * 10%   (deposit)
+          = principal * 20%   (stream)
+          = 0                  (unverified wallet)
+effectiveBonus = min(bonus, MAX_BONUS_CAP_USD - monthlyBonusUsed)
+totalCredits = principal + effectiveBonus
 ```
 
-Examples:
+The G$ → USD price comes from the reserve oracle (`currentPrice`) when configured, otherwise the `GD_USD_PER_TOKEN` env var.
 
-| User type | G$ principal value | Monthly stream cap left | Credits issued |
-|---|---:|---:|---:|
-| one-time deposit | $10.00 | $0.00 | $11.00 |
-| active streamer | $1.00 | $1.00 | $1.20 |
-| active streamer, above cap | $10.00 | $1.00 | $11.10 |
-| cap already used | $10.00 | $0.00 | $11.00 |
+Examples (assuming verified wallet, bonus cap not yet reached):
 
-The exact G$ -> USD conversion depends on the Worker’s configured `GD_MICRO_USD_PER_TOKEN` until a production oracle/quote path is wired.
+| User type | G$ principal value | Credits issued |
+|---|---:|---:|
+| one-time deposit | $10.00 | $11.00 |
+| active streamer | $1.00 | $1.20 |
+| unverified wallet | $10.00 | $10.00 |
+| monthly bonus cap reached | $10.00 | $10.00 |
 
-## Step 1 — Make sure your wallet has GoodID
+## Step 1 — Optionally verify with GoodID for bonus credits
 
-Your deposit wallet must be GoodID verified.
+Any wallet can deposit G$ or stream to the vault. GoodID verification is **not required** to deposit.
 
-The vault accepts either:
-
-- `isWhitelisted(account) == true`, or
-- `getWhitelistedRoot(account) != address(0)`
-
-The Worker also uses `getWhitelistedRoot(account)` to maintain an additional aggregate credit record for your GoodID root wallet.
+The Worker calls `getWhitelistedRoot(account)` on the GoodID contract. A non-zero root unlocks bonus credits (+10% for deposits, +20% for streams) and aggregates your credit history across linked wallets. Without GoodID, you receive principal credits only.
 
 ## Step 2 — Buy AntSeed credits with G$
 
@@ -101,13 +98,17 @@ The Worker also uses `getWhitelistedRoot(account)` to maintain an additional agg
 
 Preferred path: send G$ to the Celo vault with `transferAndCall`.
 
+You must supply your AntSeed buyer account address encoded as the `data` / `userData` parameter:
+
 ```solidity
 GoodDollar.transferAndCall(
   CELO_GD_ANTSEED_VAULT,
   amountGdWei,
-  userData
+  abi.encode(YOUR_ANTSEED_BUYER_ADDRESS)
 );
 ```
+
+The `data` field **must** be `abi.encode(buyerAddress)` — a 32-byte ABI-encoded address. A zero or missing buyer causes the vault to revert with `MissingBuyerAddress`.
 
 The vault supports these single-transaction hooks:
 
@@ -137,7 +138,7 @@ If your wallet cannot call `transferAndCall`, approve and deposit:
 
 ```solidity
 GoodDollar.approve(CELO_GD_ANTSEED_VAULT, amountGdWei);
-CeloGdAntSeedVault.deposit(amountGdWei, userData);
+CeloGdAntSeedVault.deposit(amountGdWei, abi.encode(YOUR_ANTSEED_BUYER_ADDRESS));
 ```
 
 This takes two transactions, so use `transferAndCall` when possible.
@@ -148,16 +149,19 @@ If you stream G$ to the Celo vault through Superfluid, the vault reacts as a Sup
 
 Create or update a Constant Flow Agreement from your wallet to the vault using the G$ SuperToken on Celo.
 
-Conceptually:
+You **must** pass your AntSeed buyer address as `userData` when creating or updating the flow:
 
 ```text
-sender = your GoodID wallet
+sender   = your GoodID wallet
 receiver = CELO_GD_ANTSEED_VAULT
-token = G$ SuperToken on Celo
+token    = G$ SuperToken on Celo
 flowRate = token-wei per second
+userData = abi.encode(YOUR_ANTSEED_BUYER_ADDRESS)   ← required
 ```
 
-When the stream is created or updated, the vault emits `StreamUpdated(account, flowRate, monthlyGdAmountWei)`. Record the stream update through the Worker the same way:
+The vault's SuperApp callback decodes the buyer from `ctx.userData`. A missing or zero buyer causes `MissingBuyerAddress` revert. On stream termination the stored buyer is used automatically; you do not need to re-supply it.
+
+When the stream is created or updated, the vault emits `StreamUpdated(account, buyer, flowRate, monthlyGdAmountWei, totalFlowWei)`, where `totalFlowWei = previousFlowRate * secondsSincePreviousUpdate`. Record the stream update through the Worker the same way:
 
 ```bash
 curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/celo/events/record" \
@@ -165,7 +169,7 @@ curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/celo/events/record" \
   -d '{"txHash":"0xYOUR_STREAM_TX_HASH"}'
 ```
 
-The Worker uses this to calculate your monthly stream cap for the extra 10% streaming bonus.
+The Worker uses this to record the stream's `totalFlowWei` as a credit entry and issue the +20% streaming bonus.
 
 ## Step 4 — Check your credit balance
 
@@ -175,198 +179,27 @@ curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit"
 
 The response includes:
 
-- wallet-level profile,
+- wallet-level `UserCreditProfile` (principal, bonus, outstanding funding totals),
 - GoodID-root aggregate profile when applicable,
-- G$ credit entries,
-- AntSeed request history,
-- current stream cap,
-- available credit balance.
+- list of `GdCreditEntry` records with `fundingStatus` (`pending`, `funded`, or `failed`).
 
-## Step 5 — Create a signed GoodDollar AntSeed API key
-
-The backend must verify that the caller controls the wallet whose credits will be spent. It does this once, when creating an API key:
-
-```text
-wallet signs nonce -> backend verifies signature -> backend issues gd_live_... API key -> dev tools use that API key
-```
-
-### 5.1 Request a nonce/message
+To see credits that have not yet been funded to the AntSeed buyer deposit:
 
 ```bash
-curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/auth/nonce" \
-  -H "content-type: application/json" \
-  -d '{"account":"0xYOUR_GOODID_WALLET"}'
+curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/outstanding"
 ```
 
-Response:
+This returns `outstandingFundingUsd` and the list of `failed` or `pending` credit entries. Submitting the same `txHash` to `/v1/celo/events/record` again is safe — idempotency prevents double-funding.
 
-```json
-{
-  "account": "0xyour...wallet",
-  "nonce": "...",
-  "message": "...message to sign...",
-  "expiresAt": "2026-05-18T...Z"
-}
-```
-
-### 5.2 Sign the returned `message`
-
-Sign the exact returned message with the wallet that owns the credits. In production this should be done through the GoodDollar UI / WalletConnect / browser wallet flow.
-
-Do **not** paste private keys into random developer tools. The developer tool only needs the final `gd_live_...` API key, never your wallet key or seed phrase.
-
-### 5.3 Exchange signature for an API key
+To manually trigger stream credits outside of the cron (24-hour cooldown applies):
 
 ```bash
-curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/auth/api-keys" \
-  -H "content-type: application/json" \
-  -d '{
-    "account":"0xYOUR_GOODID_WALLET",
-    "nonce":"NONCE_FROM_STEP_5_1",
-    "signature":"0xSIGNATURE_FROM_WALLET",
-    "label":"Laptop VS Code"
-  }'
+curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/stream-credits"
 ```
 
-Response:
+## Step 5 — Developer tool integration (coming soon)
 
-```json
-{
-  "token": "gd_live_...",
-  "apiKey": {
-    "id": "...",
-    "account": "0xyour...wallet",
-    "rootAccount": "0xgoodid...root",
-    "tokenPrefix": "gd_live_...abcd",
-    "status": "active"
-  }
-}
-```
-
-Save the `token` once. The backend stores only a hash of it.
-
-```bash
-export GOODDOLLAR_ANTSEED_API_KEY="gd_live_..."
-```
-
-## Step 6 — Connect local developer tools to AntSeed
-
-The Worker exposes an OpenAI-compatible chat-completions endpoint:
-
-```text
-POST /v1/chat/completions
-```
-
-Use these values in tools that support OpenAI-compatible providers:
-
-```bash
-Base URL:  $GOODDOLLAR_ANTSEED_API/v1
-Model:     qwen3-235b-instruct
-API key:   $GOODDOLLAR_ANTSEED_API_KEY
-```
-
-The backend maps the API key to the verified wallet/GoodID root, reserves GoodDollar credits, sends the request to the AntSeed buyer gateway, settles the actual cost in the GoodDollar credit layer, and returns the model response.
-
-Important payment boundary: today, the actual AntSeed network payment is still the buyer deposits contract flow. The buyer signs EIP-712 reserve/settle authorization and the AntSeed deposits contract deducts from the deposit balance. Future versions may add richer payment routing above this layer.
-
-### Quick inference test
-
-```bash
-curl "$GOODDOLLAR_ANTSEED_API/v1/chat/completions" \
-  -H "content-type: application/json" \
-  -H "authorization: Bearer $GOODDOLLAR_ANTSEED_API_KEY" \
-  -d '{
-    "model": "qwen3-235b-instruct",
-    "messages": [
-      { "role": "user", "content": "Reply with one sentence about GoodDollar." }
-    ],
-    "max_tokens": 128
-  }'
-```
-
-For local-only testing, operators may enable `ALLOW_UNVERIFIED_ACCOUNT_SELECTOR=true`, which accepts `gd:0x...` / `x-gooddollar-account` selectors. That mode is not production-safe because it does not prove wallet ownership.
-
-## VS Code setup
-
-### Continue extension
-
-In `~/.continue/config.json`, add an OpenAI-compatible model:
-
-```json
-{
-  "models": [
-    {
-      "title": "GoodDollar AntSeed",
-      "provider": "openai",
-      "model": "qwen3-235b-instruct",
-      "apiBase": "https://YOUR_GOODDOLLAR_ANTSEED_WORKER/v1",
-      "apiKey": "gd_live_YOUR_SIGNED_API_KEY"
-    }
-  ]
-}
-```
-
-Then select **GoodDollar AntSeed** inside Continue.
-
-### Cline / Roo Code / other VS Code agents
-
-Use the tool’s OpenAI-compatible provider settings:
-
-```text
-Provider:  OpenAI Compatible
-Base URL:  https://YOUR_GOODDOLLAR_ANTSEED_WORKER/v1
-API key:   gd_live_YOUR_SIGNED_API_KEY
-Model:     qwen3-235b-instruct
-```
-
-Use the signed API key field for production. `x-gooddollar-account` is only for operator-enabled local/dev testing.
-
-## Aider setup
-
-```bash
-export OPENAI_API_BASE="$GOODDOLLAR_ANTSEED_API/v1"
-export OPENAI_API_KEY="$GOODDOLLAR_ANTSEED_API_KEY"
-aider --model openai/qwen3-235b-instruct
-```
-
-## OpenAI SDK setup
-
-```ts
-import OpenAI from "openai";
-
-const client = new OpenAI({
-  apiKey: "gd_live_YOUR_SIGNED_API_KEY",
-  baseURL: "https://YOUR_GOODDOLLAR_ANTSEED_WORKER/v1"
-});
-
-const res = await client.chat.completions.create({
-  model: "qwen3-235b-instruct",
-  messages: [{ role: "user", content: "Explain this codebase in one paragraph." }],
-  max_tokens: 512
-});
-
-console.log(res.choices[0]?.message?.content);
-```
-
-## Claude Code setup
-
-Claude Code is Anthropic-native, while this Worker currently exposes an OpenAI-compatible `/v1/chat/completions` API.
-
-So for Claude Code specifically, do **not** clone this integration repo for “local setup.” Instead use one of these routes:
-
-1. **Use a GoodDollar AntSeed Anthropic-compatible gateway** if the operator exposes one.
-   - Configure Claude Code to point at that gateway.
-   - The gateway should translate Anthropic Messages requests to the Worker’s OpenAI-compatible chat-completions endpoint and charge credits using `Authorization: Bearer gd_live_...`.
-
-2. **Use an OpenAI-compatible coding agent instead** for direct access today.
-   - Continue, Cline, Roo Code, Aider, OpenClaw, and many local agents can use the Worker directly with `Base URL = .../v1` and `API key = gd_live_...`.
-
-3. **Run a local compatibility proxy** only if you already have one.
-   - Upstream target: `POST $GOODDOLLAR_ANTSEED_API/v1/chat/completions`
-   - Upstream auth header: `Authorization: Bearer gd_live_YOUR_SIGNED_API_KEY`
-   - Upstream model: `qwen3-235b-instruct`
-
-Until a first-class `/v1/messages` compatibility endpoint exists, native Claude Code direct configuration is not the primary path.
+Wallet-signature auth (`/v1/auth/nonce`, `/v1/auth/api-keys`), signed `gd_live_...` API keys, and the OpenAI-compatible `/v1/chat/completions` proxy are planned for a future phase. Once available, you will be able to point any OpenAI-compatible developer tool (Continue, Cline, Roo Code, Aider, etc.) directly at the GoodDollar AntSeed Worker.
 
 ## Troubleshooting
 
@@ -378,10 +211,9 @@ curl "$GOODDOLLAR_ANTSEED_API/config/status"
 
 Look for:
 
-- `openAiCompatible.chatCompletionsPath = /v1/chat/completions`
-- `antseed.model`
 - `celo.vaultConfigured = true`
 - `celo.goodIdConfigured = true`
+- `bridge.baseBuyerOperatorEnabled = true`
 
 ### Check credits
 
@@ -389,32 +221,11 @@ Look for:
 curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit"
 ```
 
-If you see an insufficient credit error, deposit or stream more G$ and record the Celo transaction hash again.
-
-### Tool cannot set custom headers
-
-Use the signed API key in the normal API-key field:
-
-```text
-gd_live_YOUR_SIGNED_API_KEY
-```
-
-Most OpenAI-compatible tools will send that as:
-
-```text
-Authorization: Bearer gd_live_YOUR_SIGNED_API_KEY
-```
-
-### Tool wants a model list endpoint
-
-This Worker currently supports chat completions. If a tool requires `/v1/models`, either configure the model manually or add a tiny local proxy that returns a static model list.
+If credits show `fundingStatus: "failed"`, check `fundingError` on the entry. You can retry by re-submitting the original `txHash` — idempotency prevents double-funding.
 
 ## Safety and limitations
 
-- Credits are not USDC balances; they are GoodDollar-side accounting credits for AntSeed usage.
+- Credits are not USDC balances; they are GoodDollar-side accounting credits used to fund the operator's AntSeed buyer deposit.
 - Current AntSeed payment is deposit/EIP-712 backed upstream; future payment mechanisms should be added as adapters above that layer.
-- `gd_live_...` API keys are created only after wallet signature verification. Store them like secrets and revoke them if lost.
-- `gd:0x...` / `x-gooddollar-account` selectors are local-dev-only when explicitly enabled by an operator and are not production-safe.
 - KV is durable but eventually consistent. On-chain vault events are the source of truth for deposits and stream updates.
-- A deployed Cloudflare Worker cannot reach `127.0.0.1`; production `ANTSEED_BASE_URL` must be publicly reachable.
-- Never put wallet private keys or seed phrases into developer-tool model settings.
+

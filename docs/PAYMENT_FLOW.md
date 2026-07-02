@@ -2,54 +2,55 @@
 
 This integration has two layers:
 
-1. **GoodDollar user/credit layer** — GoodID auth, G$ deposits/streams, bonus accounting, API keys, and local developer-tool UX.
+1. **GoodDollar credit layer** — G$ deposits/streams on Celo, bonus accounting, GoodID gating, and KV-backed credit accounting.
 2. **AntSeed buyer payment layer** — Base USDC deposits in AntSeed's deposits contract plus buyer-signed EIP-712 reserve/settle authorization that pays providers.
 
-The GoodDollar layer is not the final AntSeed payment primitive. It is user-facing accounting and authorization in front of a backend-controlled AntSeed buyer deposit.
+The GoodDollar layer is not the final AntSeed payment primitive. It is an accounting and funding layer in front of a backend-controlled AntSeed buyer deposit managed by `AntseedBuyerOperator`.
 
-## Current request path
+## Current credit ingestion and funding path
 
 ```text
-Developer tool
-  -> GoodDollar AntSeed Worker /v1/chat/completions
-  -> verified gd_live API key maps to wallet / GoodID root
-  -> Worker checks and reserves the user's GoodDollar credit balance
-  -> Worker ensures the backend AntSeed buyer has enough Base USDC deposit capacity
-     -> AntSeedFundingVaultClient.ensureBuyerBalance(max reserve)
-     -> BaseUsdcAntSeedVault.fundAntSeedDeposit(top-up)
-     -> USDC approve(AntSeed deposits contract, top-up)
-     -> AntSeed deposits.deposit(backend buyer, top-up)
-  -> Worker forwards request through the configured AntSeed buyer gateway
-  -> buyer gateway signs AntSeed EIP-712 reserve/settle authorization
-  -> AntSeed deposits/channel contracts settle providers from the backend buyer deposit
-  -> Worker settles/deducts the user's GoodDollar credits and returns the model response
+User deposits/streams G$ to CeloGdAntSeedVault on Celo
+  -> POST /v1/celo/events/record  { txHash }  (or cron every minute for streams)
+  -> Worker fetches Celo receipt, parses GdDeposited / StreamUpdated events
+  -> Worker calls getWhitelistedRoot(account) to resolve GoodID root and verify eligibility
+  -> Worker calculates principal (G$ -> micro-USD) and bonus
+       deposits:  principal * 10%
+       streams:   principal * 20%
+       unverified accounts: bonus = 0
+       monthly cap enforced per root account via monthly-bonus KV key
+  -> Worker records GdCreditEntry in KV (fundingStatus = "pending")
+  -> Worker calls AntSeedFundingVaultClient.depositForBuyerWithId(buyer, principal, bonus, id)
+     -> checks usedDepositIds[keccak256(id)] on-chain (idempotency guard)
+     -> AntseedBuyerOperator.depositForWithId(buyer, principal, bonus, id)
+        -> IAntseedDeposits.deposit(buyer, principal + bonus)
+  -> Worker marks GdCreditEntry fundingStatus = "funded" / "failed"
 ```
+
+Pending or failed entries are visible at `GET /v1/accounts/:account/outstanding` and can be retried by re-submitting the same `txHash` (idempotency prevents double-funding).
+
+AI request proxying and developer tool auth are **not yet implemented** in this Worker. Those capabilities will be added in a future phase.
 
 ## Where AntSeed is actually paid/funded
 
-`AgentCreditVault` is not the AntSeed payment rail. It only tracks account-level credit reservations/settlement when enabled.
-
 The actual funding code path is:
 
-- `backend/src/worker.ts` — calls `antseedFundingVault.ensureBuyerBalance(maxCostMicroUsd)` before `antseed.chatCompletion(...)`.
-- `backend/src/antseed-funding-vault.ts` — reads the backend buyer balance and calls `fundAntSeedDeposit(topUp)` if the buyer deposit is too low.
-- `contracts/src/BaseUsdcAntSeedVault.sol` — does the on-chain USDC approval and deposit:
-  - `_safeApprove(depositsAddress, amount)`
-  - `antSeedDeposits.deposit(antSeedBuyer, amount)`
-  - `_safeApprove(depositsAddress, 0)`
+- `backend/src/worker.ts` — calls `fundCredit(entry, store, antseedFundingVault)` after recording each `GdCreditEntry`.
+- `backend/src/antseed-funding-vault.ts` — calls `depositForBuyerWithId(buyer, principal, bonus, id)`; checks `usedDepositIds` on-chain before sending the transaction to prevent duplicates.
+- `contracts/src/AntseedBuyerOperator.sol` — executes `depositForWithId(buyer, principal, bonus, id)`, calls `IAntseedDeposits.deposit(buyer, principal + bonus)`, and records the deposit ID as used.
 
-This funds a single backend/operator AntSeed buyer balance. Developers do not receive withdrawable USDC balances in AntSeed for the MVP.
+Credits are always funded to the `buyerAddress` from the Celo event, not to the depositor wallet. `totalPrincipalDeposited[buyer]` and `totalBonusDeposited[buyer]` are tracked separately on `AntseedBuyerOperator`; buyers can withdraw their principal portion (but not bonus) using a signed EIP-712 message.
 
 ## What the Worker owns today
 
-- Wallet-signature auth for issuing `gd_live_...` API keys.
-- GoodID root resolution and aggregation.
-- G$ deposit/stream event ingestion from Celo.
-- Bonus credit calculation: regular +10%, streaming +20% up to monthly stream-speed cap.
-- KV-backed user/request/credit accounting.
-- Request-level reserve/release/settle lifecycle for the GoodDollar credit layer.
-- Ensuring the backend AntSeed buyer deposit is funded from the Base USDC vault.
-- Forwarding the model request to the AntSeed buyer gateway.
+- GoodID root resolution and aggregation via `getWhitelistedRoot(account)`.
+- G$ deposit/stream event ingestion from Celo by `txHash` or account log range.
+- Bonus credit calculation: deposits +10%, streams +20%; unverified accounts get no bonus; monthly per-root-account bonus cap enforced in KV.
+- KV-backed user/credit accounting with `fundingStatus` lifecycle (`pending` → `funded` / `failed`).
+- Idempotent funding of the `AntseedBuyerOperator` deposit — **to the AntSeed buyer address specified at deposit/stream time**, not the GoodDollar wallet address.
+- Outstanding credit visibility and cron-based stream funding.
+
+**Not yet implemented:** wallet-signature auth, `gd_live_...` API key issuance, AI request proxying, and request-level reserve/settle lifecycle.
 
 ## What the AntSeed buyer/deposits layer owns today
 
