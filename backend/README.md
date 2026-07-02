@@ -25,7 +25,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/accounts/:account/operator/accept` — submit buyer signature → `acceptBuyerOperator` on Base
 - `GET /v1/accounts/:account/withdrawable` — on-chain `withdrawablePrincipal` (`?buyer=` optional)
 - `GET /v1/accounts/:account/withdraw/payload` — EIP-712 typed data for withdraw (`amountUsd`, `recipient`, optional `?buyer=`)
-- `POST /v1/accounts/:account/withdraw` — buyer EIP-712 sig → `withdrawPrincipal` on Base
+- `POST /v1/accounts/:account/withdraw` — buyer EIP-712 sig → `withdrawPrincipalForBuyer` on Base
 - `POST /v1/accounts/:account/stream-credits`
 - `POST /v1/celo/events/record`
 - `POST /v1/channels/:channelId/close`

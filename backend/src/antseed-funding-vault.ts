@@ -319,15 +319,16 @@ export class AntSeedFundingVaultClient {
     };
   }
 
-  async withdrawPrincipal(
+  async withdrawPrincipalForBuyer(
     buyer: string,
     amountUsd: bigint,
     recipient: string,
-    timestamp: bigint,
+    timestamp: number | bigint,
     buyerSig: string
   ): Promise<{ enabled: boolean; buyer: string; amountUsd: string; recipient: string; txHash?: string }> {
     const normalizedBuyer = buyer.toLowerCase();
     const normalizedRecipient = recipient.toLowerCase();
+    const timestampValue = typeof timestamp === "bigint" ? timestamp : BigInt(timestamp);
     if (!this.contract) {
       return {
         enabled: false,
@@ -340,7 +341,7 @@ export class AntSeedFundingVaultClient {
       normalizedBuyer,
       amountUsd,
       normalizedRecipient,
-      timestamp,
+      timestampValue,
       buyerSig
     );
     const receipt = await tx.wait();

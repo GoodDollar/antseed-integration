@@ -635,8 +635,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     if (signer !== buyerAddress) {
       return json({ error: "buyer signature does not match buyerAddress" }, 400);
     }
+    if (buyerAddress !== account) {
+      return json({ error: "buyerAddress must match account path" }, 400);
+    }
 
-    const withdrawable = await antseedFundingVault.getWithdrawablePrincipal(buyerAddress);
+    const withdrawable = await antseedFundingVault.getWithdrawablePrincipal(account);
     if (!withdrawable.enabled) {
       return json({ error: "base buyer operator bridge is not configured", account, buyerAddress }, 503);
     }
@@ -647,17 +650,31 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       }, 400);
     }
 
+    logInfo("withdraw.request", {
+      account: redactAddress(account),
+      amountUsd: parsed.data.amountUsd,
+      recipient: redactAddress(parsed.data.recipient)
+    });
     try {
-      const bridge = await antseedFundingVault.withdrawPrincipal(
-        buyerAddress,
-        amountUsd,
-        recipient,
-        timestamp,
+      const bridge = await antseedFundingVault.withdrawPrincipalForBuyer(
+        account,
+        BigInt(parsed.data.amountUsd),
+        parsed.data.recipient,
+        parsed.data.timestamp,
         parsed.data.buyerSig
       );
-      return json({ account, buyerAddress, recipient, amountUsd: amountUsd.toString(), bridge });
+      logInfo("withdraw.result", {
+        account: redactAddress(account),
+        enabled: bridge.enabled,
+        txHash: redactHash(bridge.txHash)
+      });
+      return json({ account, amountUsd: parsed.data.amountUsd, bridge });
     } catch (error) {
       const message = error instanceof Error ? error.message : "withdraw failed";
+      logError("withdraw.failed", {
+        account: redactAddress(account),
+        message
+      });
       return json({ error: message, account, buyerAddress }, 502);
     }
   }
