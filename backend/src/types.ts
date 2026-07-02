@@ -30,6 +30,7 @@ export type UserCreditProfile = {
   totalOutstandingFundingUsd: string;
   streamFlowRateWeiPerSecond: string;
   lastStreamCreditAt: string;
+  buyer?: string;
 };
 
 export type GdCreditEntry = {

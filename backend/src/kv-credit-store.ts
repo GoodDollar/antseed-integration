@@ -35,7 +35,6 @@ export class KVCreditStore {
     const month = monthKey(input.date ?? new Date());
     const bonus = calculateCreditWithBonus(input.gdAmountWei, input.source, input.isVerified, input.gdPrice);
 
-    // Enforce per-root-account monthly bonus cap
     let effectiveBonusUsd = bonus.bonusUsd;
     if (effectiveBonusUsd > 0n && input.maxBonusCapUsd > 0n) {
       const monthlyBonusUsed = await this.getMonthlyBonusUsed(rootAccount, month);
@@ -73,16 +72,20 @@ export class KVCreditStore {
     if (effectiveBonusUsd > 0n) {
       await this.addMonthlyBonusUsed(rootAccount, month, effectiveBonusUsd);
     }
-    await this.updateUser(account, rootAccount, (current) => ({
-      ...current,
-      rootAccount: rootAccount,
-      createdAt: current.createdAt ?? now,
-      updatedAt: now,
-      streamFlowRateWeiPerSecond: input.flowRate ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
-      totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
-      totalGDStreamedWei: input.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
-      totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd),
-    }));
+    const effectiveBuyer = (entry.buyerAddress ?? account).toLowerCase();
+    await this.updateUser(account, rootAccount, (current) => {
+      assertBuyerMatches(current, effectiveBuyer);
+      return {
+        ...current,
+        rootAccount: rootAccount,
+        createdAt: current.createdAt ?? now,
+        updatedAt: now,
+        streamFlowRateWeiPerSecond: input.flowRate ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
+        totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
+        totalGDStreamedWei: input.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
+        totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd),
+      };
+    });
 
     return entry;
   }
@@ -120,11 +123,46 @@ export class KVCreditStore {
     return entries.filter((item): item is GdCreditEntry => Boolean(item));
   }
 
+  async listGdCredits(
+    account: string,
+    options: { status?: GdCreditEntry["fundingStatus"]; limit?: number; cursor?: string } = {}
+  ): Promise<{ transactions: GdCreditEntry[]; nextCursor?: string }> {
+    const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
+    let entries = await this.getGdCredits(account);
+    if (options.status) {
+      entries = entries.filter((entry) => entry.fundingStatus === options.status);
+    }
+    entries.sort((a, b) => {
+      const byCreatedAt = b.createdAt.localeCompare(a.createdAt);
+      return byCreatedAt !== 0 ? byCreatedAt : b.id.localeCompare(a.id);
+    });
+    if (options.cursor) {
+      const cursorIndex = entries.findIndex((entry) => entry.id === options.cursor);
+      if (cursorIndex >= 0) {
+        entries = entries.slice(cursorIndex + 1);
+      }
+    }
+    const page = entries.slice(0, limit);
+    const nextCursor = entries.length > limit ? page[page.length - 1]?.id : undefined;
+    return { transactions: page, nextCursor };
+  }
 
   async getUser(account: string): Promise<UserCreditProfile> {
     const normalized = normalizeAccount(account);
     const saved = await this.getJson<Partial<UserCreditProfile>>(`${USER_PREFIX}${normalized}`);
     return normalizeProfile(saved, normalized);
+  }
+
+  async setBuyer(account: string, buyerAddress: string, rootAccount?: string): Promise<UserCreditProfile> {
+    const normalized = normalizeAccount(account);
+    const buyer = normalizeAccount(buyerAddress);
+    const root = normalizeAccount(rootAccount ?? account);
+    const now = new Date().toISOString();
+    await this.updateUser(normalized, root, (current) => ({
+      ...assignBuyer(current, buyer),
+      updatedAt: now,
+    }));
+    return this.getUser(normalized);
   }
 
   private async addGdCreditToAccount(account: string, entryId: string): Promise<void> {
@@ -156,6 +194,7 @@ export class KVCreditStore {
     if (normalizedRoot !== normalized) {
       const rootCurrent = await this.getUser(normalizedRoot);
       const rootNext = mutate({ ...rootCurrent, account: normalizedRoot, rootAccount: normalizedRoot });
+      rootNext.buyer = rootCurrent.buyer;
       await this.putJson(`${USER_PREFIX}${normalizedRoot}`, rootNext);
     }
   }
@@ -183,8 +222,27 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalPrincipalUsd: saved?.totalPrincipalUsd ?? "0",
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingUsd: saved?.totalOutstandingFundingUsd ?? "0",
-    lastStreamCreditAt: saved?.lastStreamCreditAt ?? "1970-01-01T00:00:00.000Z",
+    lastStreamCreditAt: saved?.lastStreamCreditAt ?? createdAt,
+    buyer: normalizeBuyer(saved?.buyer),
   };
+}
+
+function normalizeBuyer(buyer: string | undefined): string | undefined {
+  return buyer ? buyer.toLowerCase() : undefined;
+}
+
+function assignBuyer(profile: UserCreditProfile, buyer: string): UserCreditProfile {
+  const normalized = buyer.toLowerCase();
+  if (!profile.buyer) return { ...profile, buyer: normalized };
+  if (profile.buyer === normalized) return profile;
+  throw new Error(`payer ${profile.account} is linked to buyer ${profile.buyer}, cannot use ${normalized}`);
+}
+
+function assertBuyerMatches(profile: UserCreditProfile, buyer: string): void {
+  const normalized = buyer.toLowerCase();
+  if (profile.buyer && profile.buyer !== normalized) {
+    throw new Error(`payer ${profile.account} is linked to buyer ${profile.buyer}, cannot credit buyer ${normalized}`);
+  }
 }
 
 function normalizeAccount(account: string): string {
@@ -194,4 +252,3 @@ function normalizeAccount(account: string): string {
 function addDecimalStrings(a: string, b: string): string {
   return (BigInt(a) + BigInt(b)).toString();
 }
-

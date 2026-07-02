@@ -37,6 +37,12 @@ export function gdWeiToUsd(gdAmountWei: bigint, gdPrice: number): bigint {
   return (gdAmountWei * usdPerToken) / 1_000_000_000_000_000_000n;
 }
 
+export function usdToGdWei(usdAmount: bigint, gdPrice: number): bigint {
+  const usdPerToken = BigInt(Math.round(gdPrice * 1e6));
+  if (usdPerToken <= 0n) return 0n;
+  return (usdAmount * 1_000_000_000_000_000_000n) / usdPerToken;
+}
+
 export function monthlyStreamUsd(flowRateWeiPerSecond: bigint, gdPrice: number): bigint {
   return gdWeiToUsd(flowRateWeiPerSecond * BigInt(30 * 24 * 60 * 60), gdPrice);
 }
