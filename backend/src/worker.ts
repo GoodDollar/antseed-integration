@@ -8,6 +8,7 @@ import { parseEther } from "ethers";
 import { assertWithdrawTimestampFresh, buildWithdrawPrincipalPayload, recoverWithdrawPrincipalSigner } from "./withdraw-auth.js";
 import { recoverSetOperatorSigner } from "./operator-auth.js";
 import { quoteCreditToGd, quoteGdToCredit } from "./quote.js";
+import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 
 const CeloEventsRecordSchema = z.object({
   txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
@@ -68,22 +69,49 @@ type SuperfluidIncomingStream = {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const startedAt = Date.now();
+    const url = new URL(request.url);
+    logInfo("request.start", {
+      method: request.method,
+      path: url.pathname
+    });
     try {
-      return await route(request, env, ctx);
+      const response = await route(request, env, ctx);
+      logInfo("request.end", {
+        method: request.method,
+        path: url.pathname,
+        status: response.status,
+        elapsedMs: Date.now() - startedAt
+      });
+      return response;
     } catch (err) {
-      const message = err instanceof Error ? err.message : "unknown error";
-      console.error(message, err);
+      const message = errorMessage(err);
+      logError("request.error", {
+        method: request.method,
+        path: url.pathname,
+        elapsedMs: Date.now() - startedAt,
+        message
+      });
       return json({ error: message }, 500);
     }
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const startedAt = Date.now();
     const cfg = configFromEnv(env);
     const store = new KVCreditStore(env.ANTSEED_KV);
     const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
 
+    logInfo("cron.start", {
+      bridgeEnabled: antseedFundingVault.enabled
+    });
 
     const gdPrice = await fetchCurrentGdPrice(cfg);
     const streams = await fetchSuperfluidIncomingStreams(cfg);
+    let skippedCooldown = 0;
+    let skippedMinAmount = 0;
+    let processed = 0;
+    let funded = 0;
+    let failed = 0;
     const createdAt = new Date().toISOString();
     for (const stream of streams) {
       const profile = await store.getUser(stream.account);
@@ -91,7 +119,12 @@ export default {
       const lastCreditMs = Date.parse(profile.lastStreamCreditAt);
       const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));
       const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
-      if (elapsedSeconds < 60 * 60 * 24 || gdAmountWei < MIN_STREAM_BONUS) { // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
+      if (elapsedSeconds < 60 * 60 * 24) {
+        skippedCooldown += 1;
+        continue;
+      }
+      if (gdAmountWei < MIN_STREAM_BONUS) {
+        skippedMinAmount += 1;
         continue;
       }
       const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
@@ -108,8 +141,23 @@ export default {
         maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
         buyerAddress: stream.buyerAddress
       });
-      ctx.waitUntil(fundCredit(entry, store, antseedFundingVault));
+      processed += 1;
+      ctx.waitUntil(
+        fundCredit(entry, store, antseedFundingVault).then((result) => {
+          if (result.fundingStatus === "funded") funded += 1;
+          if (result.fundingStatus === "failed") failed += 1;
+        })
+      );
     }
+    logInfo("cron.summary", {
+      streamCount: streams.length,
+      processed,
+      skippedCooldown,
+      skippedMinAmount,
+      funded,
+      failed,
+      elapsedMs: Date.now() - startedAt
+    });
   }
 }
 
@@ -277,9 +325,21 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const body = await parseJson(request);
     const parsed = CeloEventsRecordSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    logInfo("celo.events.record.start", {
+      mode: parsed.data.txHash ? "txHash" : "accountRange",
+      txHash: redactHash(parsed.data.txHash),
+      account: redactAddress(parsed.data.account),
+      fromBlock: parsed.data.fromBlock,
+      toBlock: parsed.data.toBlock ?? "latest"
+    });
     const events = parsed.data.txHash
       ? await fetchCeloVaultEvents(parsed.data.txHash, cfg)
       : await fetchCeloVaultEventsForAccount(parsed.data.account!, cfg, parsed.data.fromBlock!, parsed.data.toBlock ?? "latest");
+    logInfo("celo.events.record.fetched", {
+      count: events.length,
+      txHash: redactHash(parsed.data.txHash),
+      account: redactAddress(parsed.data.account)
+    });
     const recorded = [];
     const gdPrice = await fetchCurrentGdPrice(cfg);
     for (const event of events) {
@@ -300,6 +360,14 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           buyerAddress: event.buyer
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
+        logInfo("celo.events.record.entry", {
+          kind: event.kind,
+          entryId: entry.id,
+          account: redactAddress(entry.account),
+          rootAccount: redactAddress(entry.rootAccount),
+          buyer: redactAddress(entry.buyerAddress),
+          fundingStatus: String(res.fundingStatus)
+        });
         recorded.push(res);
       } else {
         const depositId = `${event.txHash}:${event.logIndex}`;
@@ -318,9 +386,22 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           buyerAddress: event.buyer
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
+        logInfo("celo.events.record.entry", {
+          kind: event.kind,
+          entryId: entry.id,
+          account: redactAddress(entry.account),
+          rootAccount: redactAddress(entry.rootAccount),
+          buyer: redactAddress(entry.buyerAddress),
+          fundingStatus: String(res.fundingStatus)
+        });
         recorded.push(res);
       }
     }
+    logInfo("celo.events.record.end", {
+      count: recorded.length,
+      txHash: redactHash(parsed.data.txHash),
+      account: redactAddress(parsed.data.account)
+    });
     return json({
       txHash: parsed.data.txHash,
       account: parsed.data.account?.toLowerCase(),
@@ -438,7 +519,16 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const rootAccount = await fetchGoodIdRoot(account, cfg);
     const isVerified = !!rootAccount;
     const streams = await fetchSuperfluidStreamsForAccount(account, cfg);
+    logInfo("stream.credits.start", {
+      account: redactAddress(account),
+      rootAccount: redactAddress(rootAccount),
+      streamCount: streams.length,
+      isVerified
+    });
     if (streams.length === 0) {
+      logInfo("stream.credits.empty", {
+        account: redactAddress(account)
+      });
       return json({ account, streams: [], message: "no active streams found" });
     }
 
@@ -448,13 +538,19 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));
 
     if (elapsedSeconds < 60 * 60 * 24) { // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
+      logInfo("stream.credits.cooldown", {
+        account: redactAddress(account),
+        elapsedSeconds
+      });
       return json({ account, streams: [], message: "stream credits were issued less than 60 seconds ago" });
     }
 
     const recorded = [];
+    let skippedMinAmount = 0;
     for (const stream of streams) {
       const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
       if (gdAmountWei <= MIN_STREAM_BONUS) {
+        skippedMinAmount += 1;
         recorded.push({message: `stream credit amount ${gdAmountWei} is below minimum ${MIN_STREAM_BONUS}`});
         continue;
       }
@@ -473,11 +569,23 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         buyerAddress: stream.buyerAddress
       });
       const res = await fundCredit(entry, store, antseedFundingVault);
+      logInfo("stream.credits.entry", {
+        entryId: entry.id,
+        account: redactAddress(entry.account),
+        buyer: redactAddress(entry.buyerAddress),
+        fundingStatus: String(res.fundingStatus)
+      });
       recorded.push(res);
     }
     if (recorded.length === 0) {
       return json({ account, streams: [], message: "stream credits already issued today" });
     }
+    logInfo("stream.credits.end", {
+      account: redactAddress(account),
+      elapsedSeconds,
+      recordedCount: recorded.length,
+      skippedMinAmount
+    });
     return json({ account, elapsedSeconds, streams: recorded });
   }
 
@@ -552,6 +660,24 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       const message = error instanceof Error ? error.message : "withdraw failed";
       return json({ error: message, account, buyerAddress }, 502);
     }
+    logInfo("withdraw.request", {
+      account: redactAddress(account),
+      amountUsd: parsed.data.amount,
+      recipient: redactAddress(parsed.data.recipient)
+    });
+    const bridge = await antseedFundingVault.withdrawPrincipalForBuyer(
+      account,
+      BigInt(parsed.data.amount),
+      parsed.data.recipient,
+      parsed.data.timestamp,
+      parsed.data.signature
+    );
+    logInfo("withdraw.result", {
+      account: redactAddress(account),
+      enabled: bridge.enabled,
+      txHash: redactHash(bridge.txHash)
+    });
+    return json({ account, amountUsd: parsed.data.amount, bridge });
   }
 
   const channelOpMatch = url.pathname.match(/^\/v1\/channels\/(0x[0-9a-fA-F]{64})\/(close|withdraw)$/);
@@ -562,9 +688,21 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const parsed = ChannelOpSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
     const { timestamp, signature } = parsed.data;
+    logInfo("channel.request", {
+      action,
+      channelId: redactHash(channelId),
+      hasTimestamp: timestamp !== undefined,
+      hasSignature: Boolean(signature)
+    });
     const bridge = action === "close"
       ? await antseedFundingVault.requestClose(channelId, timestamp, signature)
       : await antseedFundingVault.withdrawFromChannel(channelId, timestamp, signature);
+    logInfo("channel.result", {
+      action,
+      channelId: redactHash(channelId),
+      enabled: bridge.enabled,
+      txHash: redactHash(bridge.txHash)
+    });
     return json({ channelId, action, bridge });
   }
 
@@ -608,6 +746,15 @@ async function fundCredit(
     throw new Error(`cannot fund credit with status ${entry.fundingStatus}`);
   }
   const buyer = entry.buyerAddress || entry.account;
+  logInfo("funding.start", {
+    entryId: entry.id,
+    source: entry.source,
+    account: redactAddress(entry.account),
+    buyer: redactAddress(buyer),
+    principalUsd: entry.principalUsd,
+    bonusUsd: entry.bonusUsd,
+    totalCreditUsd: entry.totalCreditUsd
+  });
   try {
     const bridge = await antseedFundingVault.depositForBuyerWithId(
       buyer,
@@ -615,11 +762,31 @@ async function fundCredit(
       BigInt(entry.bonusUsd),
       entry.id
     );
+    if (!bridge.enabled) {
+      logWarn("funding.bridge.disabled", {
+        entryId: entry.id,
+        source: entry.source,
+        buyer: redactAddress(buyer)
+      });
+    }
     const updated = await store.markFundingResult(entry, { funded: true, txHash: bridge.txHash });
+    logInfo("funding.success", {
+      entryId: entry.id,
+      source: entry.source,
+      buyer: redactAddress(buyer),
+      txHash: redactHash(bridge.txHash),
+      bridgeEnabled: bridge.enabled
+    });
     return { ...updated, bridge };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "deposit funding failed";
-    console.error("stream/deferred funding failed", { account: entry.account, entryId: entry.id, message });
+    const message = errorMessage(error);
+    logError("funding.failed", {
+      entryId: entry.id,
+      source: entry.source,
+      account: redactAddress(entry.account),
+      buyer: redactAddress(buyer),
+      message
+    });
     const updated = await store.markFundingResult(entry, { funded: false, error: message });
     return {
       ...updated,
@@ -645,6 +812,12 @@ async function fetchSuperfluidStreamsForAccount(account: string, cfg: ReturnType
 
 async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, senderFilter?: string): Promise<SuperfluidIncomingStream[]> {
   if (!cfg.CELO_VAULT_ADDRESS || !cfg.CELO_GD_SUPERTOKEN_ADDRESS) {
+    logWarn("superfluid.streams.skipped", {
+      reason: "missing_config",
+      hasVaultAddress: Boolean(cfg.CELO_VAULT_ADDRESS),
+      hasSuperTokenAddress: Boolean(cfg.CELO_GD_SUPERTOKEN_ADDRESS),
+      senderFilter: redactAddress(senderFilter)
+    });
     return [];
   }
 
@@ -654,6 +827,14 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
   const pageSize = 500;
   let skip = 0;
   const streams: SuperfluidIncomingStream[] = [];
+  let pages = 0;
+
+  logInfo("superfluid.streams.fetch.start", {
+    endpoint,
+    receiver: redactAddress(receiver),
+    token: redactAddress(token),
+    senderFilter: redactAddress(senderFilter)
+  });
 
   try {
     while (true) {
@@ -721,20 +902,29 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
       });
 
       streams.push(...batch);
+      pages += 1;
 
       if (batch.length < pageSize) break;
       skip += pageSize;
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown Superfluid stream fetch error";
-    console.error("failed fetching incoming Superfluid streams", {
+    const message = errorMessage(error);
+    logError("superfluid.streams.fetch.failed", {
       endpoint,
-      receiver,
-      token,
+      receiver: redactAddress(receiver),
+      token: redactAddress(token),
+      senderFilter: redactAddress(senderFilter),
       message
     });
     return [];
   }
+
+  logInfo("superfluid.streams.fetch.end", {
+    endpoint,
+    senderFilter: redactAddress(senderFilter),
+    pages,
+    count: streams.length
+  });
 
   return streams;
 }

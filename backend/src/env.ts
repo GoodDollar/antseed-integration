@@ -1,3 +1,5 @@
+import { parseEther, parseUnits } from "ethers";
+
 export interface Env {
   ANTSEED_KV: KVNamespace;
 
@@ -45,7 +47,7 @@ export function configFromEnv(env: Env): RuntimeConfig {
     CELO_STATIC_ORACLE_ADDRESS: env.CELO_STATIC_ORACLE_ADDRESS,
     CELO_CUSD_ADDRESS: env.CELO_CUSD_ADDRESS,
     SUPERFLUID_SUBGRAPH_URL: env.SUPERFLUID_SUBGRAPH_URL,
-    MAX_BONUS_CAP_USD: bigintEnv(env.MAX_BONUS_CAP_USD, 100_000_000n)
+    MAX_BONUS_CAP_USD: parseUnits(env.MAX_BONUS_CAP_USD || "100",18),
   };
 }
 

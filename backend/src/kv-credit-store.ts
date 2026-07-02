@@ -1,5 +1,6 @@
 import { calculateCreditWithBonus, monthKey } from "./credit-bonus.js";
 import { GdCreditEntry, UserCreditProfile } from "./types.js";
+import { logInfo, logWarn, redactAddress } from "./logging.js";
 
 type KV = Pick<KVNamespace, "get" | "put">;
 
@@ -31,7 +32,15 @@ export class KVCreditStore {
     const rootAccount = normalizeAccount(input.rootAccount ?? input.account);
     const entryId = input.id;
     const existing = await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${entryId}`);
-    if (existing) return existing;
+    if (existing) {
+      logWarn("kv.credit.idempotent-hit", {
+        entryId,
+        account: redactAddress(account),
+        source: input.source,
+        existingStatus: existing.fundingStatus
+      });
+      return existing;
+    }
     const month = monthKey(input.date ?? new Date());
     const bonus = calculateCreditWithBonus(input.gdAmountWei, input.source, input.isVerified, input.gdPrice);
 
@@ -42,6 +51,12 @@ export class KVCreditStore {
         ? input.maxBonusCapUsd - monthlyBonusUsed
         : 0n;
       if (effectiveBonusUsd > remainingCap) {
+        logInfo("kv.credit.bonus-capped", {
+          entryId,
+          rootAccount: redactAddress(rootAccount),
+          requestedBonusUsd: effectiveBonusUsd.toString(),
+          remainingCapUsd: remainingCap.toString()
+        });
         effectiveBonusUsd = remainingCap;
       }
     }
@@ -87,11 +102,29 @@ export class KVCreditStore {
       };
     });
 
+    logInfo("kv.credit.recorded", {
+      entryId: entry.id,
+      account: redactAddress(entry.account),
+      rootAccount: redactAddress(entry.rootAccount),
+      source: entry.source,
+      principalUsd: entry.principalUsd,
+      bonusUsd: entry.bonusUsd,
+      totalCreditUsd: entry.totalCreditUsd,
+      hasBuyer: Boolean(entry.buyerAddress)
+    });
+
     return entry;
   }
 
   async markFundingResult(entry: GdCreditEntry, result: { funded: boolean; id?: string; txHash?: string; error?: string }): Promise<GdCreditEntry> {
-    if (entry.fundingStatus === "funded" || entry.fundingStatus === "failed") return entry;
+    if (entry.fundingStatus === "funded" || entry.fundingStatus === "failed") {
+      logWarn("kv.funding.already-terminal", {
+        entryId: entry.id,
+        account: redactAddress(entry.account),
+        fundingStatus: entry.fundingStatus
+      });
+      return entry;
+    }
 
     entry.fundingStatus = result.funded ? "funded" : "failed";
     entry.fundingTxHash = result.txHash;
@@ -113,6 +146,14 @@ export class KVCreditStore {
         };
       });
     }
+    logInfo("kv.funding.result", {
+      entryId: entry.id,
+      account: redactAddress(entry.account),
+      source: entry.source,
+      fundingStatus: entry.fundingStatus,
+      txHash: result.txHash,
+      error: result.error
+    });
     return entry;
   }
 
