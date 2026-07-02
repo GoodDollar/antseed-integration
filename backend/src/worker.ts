@@ -660,24 +660,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       const message = error instanceof Error ? error.message : "withdraw failed";
       return json({ error: message, account, buyerAddress }, 502);
     }
-    logInfo("withdraw.request", {
-      account: redactAddress(account),
-      amountUsd: parsed.data.amount,
-      recipient: redactAddress(parsed.data.recipient)
-    });
-    const bridge = await antseedFundingVault.withdrawPrincipalForBuyer(
-      account,
-      BigInt(parsed.data.amount),
-      parsed.data.recipient,
-      parsed.data.timestamp,
-      parsed.data.signature
-    );
-    logInfo("withdraw.result", {
-      account: redactAddress(account),
-      enabled: bridge.enabled,
-      txHash: redactHash(bridge.txHash)
-    });
-    return json({ account, amountUsd: parsed.data.amount, bridge });
   }
 
   const channelOpMatch = url.pathname.match(/^\/v1\/channels\/(0x[0-9a-fA-F]{64})\/(close|withdraw)$/);
