@@ -29,7 +29,7 @@ export type UserCreditProfile = {
   totalGDStreamedWei: string;
   totalOutstandingFundingUsd: string;
   streamFlowRateWeiPerSecond: string;
-  lastStreamCreditAt: string;
+  lastStreamCreditAt: string | undefined;
 };
 
 export type GdCreditEntry = {

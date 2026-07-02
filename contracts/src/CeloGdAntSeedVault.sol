@@ -6,7 +6,9 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 
 interface IERC20Like {
     function transfer(address to, uint256 amount) external returns (bool);
+
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+
     function balanceOf(address account) external view returns (uint256);
 }
 
@@ -26,14 +28,16 @@ interface ISuperfluidHostLike {
     }
 
     function registerApp(uint256 configWord) external;
+
     function decodeCtx(bytes calldata ctx) external pure returns (Context memory context);
 }
 
 interface IConstantFlowAgreementV1Like {
-    function getFlow(address token, address sender, address receiver)
-        external
-        view
-        returns (uint256 timestamp, int96 flowRate, uint256 deposit, uint256 owedDeposit);
+    function getFlow(
+        address token,
+        address sender,
+        address receiver
+    ) external view returns (uint256 timestamp, int96 flowRate, uint256 deposit, uint256 owedDeposit);
 }
 
 interface IStaticOracleLike {
@@ -50,7 +54,6 @@ interface IStaticOracleLike {
 /// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
 ///      and Superfluid SuperApp stream callbacks. Backend converts G$ events into USDC-denominated credits.
 contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
-
     error NotOwner();
     error ZeroAddress();
     error ZeroAmount();
@@ -75,8 +78,8 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     uint256 public fallbackGdUsdPerToken;
 
     mapping(address => uint256) public totalDepositedGd;
-    mapping(address => int96) public streamFlowRate;
-    mapping(address => uint256) public streamMonthlyGdAmount;
+    mapping(address => int96) private _unsued_streamFlowRate;
+    mapping(address => uint256) private _unused_streamMonthlyGdAmount;
     /// @notice AntSeed buyer account funded when stream credits are settled for each sender.
     mapping(address => address) public streamBuyer;
     /// @notice cUSD quote token address used by the static oracle.
@@ -119,8 +122,10 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         owner = owner_;
         superfluidHost = superfluidHost_;
         cfaV1 = cfaV1_;
-        minFirstDepositUsd = 1e18;
-        minMonthlyStreamUsd = 1e18;
+        minFirstDepositUsd = 1e18; // 1$
+        minMonthlyStreamUsd = 1e18; // 1$
+        staticOracle = address(0x00851A91a3c4E9a4c1B48df827Bacc1f884bdE28); // Celo Static Oracle
+        staticOracleCusd = address(0x765DE816845861e75A25fCA122bb6898B8B1282a); // cUSD
         fallbackGdUsdPerToken = 9000e18; // 1$ = 9000 G$ (0.0001111 USD per G$)
 
         emit OwnershipTransferred(address(0), owner_);
@@ -167,13 +172,8 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     /// @notice Classic ERC-20 deposit path. ERC677/777 callbacks below provide single-transaction deposits.
     /// @param data ABI-encoded AntSeed buyer address: `abi.encode(buyerAddress)`. Required.
     function deposit(uint256 amount, bytes calldata data) external returns (uint256) {
-        if (amount == 0) revert ZeroAmount();
-        address buyer = _decodeBuyer(data);
-        if (buyer == address(0)) revert MissingBuyerAddress();
-        if (totalDepositedGd[msg.sender] == 0 && gdUsdPerToken(uint128(amount)) < minFirstDepositUsd) revert FirstDepositBelowMinimum();
-        totalDepositedGd[msg.sender] += amount;
+        _recordTokenCallbackDeposit(msg.sender, amount, data);
         _safeTransferFrom(msg.sender, address(this), amount);
-        emit GdDeposited(msg.sender, buyer, amount, data);
         return totalDepositedGd[msg.sender];
     }
 
@@ -191,14 +191,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
 
     /// @notice ERC777 tokensReceived hook. Register this implementer in ERC1820 when using ERC777 delivery.
     /// @dev `userData` must be `abi.encode(buyerAddress)` — the AntSeed buyer to credit.
-    function tokensReceived(
-        address,
-        address from,
-        address to,
-        uint256 amount,
-        bytes calldata userData,
-        bytes calldata
-    ) external onlyGdToken {
+    function tokensReceived(address, address from, address to, uint256 amount, bytes calldata userData, bytes calldata) external onlyGdToken {
         if (to != address(this)) revert WrongReceiver();
         _recordTokenCallbackDeposit(from, amount, userData);
     }
@@ -269,7 +262,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        (address sender,) = abi.decode(agreementData, (address, address));
+        (address sender, ) = abi.decode(agreementData, (address, address));
         address buyer = streamBuyer[sender];
         _recordStream(superToken, agreementClass, agreementData, cbdata, buyer);
         return ctx;
@@ -284,15 +277,10 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         emit GdDeposited(account, buyer, amount, data);
     }
 
-    function _recordStream(
-        address superToken,
-        address agreementClass,
-        bytes calldata agreementData,
-        bytes calldata cbdata,
-        address buyer
-    ) private {
+    function _recordStream(address superToken, address agreementClass, bytes calldata agreementData, bytes calldata cbdata, address buyer) private {
         if (superToken != address(gdToken)) revert UnsupportedToken();
         if (agreementClass != cfaV1) revert UnsupportedAgreement();
+        if (buyer == address(0)) revert MissingBuyerAddress();
 
         (address sender, address receiver) = abi.decode(agreementData, (address, address));
         if (receiver != address(this)) revert WrongReceiver();
@@ -300,13 +288,11 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         streamBuyer[sender] = buyer;
 
         (uint256 previousTimestamp, int96 previousFlowRate) = _decodeFlowSnapshot(cbdata);
-        (uint256 currentTimestamp, int96 flowRate,,) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
+        (uint256 currentTimestamp, int96 flowRate, , ) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
         if (flowRate < 0) revert NegativeFlowRate();
 
-        streamFlowRate[sender] = flowRate;
         uint256 monthlyAmount = uint256(uint96(flowRate)) * 30 days;
         if (monthlyAmount > 0 && gdUsdPerToken(uint128(monthlyAmount)) < minMonthlyStreamUsd) revert StreamRateBelowMinimum();
-        streamMonthlyGdAmount[sender] = monthlyAmount;
 
         uint256 elapsedSeconds = currentTimestamp > previousTimestamp ? currentTimestamp - previousTimestamp : 0;
         uint256 totalFlow = 0;
@@ -317,11 +303,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         emit StreamUpdated(sender, buyer, flowRate, monthlyAmount, totalFlow);
     }
 
-    function _currentFlowSnapshot(address superToken, address agreementClass, bytes calldata agreementData)
-        private
-        view
-        returns (bytes memory cbdata)
-    {
+    function _currentFlowSnapshot(address superToken, address agreementClass, bytes calldata agreementData) private view returns (bytes memory cbdata) {
         if (superToken != address(gdToken) || agreementClass != cfaV1) {
             return abi.encode(uint256(0), int96(0));
         }
@@ -331,7 +313,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
             return abi.encode(uint256(0), int96(0));
         }
 
-        (uint256 timestamp, int96 flowRate,,) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
+        (uint256 timestamp, int96 flowRate, , ) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
         return abi.encode(timestamp, flowRate);
     }
 
@@ -351,8 +333,6 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
     }
 
-
-
     /// @notice Returns the current G$ price in USD units (same denomination as minFirstDepositUsd).
     ///         Queries the static oracle if configured; falls back to fallbackGdUsdPerToken.
     function gdUsdPerToken(uint128 amount) public view returns (uint256) {
@@ -360,22 +340,18 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         address cusd = staticOracleCusd;
         if (oracle != address(0) && cusd != address(0)) {
             (bool ok, bytes memory data) = oracle.staticcall(
-                abi.encodeWithSelector(
-                    IStaticOracleLike.quoteAllAvailablePoolsWithTimePeriod.selector,
-                    uint128(amount),
-                    address(gdToken),
-                    cusd,
-                    uint32(60)
-                )
+                abi.encodeWithSelector(IStaticOracleLike.quoteAllAvailablePoolsWithTimePeriod.selector, uint128(amount), address(gdToken), cusd, uint32(60))
             );
             if (ok && data.length >= 32) {
                 uint256 quoteAmount;
-                assembly { quoteAmount := mload(add(data, 32)) }
+                assembly {
+                    quoteAmount := mload(add(data, 32))
+                }
                 if (quoteAmount > 0) {
                     return quoteAmount;
                 }
             }
         }
-        return amount * 1e18/ fallbackGdUsdPerToken;
+        return (amount * 1e18) / fallbackGdUsdPerToken;
     }
 }

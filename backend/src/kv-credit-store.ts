@@ -10,8 +10,7 @@ const USER_GD_CREDITS_PREFIX = "user-gd-credits:";
 const MONTHLY_BONUS_PREFIX = "monthly-bonus:";
 
 export class KVCreditStore {
-  constructor(private readonly kv: KV) { }
-
+  constructor(private readonly kv: KV) {}
 
   async recordGdCredit(input: {
     id: string;
@@ -37,7 +36,7 @@ export class KVCreditStore {
         entryId,
         account: redactAddress(account),
         source: input.source,
-        existingStatus: existing.fundingStatus
+        existingStatus: existing.fundingStatus,
       });
       return existing;
     }
@@ -48,15 +47,13 @@ export class KVCreditStore {
     let effectiveBonusUsd = bonus.bonusUsd;
     if (effectiveBonusUsd > 0n && input.maxBonusCapUsd > 0n) {
       const monthlyBonusUsed = await this.getMonthlyBonusUsed(rootAccount, month);
-      const remainingCap = input.maxBonusCapUsd > monthlyBonusUsed
-        ? input.maxBonusCapUsd - monthlyBonusUsed
-        : 0n;
+      const remainingCap = input.maxBonusCapUsd > monthlyBonusUsed ? input.maxBonusCapUsd - monthlyBonusUsed : 0n;
       if (effectiveBonusUsd > remainingCap) {
         logInfo("kv.credit.bonus-capped", {
           entryId,
           rootAccount: redactAddress(rootAccount),
           requestedBonusUsd: effectiveBonusUsd.toString(),
-          remainingCapUsd: remainingCap.toString()
+          remainingCapUsd: remainingCap.toString(),
         });
         effectiveBonusUsd = remainingCap;
       }
@@ -77,7 +74,9 @@ export class KVCreditStore {
       ...(input.logIndex !== undefined && { logIndex: input.logIndex }),
       fundingStatus: "pending",
       createdAt: now,
-      ...(input.buyerAddress && { buyerAddress: input.buyerAddress.toLowerCase() })
+      ...(input.buyerAddress && {
+        buyerAddress: input.buyerAddress.toLowerCase(),
+      }),
     };
 
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
@@ -107,7 +106,8 @@ export class KVCreditStore {
       principalUsd: entry.principalUsd,
       bonusUsd: entry.bonusUsd,
       totalCreditUsd: entry.totalCreditUsd,
-      hasBuyer: Boolean(entry.buyerAddress)
+      buyer: entry.buyerAddress,
+      input,
     });
 
     return entry;
@@ -118,7 +118,7 @@ export class KVCreditStore {
       logWarn("kv.funding.already-terminal", {
         entryId: entry.id,
         account: redactAddress(entry.account),
-        fundingStatus: entry.fundingStatus
+        fundingStatus: entry.fundingStatus,
       });
       return entry;
     }
@@ -149,7 +149,7 @@ export class KVCreditStore {
       source: entry.source,
       fundingStatus: entry.fundingStatus,
       txHash: result.txHash,
-      error: result.error
+      error: result.error,
     });
     return entry;
   }
@@ -160,7 +160,6 @@ export class KVCreditStore {
     const entries = await Promise.all(ids.map((id) => this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`)));
     return entries.filter((item): item is GdCreditEntry => Boolean(item));
   }
-
 
   async getUser(account: string): Promise<UserCreditProfile> {
     const normalized = normalizeAccount(account);
@@ -196,7 +195,11 @@ export class KVCreditStore {
 
     if (normalizedRoot !== normalized) {
       const rootCurrent = await this.getUser(normalizedRoot);
-      const rootNext = mutate({ ...rootCurrent, account: normalizedRoot, rootAccount: normalizedRoot });
+      const rootNext = mutate({
+        ...rootCurrent,
+        account: normalizedRoot,
+        rootAccount: normalizedRoot,
+      });
       await this.putJson(`${USER_PREFIX}${normalizedRoot}`, rootNext);
     }
   }
@@ -224,7 +227,7 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalPrincipalUsd: saved?.totalPrincipalUsd ?? "0",
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingUsd: saved?.totalOutstandingFundingUsd ?? "0",
-    lastStreamCreditAt: saved?.lastStreamCreditAt ?? "1970-01-01T00:00:00.000Z",
+    lastStreamCreditAt: saved?.lastStreamCreditAt,
   };
 }
 
@@ -235,4 +238,3 @@ function normalizeAccount(account: string): string {
 function addDecimalStrings(a: string, b: string): string {
   return (BigInt(a) + BigInt(b)).toString();
 }
-

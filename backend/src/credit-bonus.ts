@@ -31,7 +31,12 @@ export function calculateCreditWithBonus(gdAmountWei: bigint, source: GdCreditEn
     totalCreditUsd: principalUsd + bonusUsd,
   };
 }
-
+/**
+ * convert to USDC 6 decimals
+ * @param gdAmountWei 
+ * @param gdPrice 
+ * @returns 
+ */
 export function gdWeiToUsd(gdAmountWei: bigint, gdPrice: number): bigint {
   const usdPerToken = BigInt(Math.round(gdPrice * 1e6));
   return (gdAmountWei * usdPerToken) / 1_000_000_000_000_000_000n;
