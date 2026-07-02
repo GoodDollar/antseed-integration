@@ -44,6 +44,10 @@ const WithdrawPrincipalSchema = z.object({
   timestamp: z.number().int().nonnegative(),
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
+const OperatorConsentSchema = z.object({
+  nonce: z.string().regex(/^\d+$/),
+  signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
+});
 const ChannelOpSchema = z.object({
   timestamp: z.number().int().nonnegative().optional(),
   signature: z
@@ -411,6 +415,29 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       skippedMinAmount
     });
     return json({ account, elapsedSeconds, streams: recorded });
+  }
+
+  const operatorConsentMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator-consent$/);
+  if (request.method === "POST" && operatorConsentMatch) {
+    const buyer = decodeURIComponent(operatorConsentMatch[1]).toLowerCase();
+    const body = await parseJson(request);
+    const parsed = OperatorConsentSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    logInfo("operator.consent.request", {
+      buyer: redactAddress(buyer),
+      nonce: parsed.data.nonce
+    });
+    const bridge = await antseedFundingVault.acceptBuyerOperator(
+      buyer,
+      BigInt(parsed.data.nonce),
+      parsed.data.signature
+    );
+    logInfo("operator.consent.result", {
+      buyer: redactAddress(buyer),
+      enabled: bridge.enabled,
+      txHash: redactHash(bridge.txHash)
+    });
+    return json({ buyer, bridge });
   }
 
   const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);
