@@ -64,8 +64,17 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 **Outstanding funding** (`GET /v1/accounts/:account/outstanding`):
 - returns `totalOutstandingFundingUsd` and all `GdCreditEntry` records with `fundingStatus = "pending"` or `"failed"`
 
-**Channel close** (`POST /v1/channels/close`):
-- calls `AntseedBuyerOperator.requestClose(channelId)`
+**Principal withdraw** (`POST /v1/accounts/:account/withdraw`):
+- body: `amount` (USDC micro-units), `recipient`, `timestamp`, buyer EIP-712 `signature`
+- calls `AntseedBuyerOperator.withdrawPrincipal(buyer, amount, recipient, timestamp, buyerSig)`
+
+**Channel close** (`POST /v1/channels/:channelId/close`):
+- optional buyer EIP-712 `RequestClose` (`timestamp`, `signature`) or operator-as-owner when unsigned
+- calls `AntseedBuyerOperator.requestClose(channelId, …)`
+
+**Channel withdraw** (`POST /v1/channels/:channelId/withdraw`):
+- optional buyer EIP-712 `WithdrawChannel` (`timestamp`, `signature`) or operator-as-owner when unsigned
+- calls `AntseedBuyerOperator.withdrawChannel(channelId, …)`
 
 **Funding path** (`fundCredit`):
 - calls `AntSeedFundingVaultClient.depositForBuyerWithId(buyer, principal, bonus, id)` — uses the `buyer` from the credit entry, or falls back to `account`
