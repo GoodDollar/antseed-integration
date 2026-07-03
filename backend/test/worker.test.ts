@@ -28,14 +28,14 @@ function env(overrides: Partial<Env> = {}): Env {
 test("health exposes bridge status", async () => {
   const res = await worker.fetch(new Request("https://worker.test/health"), env(), {} as ExecutionContext);
   assert.equal(res.status, 200);
-  const body = await res.json() as { bridgeEnabled: boolean };
+  const body = (await res.json()) as { bridgeEnabled: boolean };
   assert.equal(body.bridgeEnabled, false);
 });
 
 test("config status documents celo-to-base bridge mode", async () => {
   const res = await worker.fetch(new Request("https://worker.test/config/status"), env(), {} as ExecutionContext);
   assert.equal(res.status, 200);
-  const body = await res.json() as {
+  const body = (await res.json()) as {
     bridge: { celoVaultEvents: boolean; baseBuyerOperatorEnabled: boolean; mode: string };
   };
   assert.equal(body.bridge.celoVaultEvents, true);
@@ -46,13 +46,9 @@ test("config status documents celo-to-base bridge mode", async () => {
 test("GET /v1/accounts/:account/credit returns profile and gdCredits", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(
-    new Request(`https://worker.test/v1/accounts/${account}/credit`),
-    testEnv,
-    {} as ExecutionContext
-  );
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit`), testEnv, {} as ExecutionContext);
   assert.equal(res.status, 200);
-  const body = await res.json() as { account: string; profile: { totalGdDepositedWei: string }; gdCredits: unknown[] };
+  const body = (await res.json()) as { account: string; profile: { totalGdDepositedWei: string }; gdCredits: unknown[] };
   assert.equal(body.account, account);
   assert.equal(body.profile.totalGdDepositedWei, "0");
   assert.equal(body.gdCredits.length, 0);
@@ -61,13 +57,9 @@ test("GET /v1/accounts/:account/credit returns profile and gdCredits", async () 
 test("GET /v1/accounts/:account/outstanding returns outstanding funding info", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(
-    new Request(`https://worker.test/v1/accounts/${account}/outstanding`),
-    testEnv,
-    {} as ExecutionContext
-  );
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/outstanding`), testEnv, {} as ExecutionContext);
   assert.equal(res.status, 200);
-  const body = await res.json() as { account: string; outstandingFundingUsd: string; failedFundingCredits: unknown[] };
+  const body = (await res.json()) as { account: string; outstandingFundingUsd: string; failedFundingCredits: unknown[] };
   assert.equal(body.account, account);
   assert.equal(body.outstandingFundingUsd, "0");
   assert.equal(body.failedFundingCredits.length, 0);
@@ -84,13 +76,7 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
   try {
     const testEnv = env({ CELO_RPC_URL: "https://celo.rpc.local", CELO_VAULT_ADDRESS: celoVault });
 
-    const depositLog = encodeVaultEventLog(
-      "GdDeposited",
-      [account, buyer, 2_000_000_000_000_000_000n, "0x"],
-      celoVault,
-      txHash,
-      0
-    );
+    const depositLog = encodeVaultEventLog("GdDeposited", [account, buyer, 2_000_000_000_000_000_000n, "0x"], celoVault, txHash, 0);
 
     globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
@@ -110,26 +96,26 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
       });
     }) as typeof fetch;
 
-    const res = await worker.fetch(new Request("https://worker.test/v1/celo/events/record", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ txHash })
-    }), testEnv, {} as ExecutionContext);
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
     assert.equal(res.status, 200);
-    const body = await res.json() as { events: Array<{ id: string; source: string; fundingStatus: string; principalUsd: string; buyerAddress?: string }> };
+    const body = (await res.json()) as { events: Array<{ id: string; source: string; fundingStatus: string; principalUsd: string; buyerAddress?: string }> };
     assert.equal(body.events.length, 1);
     assert.equal(body.events[0].source, "deposit");
     assert.equal(body.events[0].fundingStatus, "funded");
     assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
 
     // Verify credit was recorded
-    const creditRes = await worker.fetch(
-      new Request(`https://worker.test/v1/accounts/${account}/credit`),
-      testEnv,
-      {} as ExecutionContext
-    );
+    const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit`), testEnv, {} as ExecutionContext);
     assert.equal(creditRes.status, 200);
-    const creditBody = await creditRes.json() as { gdCredits: Array<{ id: string; source: string }> };
+    const creditBody = (await creditRes.json()) as { gdCredits: Array<{ id: string; source: string }> };
     assert.equal(creditBody.gdCredits.length, 1);
     assert.equal(creditBody.gdCredits[0].source, "deposit");
   } finally {
@@ -140,12 +126,61 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
 test("/v1/celo/events/record requires valid input", async () => {
   const testEnv = env({ CELO_RPC_URL: "https://celo.rpc.local" });
 
-  const res = await worker.fetch(new Request("https://worker.test/v1/celo/events/record", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({})
-  }), testEnv, {} as ExecutionContext);
+  const res = await worker.fetch(
+    new Request("https://worker.test/v1/celo/events/record", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    }),
+    testEnv,
+    {} as ExecutionContext
+  );
   assert.equal(res.status, 400);
+});
+
+test("request exceptions send slack webhook with path, body, and error", async () => {
+  const originalFetch = globalThis.fetch;
+  const webhookCalls: Array<{ url: string; body: { text: string } }> = [];
+  const pending: Array<Promise<unknown>> = [];
+
+  try {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      webhookCalls.push({
+        url: String(url),
+        body: JSON.parse(String(init?.body)) as { text: string }
+      });
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+
+    const testEnv = env({ SLACK_WEBHOOK_URL: "https://hooks.slack.test/services/example" });
+    const ctx = {
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      },
+      passThroughOnException() {},
+      props: {}
+    } as unknown as ExecutionContext;
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record?source=test", {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: JSON.stringify({ txHash: `0x${"2".repeat(64)}` })
+      }),
+      testEnv,
+      ctx
+    );
+
+    await Promise.all(pending);
+
+    assert.equal(res.status, 500);
+    assert.equal(webhookCalls.length, 1);
+    assert.equal(webhookCalls[0].url, "https://hooks.slack.test/services/example");
+    assert.match(webhookCalls[0].body.text, /path: \/v1\/celo\/events\/record\?source=test/);
+    assert.match(webhookCalls[0].body.text, /body: \{"txHash":"0x2222/);
+    assert.match(webhookCalls[0].body.text, /error: content-type must be application\/json/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("POST /v1/accounts/:account/stream-credits returns no streams when none active", async () => {
@@ -175,12 +210,16 @@ test("POST /v1/accounts/:account/stream-credits returns no streams when none act
       });
     }) as typeof fetch;
 
-    const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, {
-      method: "POST",
-      headers: { "content-type": "application/json" }
-    }), testEnv, {} as ExecutionContext);
+    const res = await worker.fetch(
+      new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, {
+        method: "POST",
+        headers: { "content-type": "application/json" }
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
     assert.equal(res.status, 200);
-    const body = await res.json() as { account: string; streams: unknown[]; message: string };
+    const body = (await res.json()) as { account: string; streams: unknown[]; message: string };
     assert.equal(body.message, "no active streams found");
     assert.equal(body.streams.length, 0);
   } finally {
@@ -189,22 +228,14 @@ test("POST /v1/accounts/:account/stream-credits returns no streams when none act
 });
 
 test("unknown route returns 404", async () => {
-  const res = await worker.fetch(
-    new Request("https://worker.test/nonexistent"),
-    env(),
-    {} as ExecutionContext
-  );
+  const res = await worker.fetch(new Request("https://worker.test/nonexistent"), env(), {} as ExecutionContext);
   assert.equal(res.status, 404);
-  const body = await res.json() as { error: string };
+  const body = (await res.json()) as { error: string };
   assert.equal(body.error, "not found");
 });
 
 test("OPTIONS returns CORS preflight", async () => {
-  const res = await worker.fetch(
-    new Request("https://worker.test/anything", { method: "OPTIONS" }),
-    env(),
-    {} as ExecutionContext
-  );
+  const res = await worker.fetch(new Request("https://worker.test/anything", { method: "OPTIONS" }), env(), {} as ExecutionContext);
   assert.equal(res.status, 204);
   assert.equal(res.headers.get("access-control-allow-origin"), "*");
 });
@@ -222,7 +253,7 @@ test("POST /v1/channels/:channelId/close returns enabled:false when vault not co
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as { channelId: string; action: string; bridge: { enabled: boolean } };
+  const body = (await res.json()) as { channelId: string; action: string; bridge: { enabled: boolean } };
   assert.equal(body.channelId, CHANNEL_ID);
   assert.equal(body.action, "close");
   assert.equal(body.bridge.enabled, false);
@@ -239,7 +270,7 @@ test("POST /v1/channels/:channelId/withdraw returns enabled:false when vault not
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as { channelId: string; action: string; bridge: { enabled: boolean } };
+  const body = (await res.json()) as { channelId: string; action: string; bridge: { enabled: boolean } };
   assert.equal(body.channelId, CHANNEL_ID);
   assert.equal(body.action, "withdraw");
   assert.equal(body.bridge.enabled, false);
@@ -256,7 +287,7 @@ test("POST /v1/channels/:channelId/close with optional sig fields passes validat
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as { bridge: { enabled: boolean } };
+  const body = (await res.json()) as { bridge: { enabled: boolean } };
   assert.equal(body.bridge.enabled, false);
 });
 
@@ -358,7 +389,7 @@ test("POST /v1/accounts/:account/withdraw returns enabled:false when vault not c
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as { account: string; amountUsd: string; bridge: { enabled: boolean } };
+  const body = (await res.json()) as { account: string; amountUsd: string; bridge: { enabled: boolean } };
   assert.equal(body.account, account);
   assert.equal(body.amountUsd, "5000000");
   assert.equal(body.bridge.enabled, false);
@@ -393,7 +424,8 @@ test("/v1/celo/events/record processes StreamUpdated logs into stream credits", 
       if (body.method === "eth_call") {
         // GoodID root lookup — non-zero root means verified (32-byte ABI-encoded address)
         return Response.json({
-          jsonrpc: "2.0", id: body.id,
+          jsonrpc: "2.0",
+          id: body.id,
           result: "0x000000000000000000000000abababababababababababababababababababab"
         });
       }
@@ -401,14 +433,18 @@ test("/v1/celo/events/record processes StreamUpdated logs into stream credits", 
       return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [streamLog] } });
     }) as typeof fetch;
 
-    const res = await worker.fetch(new Request("https://worker.test/v1/celo/events/record", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ txHash })
-    }), testEnv, {} as ExecutionContext);
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
 
     assert.equal(res.status, 200);
-    const body = await res.json() as {
+    const body = (await res.json()) as {
       events: Array<{ source: string; fundingStatus: string; principalUsd: string; bonusUsd: string; buyerAddress?: string }>;
     };
     assert.equal(body.events.length, 1);
@@ -434,13 +470,7 @@ test("/v1/celo/events/record processes account+fromBlock range query", async () 
   try {
     const testEnv = env({ CELO_RPC_URL: "https://celo.rpc.local", CELO_VAULT_ADDRESS: celoVault });
 
-    const depositLog = encodeVaultEventLog(
-      "GdDeposited",
-      [account, buyer, 1_000_000_000_000_000_000n, "0x"],
-      celoVault,
-      txHash,
-      0
-    );
+    const depositLog = encodeVaultEventLog("GdDeposited", [account, buyer, 1_000_000_000_000_000_000n, "0x"], celoVault, txHash, 0);
 
     globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
@@ -454,15 +484,21 @@ test("/v1/celo/events/record processes account+fromBlock range query", async () 
       return Response.json({ jsonrpc: "2.0", id: body.id, result: null });
     }) as typeof fetch;
 
-    const res = await worker.fetch(new Request("https://worker.test/v1/celo/events/record", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ account, fromBlock: "0x1000000", toBlock: "latest" })
-    }), testEnv, {} as ExecutionContext);
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ account, fromBlock: "0x1000000", toBlock: "latest" })
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
 
     assert.equal(res.status, 200);
-    const body = await res.json() as {
-      account: string; fromBlock: string; toBlock: string;
+    const body = (await res.json()) as {
+      account: string;
+      fromBlock: string;
+      toBlock: string;
       events: Array<{ source: string }>;
     };
     assert.equal(body.account, account.toLowerCase());
@@ -495,10 +531,13 @@ test("GET /v1/accounts/:account/outstanding returns failed funding entries", asy
   };
   await kv.put("gd-credit:deposit:fail:test", JSON.stringify(failedEntry));
   await kv.put(`user-gd-credits:${account.toLowerCase()}`, JSON.stringify(["deposit:fail:test"]));
-  await kv.put(`user:${account.toLowerCase()}`, JSON.stringify({
-    account: account.toLowerCase(),
-    totalOutstandingFundingUsd: "100"
-  }));
+  await kv.put(
+    `user:${account.toLowerCase()}`,
+    JSON.stringify({
+      account: account.toLowerCase(),
+      totalOutstandingFundingUsd: "100"
+    })
+  );
 
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/accounts/${account}/outstanding`),
@@ -506,8 +545,9 @@ test("GET /v1/accounts/:account/outstanding returns failed funding entries", asy
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as {
-    account: string; outstandingFundingUsd: string;
+  const body = (await res.json()) as {
+    account: string;
+    outstandingFundingUsd: string;
     failedFundingCredits: Array<{ fundingStatus: string; fundingError: string }>;
   };
   assert.equal(body.account, account.toLowerCase());
@@ -523,10 +563,13 @@ test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued 
   const gdSuperToken = "0x0000000000000000000000000000000000000fed";
   const kv = new MemoryKV();
   // Pre-seed user with a very recent lastStreamCreditAt (just now)
-  await kv.put(`user:${account.toLowerCase()}`, JSON.stringify({
-    account: account.toLowerCase(),
-    lastStreamCreditAt: new Date().toISOString()
-  }));
+  await kv.put(
+    `user:${account.toLowerCase()}`,
+    JSON.stringify({
+      account: account.toLowerCase(),
+      lastStreamCreditAt: new Date().toISOString()
+    })
+  );
 
   const originalFetch = globalThis.fetch;
   try {
@@ -541,25 +584,31 @@ test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued 
       if (body.query) {
         return Response.json({
           data: {
-            streams: [{
-              sender: { id: account },
-              currentFlowRate: "1000000000000000",
-              updatedAtTimestamp: "1735000000",
-              flowUpdatedEvents: [{ userData: "0x" }]
-            }]
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "1000000000000000",
+                updatedAtTimestamp: "1735000000",
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
           }
         });
       }
       return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x0000000000000000000000000000000000000000000000000000000000000000" });
     }) as typeof fetch;
 
-    const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, {
-      method: "POST",
-      headers: { "content-type": "application/json" }
-    }), testEnv, {} as ExecutionContext);
+    const res = await worker.fetch(
+      new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, {
+        method: "POST",
+        headers: { "content-type": "application/json" }
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
 
     assert.equal(res.status, 200);
-    const body = await res.json() as { account: string; streams: unknown[]; message: string };
+    const body = (await res.json()) as { account: string; streams: unknown[]; message: string };
     assert.equal(body.streams.length, 0);
     assert.ok(body.message.includes("stream credits were issued less than"));
   } finally {
@@ -585,25 +634,31 @@ test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ a
         // 1 wei/sec flow rate — elapsed × 1 wei << 800 G$ minimum
         return Response.json({
           data: {
-            streams: [{
-              sender: { id: account },
-              currentFlowRate: "1",
-              updatedAtTimestamp: "1735000000",
-              flowUpdatedEvents: [{ userData: "0x" }]
-            }]
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "1",
+                updatedAtTimestamp: "1735000000",
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
           }
         });
       }
       return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x0000000000000000000000000000000000000000000000000000000000000000" });
     }) as typeof fetch;
 
-    const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, {
-      method: "POST",
-      headers: { "content-type": "application/json" }
-    }), testEnv, {} as ExecutionContext);
+    const res = await worker.fetch(
+      new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, {
+        method: "POST",
+        headers: { "content-type": "application/json" }
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
 
     assert.equal(res.status, 200);
-    const body = await res.json() as { account: string; elapsedSeconds: number; streams: Array<{ message: string }> };
+    const body = (await res.json()) as { account: string; elapsedSeconds: number; streams: Array<{ message: string }> };
     assert.ok(body.elapsedSeconds > 0);
     assert.equal(body.streams.length, 1);
     assert.ok(body.streams[0].message.includes("below minimum"));

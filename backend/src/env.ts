@@ -6,6 +6,7 @@ export interface Env {
   ANTSEED_FUNDING_RPC_URL?: string;
   ANTSEED_FUNDING_VAULT_ADDRESS?: string;
   ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY?: string;
+  SLACK_WEBHOOK_URL?: string;
 
   GD_CUSD_PRICE?: string;
   CELO_RPC_URL?: string;
@@ -22,6 +23,7 @@ export type RuntimeConfig = {
   ANTSEED_FUNDING_RPC_URL?: string;
   ANTSEED_FUNDING_VAULT_ADDRESS?: string;
   ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY?: string;
+  SLACK_WEBHOOK_URL?: string;
   /** G$ price in cUSD as a decimal number, e.g. 0.001154 means 1 G$ = 0.001154 cUSD */
   GD_CUSD_PRICE: number;
   CELO_RPC_URL?: string;
@@ -39,6 +41,7 @@ export function configFromEnv(env: Env): RuntimeConfig {
     ANTSEED_FUNDING_RPC_URL: env.ANTSEED_FUNDING_RPC_URL,
     ANTSEED_FUNDING_VAULT_ADDRESS: env.ANTSEED_FUNDING_VAULT_ADDRESS,
     ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY: env.ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY,
+    SLACK_WEBHOOK_URL: env.SLACK_WEBHOOK_URL,
     GD_CUSD_PRICE: floatEnv(env.GD_CUSD_PRICE, 0.0001),
     CELO_RPC_URL: env.CELO_RPC_URL,
     CELO_VAULT_ADDRESS: env.CELO_VAULT_ADDRESS,
@@ -47,7 +50,7 @@ export function configFromEnv(env: Env): RuntimeConfig {
     CELO_STATIC_ORACLE_ADDRESS: env.CELO_STATIC_ORACLE_ADDRESS,
     CELO_CUSD_ADDRESS: env.CELO_CUSD_ADDRESS,
     SUPERFLUID_SUBGRAPH_URL: env.SUPERFLUID_SUBGRAPH_URL,
-    MAX_BONUS_CAP_USD: parseUnits(env.MAX_BONUS_CAP_USD || "100",18),
+    MAX_BONUS_CAP_USD: parseUnits(env.MAX_BONUS_CAP_USD || "100", 18)
   };
 }
 

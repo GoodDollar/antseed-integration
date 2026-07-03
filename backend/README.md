@@ -24,6 +24,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/channels/:channelId/withdraw`
 
 `POST /v1/celo/events/record` accepts either:
+
 - `{ "txHash": "0x..." }`
 - `{ "account": "0x...", "fromBlock": "0x...", "toBlock": "latest" }`
 
@@ -35,6 +36,10 @@ npm run typecheck
 npm test
 npm run build
 ```
+
+Optional secrets/config:
+
+- `SLACK_WEBHOOK_URL` - receives a notification when a fetch request ends with an uncaught exception. The payload includes the request method, path, raw body, and error message.
 
 For local dev:
 
