@@ -12,30 +12,34 @@ export type CreditBonusResult = {
   totalCreditUsd: bigint;
 };
 
-const REGULAR_BONUS_BPS = 1_000n; // +10%
-const STREAMING_BONUS_BPS = 2_000n; // +20% for streaming sources
 const BPS = 10_000n;
 
-
-export function calculateCreditWithBonus(gdAmountWei: bigint, source: GdCreditEntry["source"], isVerified: boolean, gdPrice: number): CreditBonusResult {
-  
+export function calculateCreditWithBonus(
+  gdAmountWei: bigint,
+  source: GdCreditEntry["source"],
+  isVerified: boolean,
+  gdPrice: number,
+  regularBonusBps: bigint = 1_000n,
+  streamingBonusBps: bigint = 2_000n
+): CreditBonusResult {
   const principalUsd = gdWeiToUsd(gdAmountWei, gdPrice);
-  let bonusUsd = source.startsWith("stream") ? (principalUsd * STREAMING_BONUS_BPS) / BPS : (principalUsd * REGULAR_BONUS_BPS) / BPS;
-  if(!isVerified) {
+  const bonusBps = source.startsWith("stream") ? streamingBonusBps : regularBonusBps;
+  let bonusUsd = (principalUsd * bonusBps) / BPS;
+  if (!isVerified) {
     bonusUsd = 0n;
   }
 
   return {
     principalUsd,
     bonusUsd,
-    totalCreditUsd: principalUsd + bonusUsd,
+    totalCreditUsd: principalUsd + bonusUsd
   };
 }
 /**
  * convert to USDC 6 decimals
- * @param gdAmountWei 
- * @param gdPrice 
- * @returns 
+ * @param gdAmountWei
+ * @param gdPrice
+ * @returns
  */
 export function gdWeiToUsd(gdAmountWei: bigint, gdPrice: number): bigint {
   const usdPerToken = BigInt(Math.round(gdPrice * 1e6));
@@ -53,4 +57,3 @@ export function monthKey(date = new Date()): string {
 function min(a: bigint, b: bigint): bigint {
   return a < b ? a : b;
 }
-

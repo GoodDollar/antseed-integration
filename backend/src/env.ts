@@ -17,6 +17,9 @@ export interface Env {
   CELO_CUSD_ADDRESS?: string;
   SUPERFLUID_SUBGRAPH_URL?: string;
   MAX_BONUS_CAP_USD?: string;
+  REGULAR_BONUS_BPS?: string;
+  STREAMING_BONUS_BPS?: string;
+  MIN_GD_STREAMED_FOR_BONUS?: string;
 }
 
 export type RuntimeConfig = {
@@ -34,6 +37,9 @@ export type RuntimeConfig = {
   CELO_CUSD_ADDRESS?: string;
   SUPERFLUID_SUBGRAPH_URL?: string;
   MAX_BONUS_CAP_USD: bigint;
+  REGULAR_BONUS_BPS: bigint;
+  STREAMING_BONUS_BPS: bigint;
+  MIN_STREAM_BONUS_WEI: bigint;
 };
 
 export function configFromEnv(env: Env): RuntimeConfig {
@@ -50,7 +56,10 @@ export function configFromEnv(env: Env): RuntimeConfig {
     CELO_STATIC_ORACLE_ADDRESS: env.CELO_STATIC_ORACLE_ADDRESS,
     CELO_CUSD_ADDRESS: env.CELO_CUSD_ADDRESS,
     SUPERFLUID_SUBGRAPH_URL: env.SUPERFLUID_SUBGRAPH_URL,
-    MAX_BONUS_CAP_USD: parseUnits(env.MAX_BONUS_CAP_USD || "100", 18)
+    MAX_BONUS_CAP_USD: parseUnits(env.MAX_BONUS_CAP_USD || "100", 18),
+    REGULAR_BONUS_BPS: bigintEnv(env.REGULAR_BONUS_BPS, 1_000n),
+    STREAMING_BONUS_BPS: bigintEnv(env.STREAMING_BONUS_BPS, 2_000n),
+    MIN_STREAM_BONUS_WEI: parseEther(env.MIN_GD_STREAMED_FOR_BONUS || "4000")
   };
 }
 

@@ -14,14 +14,14 @@ function base(event: string, data?: LogData): Record<string, unknown> {
 function emit(level: LogLevel, event: string, data?: LogData): void {
   const payload = base(event, data);
   if (level === "error") {
-    console.error(payload);
+    console.error(event, payload);
     return;
   }
   if (level === "warn") {
-    console.warn(payload);
+    console.warn(event, payload);
     return;
   }
-  console.log(payload);
+  console.log(event, payload);
 }
 
 export function logInfo(event: string, data?: LogData): void {
@@ -37,19 +37,19 @@ export function logError(event: string, data?: LogData): void {
 }
 
 export function redactAddress(value: string | undefined): string | undefined {
-    return value;
-//   if (!value) return undefined;
-//   const normalized = value.toLowerCase();
-//   if (!normalized.startsWith("0x") || normalized.length < 10) return "redacted";
-//   return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`;
+  return value;
+  //   if (!value) return undefined;
+  //   const normalized = value.toLowerCase();
+  //   if (!normalized.startsWith("0x") || normalized.length < 10) return "redacted";
+  //   return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`;
 }
 
 export function redactHash(value: string | undefined): string | undefined {
-    return value;
-//   if (!value) return undefined;
-//   const normalized = value.toLowerCase();
-//   if (!normalized.startsWith("0x") || normalized.length < 14) return "redacted";
-//   return `${normalized.slice(0, 10)}...${normalized.slice(-4)}`;
+  return value;
+  //   if (!value) return undefined;
+  //   const normalized = value.toLowerCase();
+  //   if (!normalized.startsWith("0x") || normalized.length < 14) return "redacted";
+  //   return `${normalized.slice(0, 10)}...${normalized.slice(-4)}`;
 }
 
 export function errorMessage(error: unknown): string {

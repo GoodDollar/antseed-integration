@@ -25,6 +25,8 @@ export class KVCreditStore {
     gdPrice: number;
     flowRate?: bigint;
     maxBonusCapUsd: bigint;
+    regularBonusBps?: bigint;
+    streamingBonusBps?: bigint;
     buyerAddress?: string;
   }): Promise<GdCreditEntry> {
     const account = normalizeAccount(input.account);
@@ -36,12 +38,12 @@ export class KVCreditStore {
         entryId,
         account: redactAddress(account),
         source: input.source,
-        existingStatus: existing.fundingStatus,
+        existingStatus: existing.fundingStatus
       });
       return existing;
     }
     const month = monthKey(input.date ?? new Date());
-    const bonus = calculateCreditWithBonus(input.gdAmountWei, input.source, input.isVerified, input.gdPrice);
+    const bonus = calculateCreditWithBonus(input.gdAmountWei, input.source, input.isVerified, input.gdPrice, input.regularBonusBps, input.streamingBonusBps);
 
     // Enforce per-root-account monthly bonus cap
     let effectiveBonusUsd = bonus.bonusUsd;
@@ -53,7 +55,7 @@ export class KVCreditStore {
           entryId,
           rootAccount: redactAddress(rootAccount),
           requestedBonusUsd: effectiveBonusUsd.toString(),
-          remainingCapUsd: remainingCap.toString(),
+          remainingCapUsd: remainingCap.toString()
         });
         effectiveBonusUsd = remainingCap;
       }
@@ -75,8 +77,8 @@ export class KVCreditStore {
       fundingStatus: "pending",
       createdAt: now,
       ...(input.buyerAddress && {
-        buyerAddress: input.buyerAddress.toLowerCase(),
-      }),
+        buyerAddress: input.buyerAddress.toLowerCase()
+      })
     };
 
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
@@ -95,7 +97,7 @@ export class KVCreditStore {
       streamFlowRateWeiPerSecond: input.flowRate ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
       totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
       totalGDStreamedWei: input.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
-      totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd),
+      totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd)
     }));
 
     logInfo("kv.credit.recorded", {
@@ -107,7 +109,7 @@ export class KVCreditStore {
       bonusUsd: entry.bonusUsd,
       totalCreditUsd: entry.totalCreditUsd,
       buyer: entry.buyerAddress,
-      input,
+      input
     });
 
     return entry;
@@ -118,7 +120,7 @@ export class KVCreditStore {
       logWarn("kv.funding.already-terminal", {
         entryId: entry.id,
         account: redactAddress(entry.account),
-        fundingStatus: entry.fundingStatus,
+        fundingStatus: entry.fundingStatus
       });
       return entry;
     }
@@ -139,7 +141,7 @@ export class KVCreditStore {
           lastStreamCreditAt: entry.source.startsWith("stream") ? now : current.lastStreamCreditAt,
           totalPrincipalUsd: (BigInt(current.totalPrincipalUsd) + BigInt(entry.principalUsd)).toString(),
           totalBonusUsd: (BigInt(current.totalBonusUsd) + BigInt(entry.bonusUsd)).toString(),
-          totalOutstandingFundingUsd: (outstanding > creditAmount ? outstanding - creditAmount : 0n).toString(),
+          totalOutstandingFundingUsd: (outstanding > creditAmount ? outstanding - creditAmount : 0n).toString()
         };
       });
     }
@@ -149,7 +151,7 @@ export class KVCreditStore {
       source: entry.source,
       fundingStatus: entry.fundingStatus,
       txHash: result.txHash,
-      error: result.error,
+      error: result.error
     });
     return entry;
   }
@@ -198,7 +200,7 @@ export class KVCreditStore {
       const rootNext = mutate({
         ...rootCurrent,
         account: normalizedRoot,
-        rootAccount: normalizedRoot,
+        rootAccount: normalizedRoot
       });
       await this.putJson(`${USER_PREFIX}${normalizedRoot}`, rootNext);
     }
@@ -227,7 +229,7 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalPrincipalUsd: saved?.totalPrincipalUsd ?? "0",
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingUsd: saved?.totalOutstandingFundingUsd ?? "0",
-    lastStreamCreditAt: saved?.lastStreamCreditAt,
+    lastStreamCreditAt: saved?.lastStreamCreditAt
   };
 }
 

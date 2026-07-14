@@ -30,9 +30,22 @@ Check that the API is alive:
 ```bash
 curl "$GOODDOLLAR_ANTSEED_API/health"
 curl "$GOODDOLLAR_ANTSEED_API/config/status"
+curl "$GOODDOLLAR_ANTSEED_API/config/values"
 ```
 
 `/config/status` shows Celo integration flags, bridge mode, and whether the Base buyer operator is enabled.
+`/config/values` returns non-secret runtime values, including bonus/cap constants used by credit accounting.
+
+## Configurable Constants
+
+The backend operator can tune credit behavior using environment constants:
+
+- `MAX_BONUS_CAP_USD`: monthly bonus cap shared by wallets mapped to the same GoodID root.
+- `REGULAR_BONUS_BPS`: bonus rate for deposit credits.
+- `STREAMING_BONUS_BPS`: bonus rate for stream credits.
+- `MIN_GD_STREAMED_FOR_BONUS`: minimum streamed G$ amount required to issue stream credits.
+
+Use `GET /config/values` to inspect the effective runtime values. Note that the response returns the stream threshold as `MIN_STREAM_BONUS_WEI` (wei units), derived from `MIN_GD_STREAMED_FOR_BONUS`.
 
 ## Why use G$ credits instead of paying USDC directly?
 
@@ -79,12 +92,12 @@ The G$ → USD price comes from the reserve oracle (`currentPrice`) when configu
 
 Examples (assuming verified wallet, bonus cap not yet reached):
 
-| User type | G$ principal value | Credits issued |
-|---|---:|---:|
-| one-time deposit | $10.00 | $11.00 |
-| active streamer | $1.00 | $1.20 |
-| unverified wallet | $10.00 | $10.00 |
-| monthly bonus cap reached | $10.00 | $10.00 |
+| User type                 | G$ principal value | Credits issued |
+| ------------------------- | -----------------: | -------------: |
+| one-time deposit          |             $10.00 |         $11.00 |
+| active streamer           |              $1.00 |          $1.20 |
+| unverified wallet         |             $10.00 |         $10.00 |
+| monthly bonus cap reached |             $10.00 |         $10.00 |
 
 ## Step 1 — Optionally verify with GoodID for bonus credits
 
@@ -228,4 +241,3 @@ If credits show `fundingStatus: "failed"`, check `fundingError` on the entry. Yo
 - Credits are not USDC balances; they are GoodDollar-side accounting credits used to fund the operator's AntSeed buyer deposit.
 - Current AntSeed payment is deposit/EIP-712 backed upstream; future payment mechanisms should be added as adapters above that layer.
 - KV is durable but eventually consistent. On-chain vault events are the source of truth for deposits and stream updates.
-

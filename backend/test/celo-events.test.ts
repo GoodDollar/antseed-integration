@@ -41,7 +41,10 @@ test("fetches GoodID root with eth_call for root aggregation", async () => {
       GD_CUSD_PRICE: 1.0,
       CELO_RPC_URL: "https://celo.example",
       CELO_GOODID_ADDRESS: "0x0000000000000000000000000000000000000abc",
-      MAX_BONUS_CAP_USD: 100_000_000n
+      MAX_BONUS_CAP_USD: 100_000_000n,
+      REGULAR_BONUS_BPS: 1_000n,
+      STREAMING_BONUS_BPS: 2_000n,
+      MIN_STREAM_BONUS_WEI: 4_000_000_000_000_000_000_000n
     });
     assert.equal(fetchedRoot, root);
   } finally {
@@ -102,7 +105,10 @@ test("fetches GD price from StaticOracle quoteAllAvailablePoolsWithTimePeriod", 
       GD_CUSD_PRICE: 0.001,
       CELO_RPC_URL: "https://celo.example",
       CELO_GD_SUPERTOKEN_ADDRESS: gdToken,
-      MAX_BONUS_CAP_USD: 100_000_000n
+      MAX_BONUS_CAP_USD: 100_000_000n,
+      REGULAR_BONUS_BPS: 1_000n,
+      STREAMING_BONUS_BPS: 2_000n,
+      MIN_STREAM_BONUS_WEI: 4_000_000_000_000_000_000_000n
     });
     // 1154299954649337 / 1e18 ≈ 0.001154299...
     assert.ok(price > 0.001154 && price < 0.001155, `expected ~0.001154 but got ${price}`);

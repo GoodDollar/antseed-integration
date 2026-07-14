@@ -43,6 +43,25 @@ test("config status documents celo-to-base bridge mode", async () => {
   assert.equal(body.bridge.mode, "celo-vault-to-base-buyer-operator");
 });
 
+test("config values exposes non-secret runtime constants", async () => {
+  const res = await worker.fetch(new Request("https://worker.test/config/values"), env(), {} as ExecutionContext);
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    config: {
+      GD_CUSD_PRICE: number;
+      MAX_BONUS_CAP_USD: string;
+      REGULAR_BONUS_BPS: string;
+      STREAMING_BONUS_BPS: string;
+      MIN_STREAM_BONUS_WEI: string;
+    };
+  };
+  assert.equal(body.config.GD_CUSD_PRICE, 0.0001);
+  assert.equal(body.config.MAX_BONUS_CAP_USD, "100000000000000000000");
+  assert.equal(body.config.REGULAR_BONUS_BPS, "1000");
+  assert.equal(body.config.STREAMING_BONUS_BPS, "2000");
+  assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
+});
+
 test("GET /v1/accounts/:account/credit returns profile and gdCredits", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
@@ -333,7 +352,7 @@ test("POST /v1/accounts/:account/operator-consent returns enabled:false when vau
     {} as ExecutionContext
   );
   assert.equal(res.status, 200);
-  const body = await res.json() as { buyer: string; bridge: { enabled: boolean } };
+  const body = (await res.json()) as { buyer: string; bridge: { enabled: boolean } };
   assert.equal(body.buyer, buyer);
   assert.equal(body.bridge.enabled, false);
 });

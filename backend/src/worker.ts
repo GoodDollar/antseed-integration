@@ -4,7 +4,6 @@ import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdPri
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
-import { parseEther } from "ethers";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 
 const CeloEventsRecordSchema = z
@@ -73,7 +72,6 @@ const SuperfluidStreamsResponseSchema = z.object({
 });
 
 const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superfluid.dev/celo-mainnet/protocol-v1";
-const MIN_STREAM_BONUS = parseEther("800"); // minimum G$ amount to issue a stream credit, to avoid spam and abuse
 
 type SuperfluidIncomingStream = {
   account: string;
@@ -149,7 +147,7 @@ export default {
         skippedCooldown += 1;
         continue;
       }
-      if (gdAmountWei < MIN_STREAM_BONUS) {
+      if (gdAmountWei < cfg.MIN_STREAM_BONUS_WEI) {
         skippedMinAmount += 1;
         continue;
       }
@@ -165,13 +163,19 @@ export default {
         isVerified: !!rootAccount, // if root acccount was found it is whitelisted
         gdPrice,
         maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
+        regularBonusBps: cfg.REGULAR_BONUS_BPS,
+        streamingBonusBps: cfg.STREAMING_BONUS_BPS,
         buyerAddress: stream.buyerAddress
       });
       logInfo("streamCron.credits.entry", {
         entryId: entry.id,
         account: redactAddress(entry.account),
         rootAccount: redactAddress(entry.rootAccount),
-        buyer: redactAddress(entry.buyerAddress)
+        buyer: redactAddress(entry.buyerAddress),
+        elapsedSeconds,
+        stream,
+        entry,
+        profile
       });
       processed += 1;
       ctx.waitUntil(
@@ -231,6 +235,27 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     });
   }
 
+  if (request.method === "GET" && url.pathname === "/config/values") {
+    return json({
+      ok: true,
+      service: "gooddollar-antseed-integration",
+      runtime: "cloudflare-worker",
+      config: {
+        GD_CUSD_PRICE: cfg.GD_CUSD_PRICE,
+        MAX_BONUS_CAP_USD: cfg.MAX_BONUS_CAP_USD.toString(),
+        REGULAR_BONUS_BPS: cfg.REGULAR_BONUS_BPS.toString(),
+        STREAMING_BONUS_BPS: cfg.STREAMING_BONUS_BPS.toString(),
+        MIN_STREAM_BONUS_WEI: cfg.MIN_STREAM_BONUS_WEI.toString(),
+        CELO_VAULT_ADDRESS: cfg.CELO_VAULT_ADDRESS,
+        CELO_GOODID_ADDRESS: cfg.CELO_GOODID_ADDRESS,
+        CELO_STATIC_ORACLE_ADDRESS: cfg.CELO_STATIC_ORACLE_ADDRESS,
+        CELO_CUSD_ADDRESS: cfg.CELO_CUSD_ADDRESS,
+        CELO_GD_SUPERTOKEN_ADDRESS: cfg.CELO_GD_SUPERTOKEN_ADDRESS,
+        SUPERFLUID_SUBGRAPH_URL: cfg.SUPERFLUID_SUBGRAPH_URL ?? SUPERFLUID_CELO_SUBGRAPH_URL
+      }
+    });
+  }
+
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
   if (request.method === "GET" && accountMatch) {
     const account = decodeURIComponent(accountMatch[1]);
@@ -274,6 +299,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           isVerified: !!rootAccount, // if root acccount was found it is whitelisted
           gdPrice,
           maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
+          regularBonusBps: cfg.REGULAR_BONUS_BPS,
+          streamingBonusBps: cfg.STREAMING_BONUS_BPS,
           buyerAddress: event.buyer
         });
         logInfo("celo.events.record.entry", {
@@ -299,6 +326,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           isVerified: !!rootAccount, // if root acccount was found it is whitelisted
           gdPrice,
           maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
+          regularBonusBps: cfg.REGULAR_BONUS_BPS,
+          streamingBonusBps: cfg.STREAMING_BONUS_BPS,
           buyerAddress: event.buyer
         });
         logInfo("celo.events.record.entry", {
@@ -380,10 +409,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     let skippedMinAmount = 0;
     for (const stream of streams) {
       const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
-      if (gdAmountWei <= MIN_STREAM_BONUS) {
+      if (gdAmountWei <= cfg.MIN_STREAM_BONUS_WEI) {
         skippedMinAmount += 1;
         recorded.push({
-          message: `stream credit amount ${gdAmountWei} is below minimum ${MIN_STREAM_BONUS}`
+          message: `stream credit amount ${gdAmountWei} is below minimum ${cfg.MIN_STREAM_BONUS_WEI}`
         });
         continue;
       }
@@ -399,6 +428,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         isVerified,
         gdPrice,
         maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
+        regularBonusBps: cfg.REGULAR_BONUS_BPS,
+        streamingBonusBps: cfg.STREAMING_BONUS_BPS,
         buyerAddress: stream.buyerAddress
       });
 
@@ -437,11 +468,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       buyer: redactAddress(buyer),
       nonce: parsed.data.nonce
     });
-    const bridge = await antseedFundingVault.acceptBuyerOperator(
-      buyer,
-      BigInt(parsed.data.nonce),
-      parsed.data.signature
-    );
+    const bridge = await antseedFundingVault.acceptBuyerOperator(buyer, BigInt(parsed.data.nonce), parsed.data.signature);
     logInfo("operator.consent.result", {
       buyer: redactAddress(buyer),
       enabled: bridge.enabled,
