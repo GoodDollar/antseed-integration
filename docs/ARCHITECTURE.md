@@ -59,7 +59,16 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - issues stream credits for each streamer and funds them
 
 **Credit check** (`GET /v1/accounts/:account/credit`):
-- returns the user's `UserCreditProfile` and list of `GdCreditEntry` records
+- returns the user's `UserCreditProfile` only (optional `buyerAddress` from successful operator consent)
+
+**Credit history** (`GET /v1/accounts/:account/credit-history`):
+- returns paginated `GdCreditEntry` records newest-first
+- query params: `limit` (default 20, max 100), `offset` (default 0), optional `source`, `fundingStatus`, `from` / `to` (ISO `createdAt` range, inclusive)
+- response: `{ account, items, total, limit, offset, hasMore }`
+
+**Operator consent** (`POST /v1/accounts/:account/operator-consent`):
+- path `:account` is the buyer; body requires `payer`, `nonce`, `signature`
+- on successful bridge consent, sets `buyerAddress` on the payer wallet profile only (first-ever, never overwritten)
 
 **Outstanding funding** (`GET /v1/accounts/:account/outstanding`):
 - returns `totalOutstandingFundingUsd` and all `GdCreditEntry` records with `fundingStatus = "pending"` or `"failed"`
@@ -109,7 +118,7 @@ Future payment mechanisms (sponsorships, org budgets, subscriptions, multi-buyer
 
 The Worker binds `ANTSEED_KV` and persists:
 
-- `user:<account>` — `UserCreditProfile` aggregate, written for both the depositor wallet and the GoodID root wallet when they differ; tracks `totalGdDepositedWei`, `totalPrincipalUsd`, `totalBonusUsd`, `totalGDStreamedWei`, `totalOutstandingFundingUsd`, `streamFlowRateWeiPerSecond`, `lastStreamCreditAt`
+- `user:<account>` — `UserCreditProfile` aggregate, written for both the depositor wallet and the GoodID root wallet when they differ; tracks `totalGdDepositedWei`, `totalPrincipalUsd`, `totalBonusUsd`, `totalGDStreamedWei`, `totalOutstandingFundingUsd`, `streamFlowRateWeiPerSecond`, `lastStreamCreditAt`; wallet profiles may also store `buyerAddress` (set once on successful operator consent)
 - `user-gd-credits:<account>` — bounded list (last 500) of `gd-credit` entry IDs for the account
 - `gd-credit:<id>` — individual `GdCreditEntry`: source, amounts, `fundingStatus` (`pending` → `funded` or `failed`), `fundingTxHash`, `fundingError`, `buyerAddress`
 - `monthly-bonus:<rootAccount>:YYYY-MM` — cumulative bonus issued to the root account in that calendar month; used to enforce `MAX_BONUS_CAP_USD`

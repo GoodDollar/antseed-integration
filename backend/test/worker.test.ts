@@ -62,15 +62,46 @@ test("config values exposes non-secret runtime constants", async () => {
   assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
 });
 
-test("GET /v1/accounts/:account/credit returns profile and gdCredits", async () => {
+test("GET /v1/accounts/:account/credit returns profile only", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit`), testEnv, {} as ExecutionContext);
   assert.equal(res.status, 200);
-  const body = (await res.json()) as { account: string; profile: { totalGdDepositedWei: string }; gdCredits: unknown[] };
+  const body = (await res.json()) as { account: string; profile: { totalGdDepositedWei: string }; gdCredits?: unknown };
   assert.equal(body.account, account);
   assert.equal(body.profile.totalGdDepositedWei, "0");
-  assert.equal(body.gdCredits.length, 0);
+  assert.equal(body.gdCredits, undefined);
+});
+
+test("GET /v1/accounts/:account/credit-history returns paginated empty history", async () => {
+  const testEnv = env();
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    account: string;
+    items: unknown[];
+    total: number;
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+  };
+  assert.equal(body.account, account);
+  assert.equal(body.items.length, 0);
+  assert.equal(body.total, 0);
+  assert.equal(body.limit, 20);
+  assert.equal(body.offset, 0);
+  assert.equal(body.hasMore, false);
+});
+
+test("GET /v1/accounts/:account/credit-history returns 400 on invalid query", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/credit-history?source=not-a-source`),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 400);
 });
 
 test("GET /v1/accounts/:account/outstanding returns outstanding funding info", async () => {
@@ -134,9 +165,15 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
     // Verify credit was recorded
     const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit`), testEnv, {} as ExecutionContext);
     assert.equal(creditRes.status, 200);
-    const creditBody = (await creditRes.json()) as { gdCredits: Array<{ id: string; source: string }> };
-    assert.equal(creditBody.gdCredits.length, 1);
-    assert.equal(creditBody.gdCredits[0].source, "deposit");
+    const creditBody = (await creditRes.json()) as { profile: { totalGdDepositedWei: string }; gdCredits?: unknown };
+    assert.equal(creditBody.gdCredits, undefined);
+    assert.notEqual(creditBody.profile.totalGdDepositedWei, "0");
+
+    const historyRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+    assert.equal(historyRes.status, 200);
+    const historyBody = (await historyRes.json()) as { items: Array<{ id: string; source: string }> };
+    assert.equal(historyBody.items.length, 1);
+    assert.equal(historyBody.items[0].source, "deposit");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -337,7 +374,7 @@ test("POST /v1/accounts/:account/operator-consent returns 400 on missing body fi
   assert.equal(res.status, 400);
 });
 
-test("POST /v1/accounts/:account/operator-consent returns enabled:false when vault not configured", async () => {
+test("POST /v1/accounts/:account/operator-consent returns 400 when payer is missing", async () => {
   const buyer = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/accounts/${buyer}/operator-consent`, {
@@ -351,10 +388,35 @@ test("POST /v1/accounts/:account/operator-consent returns enabled:false when vau
     env(),
     {} as ExecutionContext
   );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/accounts/:account/operator-consent returns enabled:false when vault not configured", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const payer = "0x0000000000000000000000000000000000000def";
+  const testEnv = env();
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${buyer}/operator-consent`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        payer,
+        nonce: "0",
+        signature: `0x${"a".repeat(130)}`
+      })
+    }),
+    testEnv,
+    {} as ExecutionContext
+  );
   assert.equal(res.status, 200);
-  const body = (await res.json()) as { buyer: string; bridge: { enabled: boolean } };
+  const body = (await res.json()) as { buyer: string; payer: string; bridge: { enabled: boolean } };
   assert.equal(body.buyer, buyer);
+  assert.equal(body.payer, payer);
   assert.equal(body.bridge.enabled, false);
+
+  const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${payer}/credit`), testEnv, {} as ExecutionContext);
+  const creditBody = (await creditRes.json()) as { profile: { buyerAddress?: string } };
+  assert.equal(creditBody.profile.buyerAddress, undefined);
 });
 
 test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", async () => {

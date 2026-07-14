@@ -163,10 +163,76 @@ export class KVCreditStore {
     return entries.filter((item): item is GdCreditEntry => Boolean(item));
   }
 
+  async getGdCreditHistory(
+    account: string,
+    options: {
+      limit: number;
+      offset: number;
+      source?: GdCreditEntry["source"];
+      fundingStatus?: GdCreditEntry["fundingStatus"];
+      from?: string;
+      to?: string;
+    }
+  ): Promise<{ items: GdCreditEntry[]; total: number; limit: number; offset: number; hasMore: boolean }> {
+    let entries = await this.getGdCredits(account);
+    entries = [...entries].sort((a, b) => {
+      const byCreated = b.createdAt.localeCompare(a.createdAt);
+      if (byCreated !== 0) return byCreated;
+      return b.id.localeCompare(a.id);
+    });
+    if (options.source) {
+      entries = entries.filter((entry) => entry.source === options.source);
+    }
+    if (options.fundingStatus) {
+      entries = entries.filter((entry) => entry.fundingStatus === options.fundingStatus);
+    }
+    if (options.from) {
+      const fromMs = Date.parse(options.from);
+      entries = entries.filter((entry) => Date.parse(entry.createdAt) >= fromMs);
+    }
+    if (options.to) {
+      const toMs = Date.parse(options.to);
+      entries = entries.filter((entry) => Date.parse(entry.createdAt) <= toMs);
+    }
+    const total = entries.length;
+    const items = entries.slice(options.offset, options.offset + options.limit);
+    return {
+      items,
+      total,
+      limit: options.limit,
+      offset: options.offset,
+      hasMore: options.offset + options.limit < total
+    };
+  }
+
   async getUser(account: string): Promise<UserCreditProfile> {
     const normalized = normalizeAccount(account);
     const saved = await this.getJson<Partial<UserCreditProfile>>(`${USER_PREFIX}${normalized}`);
     return normalizeProfile(saved, normalized);
+  }
+
+  async setBuyerAddressIfAbsent(payer: string, buyerAddress: string): Promise<UserCreditProfile> {
+    const normalized = normalizeAccount(payer);
+    const current = await this.getUser(normalized);
+    if (current.buyerAddress) {
+      logInfo("kv.user.buyer.unchanged", {
+        payer: redactAddress(normalized),
+        buyer: redactAddress(current.buyerAddress)
+      });
+      return current;
+    }
+    const now = new Date().toISOString();
+    const next: UserCreditProfile = {
+      ...current,
+      buyerAddress: buyerAddress.toLowerCase(),
+      updatedAt: now
+    };
+    await this.putJson(`${USER_PREFIX}${normalized}`, next);
+    logInfo("kv.user.buyer.set", {
+      payer: redactAddress(normalized),
+      buyer: redactAddress(next.buyerAddress)
+    });
+    return next;
   }
 
   private async addGdCreditToAccount(account: string, entryId: string): Promise<void> {
@@ -229,7 +295,8 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalPrincipalUsd: saved?.totalPrincipalUsd ?? "0",
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingUsd: saved?.totalOutstandingFundingUsd ?? "0",
-    lastStreamCreditAt: saved?.lastStreamCreditAt
+    lastStreamCreditAt: saved?.lastStreamCreditAt,
+    ...(saved?.buyerAddress && { buyerAddress: saved.buyerAddress.toLowerCase() })
   };
 }
 

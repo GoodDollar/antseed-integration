@@ -44,8 +44,23 @@ const WithdrawPrincipalSchema = z.object({
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
 const OperatorConsentSchema = z.object({
+  payer: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
   nonce: z.string().regex(/^\d+$/),
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
+});
+const CreditHistoryQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  offset: z.coerce.number().int().min(0).default(0),
+  source: z.enum(["deposit", "streamUpdate", "streamRequest", "streamCron"]).optional(),
+  fundingStatus: z.enum(["pending", "funded", "failed"]).optional(),
+  from: z
+    .string()
+    .refine((value) => !Number.isNaN(Date.parse(value)), { message: "invalid ISO timestamp" })
+    .optional(),
+  to: z
+    .string()
+    .refine((value) => !Number.isNaN(Date.parse(value)), { message: "invalid ISO timestamp" })
+    .optional()
 });
 const ChannelOpSchema = z.object({
   timestamp: z.number().int().nonnegative().optional(),
@@ -259,8 +274,27 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
   if (request.method === "GET" && accountMatch) {
     const account = decodeURIComponent(accountMatch[1]);
-    const [profile, gdCredits] = await Promise.all([store.getUser(account), store.getGdCredits(account)]);
-    return json({ account: profile.account, profile, gdCredits });
+    const profile = await store.getUser(account);
+    return json({ account: profile.account, profile });
+  }
+
+  const creditHistoryMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit-history$/);
+  if (request.method === "GET" && creditHistoryMatch) {
+    const account = decodeURIComponent(creditHistoryMatch[1]);
+    const parsed = CreditHistoryQuerySchema.safeParse({
+      limit: url.searchParams.get("limit") ?? undefined,
+      offset: url.searchParams.get("offset") ?? undefined,
+      source: url.searchParams.get("source") ?? undefined,
+      fundingStatus: url.searchParams.get("fundingStatus") ?? undefined,
+      from: url.searchParams.get("from") ?? undefined,
+      to: url.searchParams.get("to") ?? undefined
+    });
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const history = await store.getGdCreditHistory(account, parsed.data);
+    return json({
+      account: account.toLowerCase(),
+      ...history
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/v1/celo/events/record") {
@@ -464,17 +498,23 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const body = await parseJson(request);
     const parsed = OperatorConsentSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const payer = parsed.data.payer.toLowerCase();
     logInfo("operator.consent.request", {
       buyer: redactAddress(buyer),
+      payer: redactAddress(payer),
       nonce: parsed.data.nonce
     });
     const bridge = await antseedFundingVault.acceptBuyerOperator(buyer, BigInt(parsed.data.nonce), parsed.data.signature);
+    if (bridge.enabled) {
+      await store.setBuyerAddressIfAbsent(payer, buyer);
+    }
     logInfo("operator.consent.result", {
       buyer: redactAddress(buyer),
+      payer: redactAddress(payer),
       enabled: bridge.enabled,
       txHash: redactHash(bridge.txHash)
     });
-    return json({ buyer, bridge });
+    return json({ buyer, payer, bridge });
   }
 
   const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);

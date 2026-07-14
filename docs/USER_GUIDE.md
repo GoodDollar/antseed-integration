@@ -190,11 +190,15 @@ The Worker uses this to record the stream's `totalFlowWei` as a credit entry and
 curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit"
 ```
 
-The response includes:
+The response includes the wallet-level `UserCreditProfile` (principal, bonus, outstanding funding totals, and `buyerAddress` once operator consent has succeeded).
 
-- wallet-level `UserCreditProfile` (principal, bonus, outstanding funding totals),
-- GoodID-root aggregate profile when applicable,
-- list of `GdCreditEntry` records with `fundingStatus` (`pending`, `funded`, or `failed`).
+To inspect credit entries with pagination and filters:
+
+```bash
+curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit-history?limit=20&offset=0"
+```
+
+Optional filters: `source`, `fundingStatus`, `from` / `to` (ISO timestamps on `createdAt`). The response is `{ items, total, limit, offset, hasMore }`.
 
 To see credits that have not yet been funded to the AntSeed buyer deposit:
 
@@ -232,9 +236,10 @@ Look for:
 
 ```bash
 curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit"
+curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit-history"
 ```
 
-If credits show `fundingStatus: "failed"`, check `fundingError` on the entry. You can retry by re-submitting the original `txHash` — idempotency prevents double-funding.
+If history entries show `fundingStatus: "failed"`, check `fundingError` on the entry. You can retry by re-submitting the original `txHash` — idempotency prevents double-funding.
 
 ## Safety and limitations
 

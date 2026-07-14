@@ -16,6 +16,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `GET /config/status`
 - `GET /config/values`
 - `GET /v1/accounts/:account/credit`
+- `GET /v1/accounts/:account/credit-history`
 - `GET /v1/accounts/:account/outstanding`
 - `POST /v1/accounts/:account/stream-credits`
 - `POST /v1/accounts/:account/operator-consent`
@@ -23,6 +24,16 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/celo/events/record`
 - `POST /v1/channels/:channelId/close`
 - `POST /v1/channels/:channelId/withdraw`
+
+`GET /v1/accounts/:account/credit` returns the wallet `UserCreditProfile` only (including `buyerAddress` when set via operator consent).
+
+`GET /v1/accounts/:account/credit-history` returns paginated `GdCreditEntry` history (newest first):
+
+- query: `limit` (default `20`, max `100`), `offset` (default `0`)
+- filters: `source`, `fundingStatus`, `from` / `to` (ISO timestamps on `createdAt`, inclusive)
+- response: `{ account, items, total, limit, offset, hasMore }`
+
+`POST /v1/accounts/:account/operator-consent` requires body `{ payer, nonce, signature }`. On success, sets `buyerAddress` on the payer wallet profile once (first-ever, no overwrite).
 
 `POST /v1/celo/events/record` accepts either:
 
