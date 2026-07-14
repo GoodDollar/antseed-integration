@@ -177,23 +177,22 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         return totalDepositedGd[msg.sender];
     }
 
+    /// @notice for superfluid batch calls deposit path. `data` must be `abi.encode(buyerAddress)` — the AntSeed buyer to credit.
+    /// @param sender The account sending the G$ tokens.
+    /// @param amount The G$ amount to transfer.
+    /// @param data ABI-encoded AntSeed buyer address: `abi.encode(buyerAddress)`. Required.
+    /// @return The total G$ deposited by the sender (including this callback)
+    function depositFrom(address sender, uint256 amount, bytes calldata data) external onlySuperfluidHost returns (uint256) {
+        _recordTokenCallbackDeposit(sender, amount, data);
+        _safeTransferFrom(sender, address(this), amount);
+        return totalDepositedGd[sender];
+    }
+
     /// @notice ERC677 / ERC667 transferAndCall receiver.
     /// @dev `data` must be `abi.encode(buyerAddress)` — the AntSeed buyer to credit.
     function onTokenTransfer(address from, uint256 amount, bytes calldata data) external onlyGdToken returns (bool) {
         _recordTokenCallbackDeposit(from, amount, data);
         return true;
-    }
-
-    /// @notice Legacy ERC223/ERC667-style token fallback receiver used by some token implementations.
-    function tokenFallback(address from, uint256 amount, bytes calldata data) external onlyGdToken {
-        _recordTokenCallbackDeposit(from, amount, data);
-    }
-
-    /// @notice ERC777 tokensReceived hook. Register this implementer in ERC1820 when using ERC777 delivery.
-    /// @dev `userData` must be `abi.encode(buyerAddress)` — the AntSeed buyer to credit.
-    function tokensReceived(address, address from, address to, uint256 amount, bytes calldata userData, bytes calldata) external onlyGdToken {
-        if (to != address(this)) revert WrongReceiver();
-        _recordTokenCallbackDeposit(from, amount, userData);
     }
 
     function beforeAgreementCreated(
