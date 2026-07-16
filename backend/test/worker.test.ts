@@ -62,15 +62,46 @@ test("config values exposes non-secret runtime constants", async () => {
   assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
 });
 
-test("GET /v1/accounts/:account/credit returns profile and gdCredits", async () => {
+test("GET /v1/accounts/:account/profile returns profile only", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit`), testEnv, {} as ExecutionContext);
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/profile`), testEnv, {} as ExecutionContext);
   assert.equal(res.status, 200);
-  const body = (await res.json()) as { account: string; profile: { totalGdDepositedWei: string }; gdCredits: unknown[] };
+  const body = (await res.json()) as { account: string; profile: { totalGdDepositedWei: string }; gdCredits?: unknown };
   assert.equal(body.account, account);
   assert.equal(body.profile.totalGdDepositedWei, "0");
-  assert.equal(body.gdCredits.length, 0);
+  assert.equal(body.gdCredits, undefined);
+});
+
+test("GET /v1/accounts/:account/credit-history returns paginated empty history", async () => {
+  const testEnv = env();
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    account: string;
+    items: unknown[];
+    total: number;
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+  };
+  assert.equal(body.account, account);
+  assert.equal(body.items.length, 0);
+  assert.equal(body.total, 0);
+  assert.equal(body.limit, 20);
+  assert.equal(body.offset, 0);
+  assert.equal(body.hasMore, false);
+});
+
+test("GET /v1/accounts/:account/credit-history returns 400 on invalid query", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/credit-history?source=not-a-source`),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 400);
 });
 
 test("GET /v1/accounts/:account/outstanding returns outstanding funding info", async () => {
@@ -132,11 +163,17 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
     assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
 
     // Verify credit was recorded
-    const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit`), testEnv, {} as ExecutionContext);
+    const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/profile`), testEnv, {} as ExecutionContext);
     assert.equal(creditRes.status, 200);
-    const creditBody = (await creditRes.json()) as { gdCredits: Array<{ id: string; source: string }> };
-    assert.equal(creditBody.gdCredits.length, 1);
-    assert.equal(creditBody.gdCredits[0].source, "deposit");
+    const creditBody = (await creditRes.json()) as { profile: { totalGdDepositedWei: string }; gdCredits?: unknown };
+    assert.equal(creditBody.gdCredits, undefined);
+    assert.notEqual(creditBody.profile.totalGdDepositedWei, "0");
+
+    const historyRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+    assert.equal(historyRes.status, 200);
+    const historyBody = (await historyRes.json()) as { items: Array<{ id: string; source: string }> };
+    assert.equal(historyBody.items.length, 1);
+    assert.equal(historyBody.items[0].source, "deposit");
   } finally {
     globalThis.fetch = originalFetch;
   }

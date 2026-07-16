@@ -58,8 +58,13 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - fetches all active incoming streams from the Superfluid subgraph
 - issues stream credits for each streamer and funds them
 
-**Credit check** (`GET /v1/accounts/:account/credit`):
-- returns the user's `UserCreditProfile` and list of `GdCreditEntry` records
+**Profile** (`GET /v1/accounts/:account/profile`):
+- returns the user's `UserCreditProfile` only
+
+**Credit history** (`GET /v1/accounts/:account/credit-history`):
+- returns paginated `GdCreditEntry` records newest-first
+- query params: `limit` (default 20, max 100), `offset` (default 0), optional `source`, `fundingStatus`, `from` / `to` (ISO `createdAt` range, inclusive)
+- response: `{ account, items, total, limit, offset, hasMore }`
 
 **Outstanding funding** (`GET /v1/accounts/:account/outstanding`):
 - returns `totalOutstandingFundingUsd` and all `GdCreditEntry` records with `fundingStatus = "pending"` or `"failed"`
