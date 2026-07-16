@@ -58,7 +58,7 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - fetches all active incoming streams from the Superfluid subgraph
 - issues stream credits for each streamer and funds them
 
-**Credit check** (`GET /v1/accounts/:account/credit`):
+**Profile** (`GET /v1/accounts/:account/profile`):
 - returns the user's `UserCreditProfile` only (optional `buyerAddress` from successful operator consent)
 
 **Credit history** (`GET /v1/accounts/:account/credit-history`):

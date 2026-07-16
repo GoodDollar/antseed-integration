@@ -271,7 +271,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     });
   }
 
-  const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit$/);
+  const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/profile$/);
   if (request.method === "GET" && accountMatch) {
     const account = decodeURIComponent(accountMatch[1]);
     const profile = await store.getUser(account);

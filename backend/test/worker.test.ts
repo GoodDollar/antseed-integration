@@ -62,10 +62,10 @@ test("config values exposes non-secret runtime constants", async () => {
   assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
 });
 
-test("GET /v1/accounts/:account/credit returns profile only", async () => {
+test("GET /v1/accounts/:account/profile returns profile only", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit`), testEnv, {} as ExecutionContext);
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/profile`), testEnv, {} as ExecutionContext);
   assert.equal(res.status, 200);
   const body = (await res.json()) as { account: string; profile: { totalGdDepositedWei: string }; gdCredits?: unknown };
   assert.equal(body.account, account);
@@ -163,7 +163,7 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
     assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
 
     // Verify credit was recorded
-    const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit`), testEnv, {} as ExecutionContext);
+    const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/profile`), testEnv, {} as ExecutionContext);
     assert.equal(creditRes.status, 200);
     const creditBody = (await creditRes.json()) as { profile: { totalGdDepositedWei: string }; gdCredits?: unknown };
     assert.equal(creditBody.gdCredits, undefined);
@@ -414,7 +414,7 @@ test("POST /v1/accounts/:account/operator-consent returns enabled:false when vau
   assert.equal(body.payer, payer);
   assert.equal(body.bridge.enabled, false);
 
-  const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${payer}/credit`), testEnv, {} as ExecutionContext);
+  const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${payer}/profile`), testEnv, {} as ExecutionContext);
   const creditBody = (await creditRes.json()) as { profile: { buyerAddress?: string } };
   assert.equal(creditBody.profile.buyerAddress, undefined);
 });

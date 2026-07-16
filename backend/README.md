@@ -15,7 +15,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `GET /health`
 - `GET /config/status`
 - `GET /config/values`
-- `GET /v1/accounts/:account/credit`
+- `GET /v1/accounts/:account/profile`
 - `GET /v1/accounts/:account/credit-history`
 - `GET /v1/accounts/:account/outstanding`
 - `POST /v1/accounts/:account/stream-credits`
@@ -25,7 +25,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/channels/:channelId/close`
 - `POST /v1/channels/:channelId/withdraw`
 
-`GET /v1/accounts/:account/credit` returns the wallet `UserCreditProfile` only (including `buyerAddress` when set via operator consent).
+`GET /v1/accounts/:account/profile` returns the wallet `UserCreditProfile` only (including `buyerAddress` when set via operator consent).
 
 `GET /v1/accounts/:account/credit-history` returns paginated `GdCreditEntry` history (newest first):
 

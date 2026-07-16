@@ -187,7 +187,7 @@ The Worker uses this to record the stream's `totalFlowWei` as a credit entry and
 ## Step 4 — Check your credit balance
 
 ```bash
-curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit"
+curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/profile"
 ```
 
 The response includes the wallet-level `UserCreditProfile` (principal, bonus, outstanding funding totals, and `buyerAddress` once operator consent has succeeded).
@@ -235,7 +235,7 @@ Look for:
 ### Check credits
 
 ```bash
-curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit"
+curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/profile"
 curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/credit-history"
 ```
 
