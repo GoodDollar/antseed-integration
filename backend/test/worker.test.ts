@@ -374,7 +374,7 @@ test("POST /v1/accounts/:account/operator-consent returns 400 on missing body fi
   assert.equal(res.status, 400);
 });
 
-test("POST /v1/accounts/:account/operator-consent returns 400 when payer is missing", async () => {
+test("POST /v1/accounts/:account/operator-consent returns enabled:false when vault not configured", async () => {
   const buyer = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/accounts/${buyer}/operator-consent`, {
@@ -388,35 +388,10 @@ test("POST /v1/accounts/:account/operator-consent returns 400 when payer is miss
     env(),
     {} as ExecutionContext
   );
-  assert.equal(res.status, 400);
-});
-
-test("POST /v1/accounts/:account/operator-consent returns enabled:false when vault not configured", async () => {
-  const buyer = "0x0000000000000000000000000000000000000abc";
-  const payer = "0x0000000000000000000000000000000000000def";
-  const testEnv = env();
-  const res = await worker.fetch(
-    new Request(`https://worker.test/v1/accounts/${buyer}/operator-consent`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        payer,
-        nonce: "0",
-        signature: `0x${"a".repeat(130)}`
-      })
-    }),
-    testEnv,
-    {} as ExecutionContext
-  );
   assert.equal(res.status, 200);
-  const body = (await res.json()) as { buyer: string; payer: string; bridge: { enabled: boolean } };
+  const body = (await res.json()) as { buyer: string; bridge: { enabled: boolean } };
   assert.equal(body.buyer, buyer);
-  assert.equal(body.payer, payer);
   assert.equal(body.bridge.enabled, false);
-
-  const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${payer}/profile`), testEnv, {} as ExecutionContext);
-  const creditBody = (await creditRes.json()) as { profile: { buyerAddress?: string } };
-  assert.equal(creditBody.profile.buyerAddress, undefined);
 });
 
 test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", async () => {

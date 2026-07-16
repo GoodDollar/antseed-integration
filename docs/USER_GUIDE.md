@@ -190,7 +190,7 @@ The Worker uses this to record the stream's `totalFlowWei` as a credit entry and
 curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/profile"
 ```
 
-The response includes the wallet-level `UserCreditProfile` (principal, bonus, outstanding funding totals, and `buyerAddress` once operator consent has succeeded).
+The response includes the wallet-level `UserCreditProfile` (principal, bonus, outstanding funding totals).
 
 To inspect credit entries with pagination and filters:
 

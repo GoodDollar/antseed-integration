@@ -211,30 +211,6 @@ export class KVCreditStore {
     return normalizeProfile(saved, normalized);
   }
 
-  async setBuyerAddressIfAbsent(payer: string, buyerAddress: string): Promise<UserCreditProfile> {
-    const normalized = normalizeAccount(payer);
-    const current = await this.getUser(normalized);
-    if (current.buyerAddress) {
-      logInfo("kv.user.buyer.unchanged", {
-        payer: redactAddress(normalized),
-        buyer: redactAddress(current.buyerAddress)
-      });
-      return current;
-    }
-    const now = new Date().toISOString();
-    const next: UserCreditProfile = {
-      ...current,
-      buyerAddress: buyerAddress.toLowerCase(),
-      updatedAt: now
-    };
-    await this.putJson(`${USER_PREFIX}${normalized}`, next);
-    logInfo("kv.user.buyer.set", {
-      payer: redactAddress(normalized),
-      buyer: redactAddress(next.buyerAddress)
-    });
-    return next;
-  }
-
   private async addGdCreditToAccount(account: string, entryId: string): Promise<void> {
     const key = `${USER_GD_CREDITS_PREFIX}${account}`;
     const ids = (await this.getJson<string[]>(key)) ?? [];
@@ -295,8 +271,7 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalPrincipalUsd: saved?.totalPrincipalUsd ?? "0",
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingUsd: saved?.totalOutstandingFundingUsd ?? "0",
-    lastStreamCreditAt: saved?.lastStreamCreditAt,
-    ...(saved?.buyerAddress && { buyerAddress: saved.buyerAddress.toLowerCase() })
+    lastStreamCreditAt: saved?.lastStreamCreditAt
   };
 }
 

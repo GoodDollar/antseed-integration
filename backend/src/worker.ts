@@ -44,7 +44,6 @@ const WithdrawPrincipalSchema = z.object({
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
 const OperatorConsentSchema = z.object({
-  payer: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
   nonce: z.string().regex(/^\d+$/),
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
@@ -498,23 +497,17 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const body = await parseJson(request);
     const parsed = OperatorConsentSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const payer = parsed.data.payer.toLowerCase();
     logInfo("operator.consent.request", {
       buyer: redactAddress(buyer),
-      payer: redactAddress(payer),
       nonce: parsed.data.nonce
     });
     const bridge = await antseedFundingVault.acceptBuyerOperator(buyer, BigInt(parsed.data.nonce), parsed.data.signature);
-    if (bridge.enabled) {
-      await store.setBuyerAddressIfAbsent(payer, buyer);
-    }
     logInfo("operator.consent.result", {
       buyer: redactAddress(buyer),
-      payer: redactAddress(payer),
       enabled: bridge.enabled,
       txHash: redactHash(bridge.txHash)
     });
-    return json({ buyer, payer, bridge });
+    return json({ buyer, bridge });
   }
 
   const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);

@@ -401,34 +401,6 @@ test("updateUser accumulates totals correctly across multiple deposits", async (
   assert.equal(done.totalOutstandingFundingUsd, "0");
 });
 
-test("setBuyerAddressIfAbsent sets buyer once and never overwrites", async () => {
-  const store = new KVCreditStore(new MemoryKV() as never);
-  const payer = "0xPAYER";
-  const root = "0xROOT";
-
-  await store.recordGdCredit({
-    id: "deposit:buyer1",
-    account: payer,
-    rootAccount: root,
-    source: "deposit",
-    gdAmountWei: 1_000_000_000_000_000_000n,
-    gdPrice: GD_PRICE,
-    isVerified: true,
-    maxBonusCapUsd: 100_000_000n
-  });
-
-  const first = await store.setBuyerAddressIfAbsent(payer, "0xBUYER1");
-  assert.equal(first.buyerAddress, "0xbuyer1");
-
-  const second = await store.setBuyerAddressIfAbsent(payer, "0xBUYER2");
-  assert.equal(second.buyerAddress, "0xbuyer1");
-
-  const wallet = await store.getUser(payer);
-  const rootProfile = await store.getUser(root);
-  assert.equal(wallet.buyerAddress, "0xbuyer1");
-  assert.equal(rootProfile.buyerAddress, undefined);
-});
-
 test("getGdCreditHistory paginates filters and sorts newest first", async () => {
   const kv = new MemoryKV();
   const store = new KVCreditStore(kv as never);
