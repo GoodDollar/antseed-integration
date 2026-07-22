@@ -88,6 +88,18 @@ contract MockCFA {
     }
 }
 
+contract MockERC1820Registry {
+    mapping(address => mapping(bytes32 => address)) public implementers;
+
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external {
+        implementers[account][interfaceHash] = implementer;
+    }
+
+    function getInterfaceImplementer(address account, bytes32 interfaceHash) external view returns (address) {
+        return implementers[account][interfaceHash];
+    }
+}
+
 contract MockSuperfluidHost {
     MockCFA public cfa;
     address public registeredApp;
@@ -287,6 +299,13 @@ contract CeloGdAntSeedVaultTest {
         user.transferAndCall(25 ether);
         require(vault.totalDepositedGd(address(user)) == 25 ether, "erc677 deposit recorded");
         require(token.balanceOf(address(vault)) == 25 ether, "vault funded");
+    }
+
+    function testErc777TokensReceivedSingleTxDeposit() public {
+        setUp();
+        token.erc777Send(address(0xBEEF), address(user), address(vault), 30 ether, abi.encode(BUYER));
+        require(vault.totalDepositedGd(address(user)) == 30 ether, "erc777 deposit recorded");
+        require(token.balanceOf(address(vault)) == 30 ether, "vault funded");
     }
 
     function testRejectsFirstDepositBelowOneUsdAndAllowsLaterSmallTopUps() public {
@@ -490,9 +509,53 @@ contract CeloGdAntSeedVaultTest {
             abi.encodeWithSignature("onTokenTransfer(address,uint256,bytes)", address(this), uint256(1 ether), abi.encode(BUYER))
         );
         require(!ok, "non-gd token onTokenTransfer rejected");
+
+        (ok, ) = address(vault).call(
+            abi.encodeWithSignature("tokenFallback(address,uint256,bytes)", address(this), uint256(1 ether), abi.encode(BUYER))
+        );
+        require(!ok, "non-gd token tokenFallback rejected");
+
+        (ok, ) = address(vault).call(
+            abi.encodeWithSignature(
+                "tokensReceived(address,address,address,uint256,bytes,bytes)",
+                address(this),
+                address(this),
+                address(vault),
+                uint256(1 ether),
+                abi.encode(BUYER),
+                bytes("")
+            )
+        );
+        require(!ok, "non-gd token tokensReceived rejected");
     }
 
-    // --- TransferFailed ---
+    function testErc777RejectsWrongReceiverInCallback() public {
+        setUp();
+        bool ok = token.callTokensReceivedWithTo(address(vault), address(user), address(0xBEEF), 1 ether, abi.encode(BUYER));
+        require(!ok, "wrong receiver in tokensReceived rejected");
+    }
+
+    function testTokenFallbackDeposit() public {
+        setUp();
+        token.mint(address(this), 50 ether);
+        bool ok = token.callTokenFallback(address(vault), address(this), 50 ether, abi.encode(BUYER));
+        require(ok, "tokenFallback deposit succeeded");
+        require(vault.totalDepositedGd(address(this)) == 50 ether, "tokenFallback deposit recorded");
+    }
+
+    function testRegisterERC777TokensRecipient() public {
+        setUp();
+        MockERC1820Registry registry = new MockERC1820Registry();
+        vault.registerERC777TokensRecipient(address(registry));
+        bytes32 interfaceHash = keccak256("ERC777TokensRecipient");
+        require(registry.getInterfaceImplementer(address(vault), interfaceHash) == address(vault), "recipient registered");
+    }
+
+    function testRegisterERC777TokensRecipientRejectsZeroRegistry() public {
+        setUp();
+        (bool ok, ) = address(vault).call(abi.encodeWithSignature("registerERC777TokensRecipient(address)", address(0)));
+        require(!ok, "zero registry rejected");
+    }
 
     function testTransferFailedRevertsDeposit() public {
         setUp();
@@ -536,6 +599,9 @@ contract CeloGdAntSeedVaultTest {
 
         (ok, ) = address(outsider).call(abi.encodeWithSignature("registerSuperApp(uint256)", uint256(1)));
         require(!ok, "non-owner registerSuperApp rejected");
+
+        (ok, ) = address(outsider).call(abi.encodeWithSignature("registerERC777TokensRecipient(address)", address(0x1820)));
+        require(!ok, "non-owner registerERC777TokensRecipient rejected");
     }
 
     // --- ZeroAddress in transferOwnership ---

@@ -49,6 +49,12 @@ interface IStaticOracleLike {
     ) external view returns (uint256 quoteAmount, address[] memory queriedPools);
 }
 
+interface IERC1820RegistryLike {
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external;
+
+    function getInterfaceImplementer(address account, bytes32 interfaceHash) external view returns (address);
+}
+
 /// @title CeloGdAntSeedVault
 /// @notice Celo-side G$ vault for AntSeed credits. No bridge logic is included.
 /// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
@@ -193,6 +199,28 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     function onTokenTransfer(address from, uint256 amount, bytes calldata data) external onlyGdToken returns (bool) {
         _recordTokenCallbackDeposit(from, amount, data);
         return true;
+    }
+
+    /// @notice Legacy ERC223/ERC667-style token fallback receiver used by some token implementations.
+    /// @dev `data` must be `abi.encode(buyerAddress)` — the AntSeed buyer to credit.
+    function tokenFallback(address from, uint256 amount, bytes calldata data) external onlyGdToken {
+        _recordTokenCallbackDeposit(from, amount, data);
+    }
+
+    /// @notice ERC777 tokensReceived hook for Superfluid Host ERC777_SEND / G$.send batch deposits.
+    /// @dev `userData` must be `abi.encode(buyerAddress)` — the AntSeed buyer to credit.
+    ///      Call `registerERC777TokensRecipient` after deploy so Host send with reception ack succeeds.
+    function tokensReceived(address, address from, address to, uint256 amount, bytes calldata userData, bytes calldata) external onlyGdToken {
+        if (to != address(this)) revert WrongReceiver();
+        _recordTokenCallbackDeposit(from, amount, userData);
+    }
+
+    /// @notice Registers this vault as ERC777TokensRecipient in ERC1820 (required for Host ERC777_SEND).
+    /// @param erc1820Registry Canonical ERC1820 registry (`0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24` on Celo).
+    function registerERC777TokensRecipient(address erc1820Registry) external onlyOwner {
+        if (erc1820Registry == address(0)) revert ZeroAddress();
+        bytes32 interfaceHash = keccak256("ERC777TokensRecipient");
+        IERC1820RegistryLike(erc1820Registry).setInterfaceImplementer(address(this), interfaceHash, address(this));
     }
 
     function beforeAgreementCreated(
