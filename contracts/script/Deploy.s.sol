@@ -10,6 +10,7 @@ import {AntseedBuyerOperator} from "../src/AntseedBuyerOperator.sol";
 /// forge script script/Deploy.s.sol:DeployCelo --rpc-url $CELO_RPC_URL --broadcast --verify --etherscan-api-key $CELOSCAN_API_KEY -vvvv
 contract DeployCelo is Script {
     string constant OUTPUT_FILE = "./deploy-celo-output.json";
+    address constant ERC1820_REGISTRY = 0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24;
     uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
     address deployer = vm.addr(deployerKey);
     address owner = vm.envAddress("OWNER_ADDRESS");
@@ -46,6 +47,13 @@ contract DeployCelo is Script {
         ERC1967Proxy vaultProxy = vaultProxyAddr.code.length == 0
             ? new ERC1967Proxy{salt: vaultProxySalt}(address(vaultImpl), vaultInitData)
             : ERC1967Proxy(payable(vaultProxyAddr));
+
+        if (deployer == owner) {
+            console.log("Registering vault as ERC777TokensRecipient in ERC1820");
+            CeloGdAntSeedVault(address(vaultProxy)).registerERC777TokensRecipient(ERC1820_REGISTRY);
+        } else {
+            console.log("Skipping ERC1820 registration - deployer is not owner; run post-deploy cast from OWNER");
+        }
 
         vm.stopBroadcast();
 

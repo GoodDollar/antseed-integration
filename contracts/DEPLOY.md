@@ -157,9 +157,36 @@ cast call "$SUPERFLUID_HOST" "isApp(address)(bool)" <vaultProxy> \
 
 > **Note:** `configWord` is network/version-specific. Consult the [Superfluid `SuperAppDefinitions`](https://github.com/superfluid-finance/protocol-monorepo/blob/dev/packages/ethereum-contracts/contracts/apps/SuperAppBase.sol) for the correct value if registering on a non-mainnet Celo network.
 
+### 5.4 Register the vault as ERC777TokensRecipient (Celo)
+
+Required for Superfluid Host `ERC777_SEND` / G$ `send` deposits (the 2-op batch path). The vault must implement `tokensReceived` **and** be registered in the canonical ERC1820 registry under `ERC777TokensRecipient`.
+
+`DeployCelo` calls this automatically when `DEPLOYER_PRIVATE_KEY` matches `OWNER_ADDRESS`. Otherwise (or after upgrading an older proxy that never registered), run:
+
+```bash
+# Canonical ERC1820 registry on all EVM chains including Celo
+cast send <vaultProxy> "registerERC777TokensRecipient(address)" \
+  0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24 \
+  --rpc-url "$CELO_RPC_URL" \
+  --private-key "$DEPLOYER_PRIVATE_KEY"
+```
+
+Verify registration:
+
+```bash
+cast call 0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24 \
+  "getInterfaceImplementer(address,bytes32)(address)" \
+  <vaultProxy> \
+  $(cast keccak "ERC777TokensRecipient") \
+  --rpc-url "$CELO_RPC_URL"
+# Expected: <vaultProxy>
+```
+
+Registration is on the **proxy** address, so it survives UUPS upgrades once set.
+
 ---
 
-### 5.4 Update the backend Worker config
+### 5.5 Update the backend Worker config
 
 Edit `backend/wrangler.toml` and set `CELO_VAULT_ADDRESS` to the `vaultProxy` address from `deploy-celo-output.json`. Then set the Base operator secrets (see `backend/DEPLOY.md`, step 3):
 
@@ -217,7 +244,9 @@ cast send <vaultProxy> \
   --private-key "$DEPLOYER_PRIVATE_KEY"
 ```
 
-4. Run `forge test -vvv` against a fork to validate before upgrading on mainnet:
+4. If this proxy was never registered for ERC777 (pre-`tokensReceived` deploys), run the §5.4 `registerERC777TokensRecipient` cast once. Skip if already registered — it persists across upgrades.
+
+5. Run `forge test -vvv` against a fork to validate before upgrading on mainnet:
 
 ```bash
 forge test -vvv --fork-url "$CELO_RPC_URL"
