@@ -9,12 +9,14 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
 - Optional Base `AntseedBuyerOperator` bridge client that calls `depositForWithId(buyer, principal, bonus, id)`
 - Cron trigger every minute for stream bonus settlement checks
+- Cron trigger every 6 hours for analytics aggregation (`/v1/analytics` data source)
 
 ## Endpoints
 
 - `GET /health`
 - `GET /config/status`
 - `GET /config/values`
+- `GET /v1/analytics`
 - `GET /v1/accounts/:account/profile`
 - `GET /v1/accounts/:account/credit-history`
 - `GET /v1/accounts/:account/outstanding`
@@ -38,6 +40,20 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `{ "txHash": "0x..." }`
 - `{ "account": "0x...", "fromBlock": "0x...", "toBlock": "latest" }`
 
+`GET /v1/analytics` returns daily and global analytics for the last 30 days by default:
+
+- query: `days` (default `30`, max `365`) — number of calendar days to return
+- response: `{ ok: true, days: DailyAnalytics[], global: GlobalAnalytics }`
+- `DailyAnalytics` fields:
+  - `date` (YYYY-MM-DD)
+  - `gdOneTimeDeposits` (wei)
+  - `gdStreamed` (cumulative wei streamed)
+  - `gdTotalFlowRate` (current total flow rate wei/sec)
+  - `aiCreditsUsed` (settled amount on Base)
+  - `uniqueGdBuyers` (count of distinct buyers)
+  - `uniqueCreditUsers` (count of distinct credit users)
+- `GlobalAnalytics` contains lifetime totals and current flow rate.
+
 ## Setup
 
 ```bash
@@ -54,6 +70,9 @@ Optional secrets/config:
 - `REGULAR_BONUS_BPS` - bonus basis points for deposits/non-stream sources, defaults to `1000` (10%).
 - `STREAMING_BONUS_BPS` - bonus basis points for stream sources, defaults to `2000` (20%).
 - `MIN_GD_STREAMED_FOR_BONUS` - minimum stream amount in G$ to issue stream credits, defaults to `4000`.
+- `BASE_RPC_URL` - Base RPC endpoint for analytics channel log fetches.
+- `BASE_BLOCKSCOUT_URL` - optional Blockscout API base URL for Base analytics.
+- `ANTSEED_CHANNELS_ADDRESS` - AntSeed Channels contract on Base for AI credits usage analytics.
 
 ## Config And Constants
 

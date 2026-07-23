@@ -104,9 +104,7 @@ export class AnalyticsClient {
       await this.mergeDailyRecord(date, update);
     }
 
-    if (updates.size > 0 || totalFlowRate > 0n) {
-      await this.updateGlobalTotals();
-    }
+    await this.updateGlobalTotals();
 
     const newLastRun: AnalyticsLastRun = {
       celoBlock: latestCeloBlock,
@@ -166,23 +164,22 @@ export class AnalyticsClient {
       gdStreamed: (BigInt(existing.gdStreamed) + BigInt(update.gdStreamed ?? 0n)).toString(),
       gdTotalFlowRate: update.gdTotalFlowRate?.toString() ?? existing.gdTotalFlowRate,
       aiCreditsUsed: (BigInt(existing.aiCreditsUsed) + BigInt(update.aiCreditsUsed ?? 0n)).toString(),
-      uniqueGdBuyers: existing.uniqueGdBuyers + (update.uniqueGdBuyers ?? 0),
-      uniqueCreditUsers: existing.uniqueCreditUsers + (update.uniqueCreditUsers ?? 0)
+      uniqueGdBuyers: Math.max(existing.uniqueGdBuyers, update.uniqueGdBuyers ?? 0),
+      uniqueCreditUsers: Math.max(existing.uniqueCreditUsers, update.uniqueCreditUsers ?? 0)
     };
 
     await this.kv.put(key, JSON.stringify(merged));
   }
 
   private async updateGlobalTotals(): Promise<void> {
-    const prefixLen = DAILY_PREFIX.length;
     const keys = await this.listJsonKeys(DAILY_PREFIX);
 
     let gdOneTimeDeposits = 0n;
     let gdStreamed = 0n;
     let gdTotalFlowRate = 0n;
     let aiCreditsUsed = 0n;
-    const gdBuyers = new Set<string>();
-    const creditUsers = new Set<string>();
+    let uniqueGdBuyers = 0;
+    let uniqueCreditUsers = 0;
 
     for (const key of keys) {
       const record = await this.getJson<DailyAnalytics>(key);
@@ -191,11 +188,8 @@ export class AnalyticsClient {
       gdStreamed += BigInt(record.gdStreamed);
       gdTotalFlowRate = BigInt(record.gdTotalFlowRate); // latest day wins
       aiCreditsUsed += BigInt(record.aiCreditsUsed);
-      // Recover unique wallets from per-day counts is lossy; global counts unique
-      // wallets by re-scanning would require storing sets per day. We approximate
-      // by summing daily counts as requested in the acceptance criteria for totals.
-      gdBuyers.add(key.slice(prefixLen));
-      creditUsers.add(key.slice(prefixLen));
+      uniqueGdBuyers += record.uniqueGdBuyers;
+      uniqueCreditUsers += record.uniqueCreditUsers;
     }
 
     const global: GlobalAnalytics = {
@@ -203,8 +197,8 @@ export class AnalyticsClient {
       gdStreamed: gdStreamed.toString(),
       gdTotalFlowRate: gdTotalFlowRate.toString(),
       aiCreditsUsed: aiCreditsUsed.toString(),
-      uniqueGdBuyers: gdBuyers.size,
-      uniqueCreditUsers: creditUsers.size
+      uniqueGdBuyers,
+      uniqueCreditUsers
     };
     await this.kv.put(GLOBAL_KEY, JSON.stringify(global));
   }
@@ -324,19 +318,12 @@ export class AnalyticsClient {
       return [];
     }
 
-    if (blockscout) {
-      try {
-        return await this.fetchBlockscoutChannelLogs(blockscout, address, fromBlock, toBlock);
-      } catch (error) {
-        logWarn("analytics.base.blockscout.failed", { message: errorMessage(error) });
-      }
-    }
-
     if (!rpcUrl) {
       logWarn("analytics.base.skipped", { reason: "missing_rpc" });
       return [];
     }
 
+    // Prefer RPC path; Blockscout fallback is available but not enabled by default.
     try {
       const eventSigs = [
         "Reserved(bytes32,address,address,uint128,bytes32,uint256)",
@@ -593,13 +580,13 @@ function toHex(n: number): string {
 }
 
 function utcDate(date: Date): string {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())).toISOString().slice(0, 10);
+  return date.toISOString().slice(0, 10);
 }
 
 function offsetDate(dateStr: string, days: number): string {
   const date = new Date(`${dateStr}T00:00:00.000Z`);
   date.setUTCDate(date.getUTCDate() + days);
-  return utcDate(date);
+  return date.toISOString().slice(0, 10);
 }
 
 const setSymbol = Symbol("analyticsSet");
