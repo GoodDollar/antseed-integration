@@ -37,7 +37,7 @@ function cfg(overrides: Partial<RuntimeConfig> = {}): RuntimeConfig {
     CELO_VAULT_ADDRESS: "0x0000000000000000000000000000000000000def",
     CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000fed",
     SUPERFLUID_SUBGRAPH_URL: "https://superfluid.local/subgraph",
-    BASE_RPC_URL: "https://base.rpc.local",
+    BASE_BLOCKSCOUT_URL: "https://base.blockscout.local",
     ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
     ...overrides
   } as RuntimeConfig;
@@ -132,6 +132,27 @@ test("runAggregation groups Celo deposits and Base settlements by UTC day", asyn
   assert.equal(day.aiCreditsUsed, "500000");
   assert.equal(day.uniqueGdBuyers, 1);
   assert.equal(day.uniqueCreditUsers, 1);
+});
+
+test("runAggregation keeps streamed totals separate from current flow rate", async () => {
+  const kv = new MemoryKV();
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const celoStream = encodeCeloStream(buyer, 12_345n);
+  const testFetch = buildFetch({
+    celoLogs: [celoStream],
+    baseLogs: [],
+    latestCeloBlock: 1_001,
+    latestBaseBlock: 5_000,
+    celoTimestamps: { 1_001: 1_756_000_000 }
+  });
+
+  const client = new AnalyticsClient({ kv: kv as never, cfg: cfg(), fetch: testFetch });
+  await client.runAggregation();
+  const analytics = await client.getAnalytics(365);
+  const day = analytics.days.find((d) => d.date === "2025-08-24");
+  assert.ok(day);
+  assert.equal(day.gdStreamed, "12345");
+  assert.equal(day.gdTotalFlowRate, "1000000000000000");
 });
 
 test("getAnalytics returns last N days defaulting to 30 and global totals", async () => {
@@ -237,6 +258,24 @@ function buildFetch(scenario: {
     if (body?.method === "eth_getLogs") {
       const isCelo = url.includes("celo");
       return Response.json({ jsonrpc: "2.0", id: body.id, result: isCelo ? scenario.celoLogs : scenario.baseLogs });
+    }
+
+    if (url.includes("/api/v2/addresses/")) {
+      return Response.json({
+        items: scenario.baseLogs.map((log) => ({
+          address: log.address,
+          topics: log.topics,
+          data: log.data,
+          block_number: String(log.blockNumber),
+          block_timestamp: new Date((scenario.baseTimestamps?.[log.blockNumber] ?? 1_756_000_100) * 1000).toISOString()
+        }))
+      });
+    }
+
+    if (url.includes("/api/v2/blocks")) {
+      return Response.json({
+        items: [{ height: String(scenario.latestBaseBlock) }]
+      });
     }
 
     if (body?.query) {

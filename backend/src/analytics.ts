@@ -79,22 +79,20 @@ export class AnalyticsClient {
     logInfo("analytics.run.start");
 
     const lastRun = await this.getLastRun();
-    const [latestCeloBlock, latestBaseBlock] = await Promise.all([
-      this.getLatestBlockNumber(this.cfg.CELO_RPC_URL),
-      this.getLatestBlockNumber(this.cfg.BASE_RPC_URL)
-    ]);
+    const latestCeloBlock = await this.getLatestBlockNumber(this.cfg.CELO_RPC_URL);
 
     const celoFrom = lastRun ? lastRun.celoBlock + 1 : 0;
     const baseFrom = lastRun ? lastRun.baseBlock + 1 : 0;
 
-    const [celoEvents, baseEvents, totalFlowRate] = await Promise.all([
+    const [celoEvents, baseResult, totalFlowRate, latestBaseBlock] = await Promise.all([
       this.fetchCeloVaultLogs(celoFrom, latestCeloBlock),
-      this.fetchBaseChannelLogs(baseFrom, latestBaseBlock),
-      this.fetchCurrentTotalFlowRate()
+      this.fetchBaseChannelLogs(baseFrom),
+      this.fetchCurrentTotalFlowRate(),
+      this.fetchBaseLatestBlock()
     ]);
 
-    const blockTimestamps = await this.fetchBlockTimestamps(celoEvents, baseEvents);
-    const updates = this.buildDailyUpdates(celoEvents, baseEvents, blockTimestamps, totalFlowRate);
+    const blockTimestamps = await this.fetchCeloBlockTimestamps(celoEvents);
+    const updates = this.buildDailyUpdates(celoEvents, baseResult.events, blockTimestamps, totalFlowRate);
 
     for (const [date, update] of updates) {
       await this.mergeDailyRecord(date, update);
@@ -104,7 +102,7 @@ export class AnalyticsClient {
 
     const newLastRun: AnalyticsLastRun = {
       celoBlock: latestCeloBlock,
-      baseBlock: latestBaseBlock,
+      baseBlock: Math.max(lastRun?.baseBlock ?? 0, baseResult.latestBlock, latestBaseBlock),
       timestamp: new Date().toISOString()
     };
     await this.kv.put(LAST_RUN_KEY, JSON.stringify(newLastRun));
@@ -113,9 +111,9 @@ export class AnalyticsClient {
       celoFrom,
       latestCeloBlock,
       baseFrom,
-      latestBaseBlock,
+      latestBaseBlock: newLastRun.baseBlock,
       celoEvents: celoEvents.length,
-      baseEvents: baseEvents.length,
+      baseEvents: baseResult.events.length,
       totalFlowRate: totalFlowRate.toString(),
       daysUpdated: updates.size,
       elapsedMs: Date.now() - startedAt
@@ -202,12 +200,10 @@ export class AnalyticsClient {
     await this.kv.put(GLOBAL_KEY, JSON.stringify(global));
   }
 
-  private buildDailyUpdates(
-    celoEvents: CeloVaultLog[],
-    baseEvents: BaseChannelLog[],
-    blockTimestamps: Map<number, number>,
-    totalFlowRate: bigint
-  ): Map<string, DailyAnalytics> {
+  private buildDailyUpdates(celoEvents: CeloVaultLog[], baseEvents: BaseChannelLog[], blockTimestamps: Map<number, number>, totalFlowRate: bigint): Map<
+    string,
+    DailyAnalytics
+  > {
     const updates = new Map<string, DailyAnalytics>();
 
     for (const event of celoEvents) {
@@ -219,7 +215,7 @@ export class AnalyticsClient {
       if (event.kind === "deposit") {
         current.gdOneTimeDeposits = (BigInt(current.gdOneTimeDeposits) + event.gdAmountWei).toString();
       } else {
-        current.gdStreamed = (BigInt(current.gdStreamed) + event.totalFlowWei).toString();
+        current.gdStreamed = (BigInt(current.gdStreamed) + event.streamedAmountWei).toString();
       }
 
       // Count unique buyer per day: store buyer in a temporary set on the record object.
@@ -231,9 +227,7 @@ export class AnalyticsClient {
     }
 
     for (const event of baseEvents) {
-      const timestamp = blockTimestamps.get(event.blockNumber);
-      if (timestamp === undefined) continue;
-      const date = utcDate(new Date(timestamp * 1000));
+      const date = utcDate(new Date(event.timestamp * 1000));
       const current = updates.get(date) ?? emptyDailyRecord(date);
 
       if (event.kind === "ChannelSettled" || event.kind === "ChannelClosed") {
@@ -250,24 +244,21 @@ export class AnalyticsClient {
     return updates;
   }
 
-  private async fetchBlockTimestamps(celoEvents: CeloVaultLog[], baseEvents: BaseChannelLog[]): Promise<Map<number, number>> {
+  private async fetchCeloBlockTimestamps(celoEvents: CeloVaultLog[]): Promise<Map<number, number>> {
     const blockNumbers = new Set<number>();
     for (const event of celoEvents) blockNumbers.add(event.blockNumber);
-    for (const event of baseEvents) blockNumbers.add(event.blockNumber);
 
     const timestamps = new Map<number, number>();
     await Promise.all(
       Array.from(blockNumbers).map(async (blockNumber) => {
-        const isCelo = celoEvents.some((e) => e.blockNumber === blockNumber);
-        const rpcUrl = isCelo ? this.cfg.CELO_RPC_URL : this.cfg.BASE_RPC_URL;
-        if (!rpcUrl) return;
+        if (!this.cfg.CELO_RPC_URL) return;
         try {
-          const timestamp = await this.fetchBlockTimestamp(rpcUrl, blockNumber);
+          const timestamp = await this.fetchBlockTimestamp(this.cfg.CELO_RPC_URL, blockNumber);
           if (timestamp !== undefined) timestamps.set(blockNumber, timestamp);
         } catch (error) {
           logWarn("analytics.block.timestamp.failed", {
             blockNumber,
-            chain: isCelo ? "celo" : "base",
+            chain: "celo",
             message: errorMessage(error)
           });
         }
@@ -311,61 +302,67 @@ export class AnalyticsClient {
     ];
   }
 
-  private async fetchBaseChannelLogs(fromBlock: number, toBlock: number): Promise<BaseChannelLog[]> {
-    if (fromBlock > toBlock) return [];
-
-    const blockscout = this.cfg.BASE_BLOCKSCOUT_URL;
-    const rpcUrl = this.cfg.BASE_RPC_URL;
-    const address = this.cfg.ANTSEED_CHANNELS_ADDRESS;
-    if (!address) {
-      logWarn("analytics.base.skipped", { reason: "missing_channels_address" });
-      return [];
-    }
-
-    if (!rpcUrl) {
-      logWarn("analytics.base.skipped", { reason: "missing_rpc" });
-      return [];
-    }
-
-    // Prefer RPC path; Blockscout fallback is available but not enabled by default.
-    try {
-      const eventSigs = this.channelEventSignatures()
-        .map((sig) => ANTSEED_CHANNELS_ABI.getEvent(sig)?.topicHash)
-        .filter(Boolean) as string[];
-
-      const logs = await this.rpc<RpcLog[]>(rpcUrl, "eth_getLogs", [{
-        address,
-        fromBlock: toHex(fromBlock),
-        toBlock: toHex(toBlock),
-        topics: [eventSigs]
-      }]);
-      return this.parseBaseLogs(logs ?? []);
-    } catch (error) {
-      logError("analytics.base.fetch.failed", { message: errorMessage(error) });
-      return [];
-    }
-  }
-
-  private async fetchBlockscoutChannelLogs(
-    baseUrl: string,
-    address: string,
-    fromBlock: number,
-    toBlock: number
-  ): Promise<BaseChannelLog[]> {
-    const topic0 = this.channelEventSignatures()
+  private channelEventTopic0(): string {
+    return this.channelEventSignatures()
       .map((sig) => ANTSEED_CHANNELS_ABI.getEvent(sig)?.topicHash)
       .filter(Boolean)
       .join(",");
-    const url = new URL(`${baseUrl.replace(/\/$/, "")}/api/v2/addresses/${address}/logs`);
-    url.searchParams.set("from_block", String(fromBlock));
-    url.searchParams.set("to_block", String(toBlock));
-    url.searchParams.set("topic0", topic0);
+  }
 
-    const response = await this.fetchImpl(url.toString());
-    if (!response.ok) throw new Error(`Blockscout HTTP ${response.status}`);
-    const body = (await response.json()) as { items?: BlockscoutLog[] };
-    const items = body.items ?? [];
-    return this.parseBaseBlockscoutLogs(items);
+  private async fetchBaseChannelLogs(fromBlock: number): Promise<{ events: BaseChannelLog[]; latestBlock: number }> {
+    const baseUrl = this.cfg.BASE_BLOCKSCOUT_URL;
+    const address = this.cfg.ANTSEED_CHANNELS_ADDRESS;
+    if (!baseUrl) {
+      logWarn("analytics.base.skipped", { reason: "missing_blockscout" });
+      return { events: [], latestBlock: 0 };
+    }
+    if (!address) {
+      logWarn("analytics.base.skipped", { reason: "missing_channels_address" });
+      return { events: [], latestBlock: 0 };
+    }
+
+    const endpoint = `${baseUrl.replace(/\/$/, "")}/api/v2/addresses/${address}/logs`;
+    const events: BaseChannelLog[] = [];
+    const topic0 = this.channelEventTopic0();
+    let nextPage: Record<string, string | number | undefined> | undefined = { from_block: fromBlock, topic0 };
+
+    try {
+      while (nextPage) {
+        const url = new URL(endpoint);
+        for (const [key, value] of Object.entries(nextPage)) {
+          if (value !== undefined) url.searchParams.set(key, String(value));
+        }
+        if (!url.searchParams.has("topic0")) url.searchParams.set("topic0", topic0);
+        const response = await this.fetchImpl(url.toString());
+        if (!response.ok) throw new Error(`Blockscout HTTP ${response.status}`);
+        const body = (await response.json()) as {
+          items?: BlockscoutLog[];
+          next_page_params?: Record<string, string | number | undefined> | null;
+        };
+        events.push(...this.parseBaseBlockscoutLogs(body.items ?? []));
+        nextPage = body.next_page_params ?? undefined;
+      }
+      const latestBlock = events.reduce((max, event) => Math.max(max, event.blockNumber), 0);
+      return { events, latestBlock };
+    } catch (error) {
+      logError("analytics.base.fetch.failed", { message: errorMessage(error) });
+      return { events: [], latestBlock: 0 };
+    }
+  }
+
+  private async fetchBaseLatestBlock(): Promise<number> {
+    const baseUrl = this.cfg.BASE_BLOCKSCOUT_URL;
+    if (!baseUrl) return 0;
+    try {
+      const response = await this.fetchImpl(`${baseUrl.replace(/\/$/, "")}/api/v2/blocks?items_count=1`);
+      if (!response.ok) throw new Error(`Blockscout HTTP ${response.status}`);
+      const body = (await response.json()) as { items?: Array<{ height?: string | number; number?: string | number }> };
+      const first = body.items?.[0];
+      return asInteger(first?.height ?? first?.number) ?? 0;
+    } catch (error) {
+      logWarn("analytics.base.latestBlock.failed", { message: errorMessage(error) });
+      return 0;
+    }
   }
 
   private parseBaseBlockscoutLogs(items: BlockscoutLog[]): BaseChannelLog[] {
@@ -378,21 +375,25 @@ export class AnalyticsClient {
           });
           if (!decoded) return undefined;
           const buyer = getAddress(decoded.args.buyer).toLowerCase();
-          const blockNumber = Number(item.block_number ?? item.blockNumber);
+          const blockNumber = asInteger(item.block_number ?? item.blockNumber);
+          const timestamp = parseTimestamp(item.block_timestamp ?? item.timestamp ?? item.block?.timestamp);
+          if (blockNumber === undefined || timestamp === undefined) return undefined;
           if (decoded.name === "ChannelSettled" || decoded.name === "ChannelClosed") {
             return {
               kind: decoded.name,
               channelId: String(decoded.args.channelId),
               buyer,
               settledAmount: BigInt(decoded.args.settledAmount.toString()),
-              blockNumber
+              blockNumber,
+              timestamp
             };
           }
           return {
             kind: decoded.name as Exclude<BaseChannelLog["kind"], "ChannelSettled" | "ChannelClosed">,
             channelId: String(decoded.args.channelId),
             buyer,
-            blockNumber
+            blockNumber,
+            timestamp
           };
         } catch {
           return undefined;
@@ -422,41 +423,7 @@ export class AnalyticsClient {
           parsed.push({
             kind: "stream",
             buyer: getAddress(decoded.args.buyer).toLowerCase(),
-            totalFlowWei: BigInt(decoded.args.totalFlowWei.toString()),
-            blockNumber
-          });
-        }
-      } catch {
-        // ignore undecodable logs
-      }
-    }
-    return parsed;
-  }
-
-  private parseBaseLogs(logs: RpcLog[]): BaseChannelLog[] {
-    const normalizedAddress = this.cfg.ANTSEED_CHANNELS_ADDRESS ? getAddress(this.cfg.ANTSEED_CHANNELS_ADDRESS) : "";
-    const parsed: BaseChannelLog[] = [];
-
-    for (const log of logs) {
-      if (normalizedAddress && getAddress(log.address) !== normalizedAddress) continue;
-      try {
-        const decoded = ANTSEED_CHANNELS_ABI.parseLog({ topics: log.topics, data: log.data });
-        if (!decoded) continue;
-        const buyer = getAddress(decoded.args.buyer).toLowerCase();
-        const blockNumber = Number(log.blockNumber);
-        if (decoded.name === "ChannelSettled" || decoded.name === "ChannelClosed") {
-          parsed.push({
-            kind: decoded.name,
-            channelId: String(decoded.args.channelId),
-            buyer,
-            settledAmount: BigInt(decoded.args.settledAmount.toString()),
-            blockNumber
-          });
-        } else {
-          parsed.push({
-            kind: decoded.name as Exclude<BaseChannelLog["kind"], "ChannelSettled" | "ChannelClosed">,
-            channelId: String(decoded.args.channelId),
-            buyer,
+            streamedAmountWei: BigInt(decoded.args.totalFlowWei.toString()),
             blockNumber
           });
         }
@@ -593,11 +560,18 @@ function getSet(record: DailyAnalytics, key: "__gdBuyers" | "__creditUsers"): Se
 
 type CeloVaultLog =
   | { kind: "deposit"; buyer: string; gdAmountWei: bigint; blockNumber: number }
-  | { kind: "stream"; buyer: string; totalFlowWei: bigint; blockNumber: number };
+  | { kind: "stream"; buyer: string; streamedAmountWei: bigint; blockNumber: number };
 
 type BaseChannelLog =
-  | { kind: "Reserved" | "ChannelTopUp" | "ChannelWithdrawn" | "CloseRequested"; channelId: string; buyer: string; blockNumber: number }
-  | { kind: "ChannelSettled" | "ChannelClosed"; channelId: string; buyer: string; settledAmount: bigint; blockNumber: number };
+  | { kind: "Reserved" | "ChannelTopUp" | "ChannelWithdrawn" | "CloseRequested"; channelId: string; buyer: string; blockNumber: number; timestamp: number }
+  | {
+    kind: "ChannelSettled" | "ChannelClosed";
+    channelId: string;
+    buyer: string;
+    settledAmount: bigint;
+    blockNumber: number;
+    timestamp: number;
+  };
 
 type RpcLog = {
   address: string;
@@ -612,10 +586,37 @@ type BlockscoutLog = {
   address: string;
   topics: string[];
   data: string;
-  block_number?: string;
-  blockNumber?: string;
-  transaction_hash?: string;
-  log_index?: string;
+  block_number?: string | number;
+  blockNumber?: string | number;
+  block_timestamp?: string | number;
+  timestamp?: string | number;
+  block?: { timestamp?: string | number };
 };
+
+function asInteger(value: string | number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (/^0x/i.test(value)) {
+    const n = Number.parseInt(value, 16);
+    return Number.isNaN(n) ? undefined : n;
+  }
+  const n = Number.parseInt(value, 10);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+function parseTimestamp(value: string | number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "number") return value > 1_000_000_000_000 ? Math.floor(value / 1000) : value;
+  if (/^0x/i.test(value)) {
+    const ts = Number.parseInt(value, 16);
+    return Number.isNaN(ts) ? undefined : ts;
+  }
+  if (/^\d+$/.test(value)) {
+    const ts = Number.parseInt(value, 10);
+    return ts > 1_000_000_000_000 ? Math.floor(ts / 1000) : ts;
+  }
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? undefined : Math.floor(parsed / 1000);
+}
 
 export { ANTSEED_CHANNELS_ABI };

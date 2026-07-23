@@ -47,7 +47,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `DailyAnalytics` fields:
   - `date` (YYYY-MM-DD)
   - `gdOneTimeDeposits` (wei)
-  - `gdStreamed` (cumulative wei streamed)
+  - `gdStreamed` (cumulative streamed wei from `StreamUpdated.totalFlowWei`; distinct from live flow rate)
   - `gdTotalFlowRate` (current total flow rate wei/sec)
   - `aiCreditsUsed` (settled amount on Base)
   - `uniqueGdBuyers` (count of distinct buyers)
@@ -70,8 +70,7 @@ Optional secrets/config:
 - `REGULAR_BONUS_BPS` - bonus basis points for deposits/non-stream sources, defaults to `1000` (10%).
 - `STREAMING_BONUS_BPS` - bonus basis points for stream sources, defaults to `2000` (20%).
 - `MIN_GD_STREAMED_FOR_BONUS` - minimum stream amount in G$ to issue stream credits, defaults to `4000`.
-- `BASE_RPC_URL` - Base RPC endpoint for analytics channel log fetches.
-- `BASE_BLOCKSCOUT_URL` - optional Blockscout API base URL for Base analytics.
+- `BASE_BLOCKSCOUT_URL` - Blockscout API base URL for Base analytics channel logs.
 - `ANTSEED_CHANNELS_ADDRESS` - AntSeed Channels contract on Base for AI credits usage analytics.
 
 ## Config And Constants
