@@ -102,9 +102,15 @@ contract MockSuperfluidHost {
         registeredConfigWord = configWord;
     }
 
-    /// @dev For testing: treats the entire ctx bytes as userData so tests can pass abi.encode(buyer) as ctx.
+    /// @dev For testing:
+    /// - stream callbacks: ctx = abi.encode(buyer) → userData only
+    /// - depositFromAction: ctx = abi.encode(msgSender, userData)
     function decodeCtx(bytes calldata ctx) external pure returns (ISuperfluidHostLike.Context memory context) {
-        context.userData = ctx;
+        if (ctx.length > 32) {
+            (context.msgSender, context.userData) = abi.decode(ctx, (address, bytes));
+        } else {
+            context.userData = ctx;
+        }
     }
 
     function createFlow(CeloGdAntSeedVault vault, address superToken, address sender, int96 flowRate, bytes calldata ctx) external returns (bytes memory) {
@@ -128,6 +134,16 @@ contract MockSuperfluidHost {
     /// @dev Simulates a Superfluid batch call: the host calls depositFrom on the vault on behalf of `sender`.
     function callDepositFrom(CeloGdAntSeedVault vault, address sender, uint256 amount, bytes calldata data) external returns (uint256) {
         return vault.depositFrom(sender, amount, data);
+    }
+
+    /// @dev Simulates Host CALL_APP_ACTION → depositFromAction with injected ctx.msgSender.
+    function callDepositFromAction(
+        CeloGdAntSeedVault vault,
+        address sender,
+        uint256 amount,
+        bytes calldata data
+    ) external returns (bytes memory) {
+        return vault.depositFromAction(amount, data, abi.encode(sender, bytes("")));
     }
 
     function createFlowWrongReceiver(
@@ -717,6 +733,55 @@ contract CeloGdAntSeedVaultTest {
         // Calling depositFrom directly (not from the host) must revert.
         (bool ok, ) = address(vault).call(abi.encodeWithSignature("depositFrom(address,uint256,bytes)", address(user), uint256(10 ether), abi.encode(BUYER)));
         require(!ok, "non-host depositFrom rejected");
+    }
+
+    function testDepositFromActionViaCallAppAction() public {
+        setUp();
+        user.approveVault(40 ether);
+
+        (bool ok, bytes memory retData) = address(host).call(
+            abi.encodeWithSignature(
+                "callDepositFromAction(address,address,uint256,bytes)",
+                address(vault),
+                address(user),
+                uint256(40 ether),
+                abi.encode(BUYER)
+            )
+        );
+        require(ok, "depositFromAction via host succeeded");
+        bytes memory returnedCtx = abi.decode(retData, (bytes));
+        require(returnedCtx.length > 0, "returns ctx");
+        require(vault.totalDepositedGd(address(user)) == 40 ether, "deposit recorded under ctx.msgSender");
+        require(token.balanceOf(address(vault)) == 40 ether, "vault holds transferred tokens");
+    }
+
+    function testDepositFromActionRejectsNonHost() public {
+        setUp();
+        user.approveVault(10 ether);
+        (bool ok, ) = address(vault).call(
+            abi.encodeWithSignature(
+                "depositFromAction(uint256,bytes,bytes)",
+                uint256(10 ether),
+                abi.encode(BUYER),
+                abi.encode(address(user), bytes(""))
+            )
+        );
+        require(!ok, "non-host depositFromAction rejected");
+    }
+
+    function testDepositFromActionRejectsZeroMsgSender() public {
+        setUp();
+        user.approveVault(10 ether);
+        (bool ok, ) = address(host).call(
+            abi.encodeWithSignature(
+                "callDepositFromAction(address,address,uint256,bytes)",
+                address(vault),
+                address(0),
+                uint256(10 ether),
+                abi.encode(BUYER)
+            )
+        );
+        require(!ok, "zero msgSender depositFromAction rejected");
     }
 }
 
