@@ -1,6 +1,6 @@
 import { getAddress, Interface } from "ethers";
 import { RuntimeConfig } from "./env.js";
-import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
+import { errorMessage, logError, logInfo, logWarn } from "./logging.js";
 
 /**
  * Minimal AntSeed Channels ABI for analytics. Events defined from the contract
@@ -307,6 +307,17 @@ export class AnalyticsClient {
     }
   }
 
+  private channelEventSignatures(): string[] {
+    return [
+      "Reserved(bytes32,address,address,uint128,bytes32,uint256)",
+      "ChannelSettled(bytes32,address,uint256)",
+      "ChannelClosed(bytes32,address,uint256)",
+      "ChannelTopUp(bytes32,address,uint256)",
+      "ChannelWithdrawn(bytes32,address,uint256)",
+      "CloseRequested(bytes32,address,uint256)"
+    ];
+  }
+
   private async fetchBaseChannelLogs(fromBlock: number, toBlock: number): Promise<BaseChannelLog[]> {
     if (fromBlock > toBlock) return [];
 
@@ -325,14 +336,9 @@ export class AnalyticsClient {
 
     // Prefer RPC path; Blockscout fallback is available but not enabled by default.
     try {
-      const eventSigs = [
-        "Reserved(bytes32,address,address,uint128,bytes32,uint256)",
-        "ChannelSettled(bytes32,address,uint256)",
-        "ChannelClosed(bytes32,address,uint256)",
-        "ChannelTopUp(bytes32,address,uint256)",
-        "ChannelWithdrawn(bytes32,address,uint256)",
-        "CloseRequested(bytes32,address,uint256)"
-      ].map((sig) => ANTSEED_CHANNELS_ABI.getEvent(sig)?.topicHash).filter(Boolean) as string[];
+      const eventSigs = this.channelEventSignatures()
+        .map((sig) => ANTSEED_CHANNELS_ABI.getEvent(sig)?.topicHash)
+        .filter(Boolean) as string[];
 
       const logs = await this.rpc<RpcLog[]>(rpcUrl, "eth_getLogs", [{
         address,
@@ -353,15 +359,10 @@ export class AnalyticsClient {
     fromBlock: number,
     toBlock: number
   ): Promise<BaseChannelLog[]> {
-    const eventTopics = [
-      "Reserved(bytes32,address,address,uint128,bytes32,uint256)",
-      "ChannelSettled(bytes32,address,uint256)",
-      "ChannelClosed(bytes32,address,uint256)",
-      "ChannelTopUp(bytes32,address,uint256)",
-      "ChannelWithdrawn(bytes32,address,uint256)",
-      "CloseRequested(bytes32,address,uint256)"
-    ];
-    const topic0 = eventTopics.map((sig) => ANTSEED_CHANNELS_ABI.getEvent(sig)?.topicHash).filter(Boolean).join(",");
+    const topic0 = this.channelEventSignatures()
+      .map((sig) => ANTSEED_CHANNELS_ABI.getEvent(sig)?.topicHash)
+      .filter(Boolean)
+      .join(",");
     const url = new URL(`${baseUrl.replace(/\/$/, "")}/api/v2/addresses/${address}/logs`);
     url.searchParams.set("from_block", String(fromBlock));
     url.searchParams.set("to_block", String(toBlock));
