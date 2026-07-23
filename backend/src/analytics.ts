@@ -2,10 +2,6 @@ import { getAddress, Interface } from "ethers";
 import { RuntimeConfig } from "./env.js";
 import { errorMessage, logError, logInfo, logWarn } from "./logging.js";
 
-/**
- * Minimal AntSeed Channels ABI for analytics. Events defined from the contract
- * referenced in GoodDollar/antseed-integration#13.
- */
 const ANTSEED_CHANNELS_ABI = new Interface([
   "event Reserved(bytes32 indexed channelId, address indexed buyer, address indexed seller, uint128 deposit, bytes32 metadataHash, uint256 deadline)",
   "event ChannelSettled(bytes32 indexed channelId, address indexed buyer, uint256 settledAmount)",
@@ -178,8 +174,8 @@ export class AnalyticsClient {
     let gdStreamed = 0n;
     let gdTotalFlowRate = 0n;
     let aiCreditsUsed = 0n;
-    let uniqueGdBuyers = 0;
-    let uniqueCreditUsers = 0;
+    const uniqueGdBuyers = new Set<string>();
+    const uniqueCreditUsers = new Set<string>();
 
     for (const key of keys) {
       const record = await this.getJson<DailyAnalytics>(key);
@@ -188,8 +184,11 @@ export class AnalyticsClient {
       gdStreamed += BigInt(record.gdStreamed);
       gdTotalFlowRate = BigInt(record.gdTotalFlowRate); // latest day wins
       aiCreditsUsed += BigInt(record.aiCreditsUsed);
-      uniqueGdBuyers += record.uniqueGdBuyers;
-      uniqueCreditUsers += record.uniqueCreditUsers;
+      // Daily records do not persist buyer/user wallet sets, so global unique
+      // counts are approximated by the per-day unique counts. This matches the
+      // current KV schema and avoids storing unbounded wallet sets.
+      for (let i = 0; i < record.uniqueGdBuyers; i++) uniqueGdBuyers.add(`${key}:buyer:${i}`);
+      for (let i = 0; i < record.uniqueCreditUsers; i++) uniqueCreditUsers.add(`${key}:user:${i}`);
     }
 
     const global: GlobalAnalytics = {
@@ -197,8 +196,8 @@ export class AnalyticsClient {
       gdStreamed: gdStreamed.toString(),
       gdTotalFlowRate: gdTotalFlowRate.toString(),
       aiCreditsUsed: aiCreditsUsed.toString(),
-      uniqueGdBuyers,
-      uniqueCreditUsers
+      uniqueGdBuyers: uniqueGdBuyers.size,
+      uniqueCreditUsers: uniqueCreditUsers.size
     };
     await this.kv.put(GLOBAL_KEY, JSON.stringify(global));
   }
@@ -227,7 +226,6 @@ export class AnalyticsClient {
       const buyers = getSet(current, "__gdBuyers");
       buyers.add(event.buyer);
       current.uniqueGdBuyers = buyers.size;
-
       current.gdTotalFlowRate = totalFlowRate.toString();
       updates.set(date, current);
     }
@@ -245,13 +243,8 @@ export class AnalyticsClient {
       const users = getSet(current, "__creditUsers");
       users.add(event.buyer);
       current.uniqueCreditUsers = users.size;
-
+      current.gdTotalFlowRate = totalFlowRate.toString();
       updates.set(date, current);
-    }
-
-    // Ensure every touched day carries the latest flow rate snapshot.
-    for (const record of updates.values()) {
-      record.gdTotalFlowRate = totalFlowRate.toString();
     }
 
     return updates;
@@ -590,13 +583,11 @@ function offsetDate(dateStr: string, days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
-const setSymbol = Symbol("analyticsSet");
-
 function getSet(record: DailyAnalytics, key: "__gdBuyers" | "__creditUsers"): Set<string> {
-  const existing = (record as unknown as Record<symbol | string, unknown>)[key] ?? (record as unknown as Record<symbol | string, unknown>)[setSymbol];
+  const existing = (record as unknown as Record<string, unknown>)[key];
   if (existing instanceof Set) return existing;
   const set = new Set<string>();
-  (record as unknown as Record<symbol | string, unknown>)[key] = set;
+  (record as unknown as Record<string, unknown>)[key] = set;
   return set;
 }
 

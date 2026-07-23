@@ -210,7 +210,7 @@ export default {
       elapsedMs: Date.now() - startedAt
     });
 
-    // Run analytics aggregation on every 6-hour cron invocation.
+    // Run analytics aggregation in the background on every cron invocation.
     const analyticsClient = new AnalyticsClient({ kv: env.ANTSEED_KV, cfg });
     ctx.waitUntil(analyticsClient.runAggregation());
   }
