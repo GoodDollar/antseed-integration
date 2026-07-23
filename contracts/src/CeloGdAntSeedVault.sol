@@ -183,6 +183,24 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     /// @param data ABI-encoded AntSeed buyer address: `abi.encode(buyerAddress)`. Required.
     /// @return The total G$ deposited by the sender (including this callback)
     function depositFrom(address sender, uint256 amount, bytes calldata data) external onlySuperfluidHost returns (uint256) {
+        return _executeDepositFrom(sender, amount, data);
+    }
+
+    /// @notice CALL_APP_ACTION wrapper for Host `batchCall`. Leaves `depositFrom` unchanged.
+    /// @dev Trailing `ctx` is the Superfluid placeholder the Host replaces. Depositor = `decodeCtx(ctx).msgSender`.
+    ///      `data` remains `abi.encode(buyerAddress)` (app payload — not Superfluid ctx).
+    function depositFromAction(
+        uint256 amount,
+        bytes calldata data,
+        bytes calldata ctx
+    ) external onlySuperfluidHost returns (bytes memory newCtx) {
+        address sender = ISuperfluidHostLike(superfluidHost).decodeCtx(ctx).msgSender;
+        if (sender == address(0)) revert ZeroAddress();
+        _executeDepositFrom(sender, amount, data);
+        return ctx;
+    }
+
+    function _executeDepositFrom(address sender, uint256 amount, bytes calldata data) private returns (uint256) {
         _recordTokenCallbackDeposit(sender, amount, data);
         _safeTransferFrom(sender, address(this), amount);
         return totalDepositedGd[sender];
