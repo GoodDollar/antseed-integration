@@ -6,6 +6,9 @@ export interface Env {
   ANTSEED_FUNDING_RPC_URL?: string;
   ANTSEED_FUNDING_VAULT_ADDRESS?: string;
   ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY?: string;
+  BASE_RPC_URL?: string;
+  BASE_CHANNELS_ADDRESS?: string;
+  ANALYTICS_REFRESH_INTERVAL_SECONDS?: string;
   SLACK_WEBHOOK_URL?: string;
 
   GD_CUSD_PRICE?: string;
@@ -26,6 +29,9 @@ export type RuntimeConfig = {
   ANTSEED_FUNDING_RPC_URL?: string;
   ANTSEED_FUNDING_VAULT_ADDRESS?: string;
   ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY?: string;
+  BASE_RPC_URL?: string;
+  BASE_CHANNELS_ADDRESS?: string;
+  ANALYTICS_REFRESH_INTERVAL_SECONDS?: number;
   SLACK_WEBHOOK_URL?: string;
   /** G$ price in cUSD as a decimal number, e.g. 0.001154 means 1 G$ = 0.001154 cUSD */
   GD_CUSD_PRICE: number;
@@ -42,11 +48,16 @@ export type RuntimeConfig = {
   MIN_STREAM_BONUS_WEI: bigint;
 };
 
+const DEFAULT_BASE_CHANNELS_ADDRESS = "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d";
+
 export function configFromEnv(env: Env): RuntimeConfig {
   return {
     ANTSEED_FUNDING_RPC_URL: env.ANTSEED_FUNDING_RPC_URL,
     ANTSEED_FUNDING_VAULT_ADDRESS: env.ANTSEED_FUNDING_VAULT_ADDRESS,
     ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY: env.ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY,
+    BASE_RPC_URL: env.BASE_RPC_URL,
+    BASE_CHANNELS_ADDRESS: env.BASE_CHANNELS_ADDRESS ?? DEFAULT_BASE_CHANNELS_ADDRESS,
+    ANALYTICS_REFRESH_INTERVAL_SECONDS: intEnv(env.ANALYTICS_REFRESH_INTERVAL_SECONDS, 21_600),
     SLACK_WEBHOOK_URL: env.SLACK_WEBHOOK_URL,
     GD_CUSD_PRICE: floatEnv(env.GD_CUSD_PRICE, 0.0001),
     CELO_RPC_URL: env.CELO_RPC_URL,
@@ -72,4 +83,10 @@ function floatEnv(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
   const n = parseFloat(value);
   return isFinite(n) && n > 0 ? n : fallback;
+}
+
+function intEnv(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }

@@ -3,6 +3,7 @@ import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
 import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdPrice, fetchGoodIdRoot, decodeBuyerFromUserData } from "./celo-events.js";
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
+import { readAnalytics, refreshAnalytics } from "./analytics.js";
 import { GdCreditEntry } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 
@@ -60,6 +61,13 @@ const CreditHistoryQuerySchema = z.object({
     .string()
     .refine((value) => !Number.isNaN(Date.parse(value)), { message: "invalid ISO timestamp" })
     .optional()
+});
+const AnalyticsQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(365).default(30),
+  refresh: z
+    .string()
+    .optional()
+    .transform((value) => value === "true")
 });
 const ChannelOpSchema = z.object({
   timestamp: z.number().int().nonnegative().optional(),
@@ -208,6 +216,7 @@ export default {
       failed,
       elapsedMs: Date.now() - startedAt
     });
+    ctx.waitUntil(refreshAnalytics(env, cfg));
   }
 };
 
@@ -265,9 +274,25 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         CELO_STATIC_ORACLE_ADDRESS: cfg.CELO_STATIC_ORACLE_ADDRESS,
         CELO_CUSD_ADDRESS: cfg.CELO_CUSD_ADDRESS,
         CELO_GD_SUPERTOKEN_ADDRESS: cfg.CELO_GD_SUPERTOKEN_ADDRESS,
-        SUPERFLUID_SUBGRAPH_URL: cfg.SUPERFLUID_SUBGRAPH_URL ?? SUPERFLUID_CELO_SUBGRAPH_URL
+        SUPERFLUID_SUBGRAPH_URL: cfg.SUPERFLUID_SUBGRAPH_URL ?? SUPERFLUID_CELO_SUBGRAPH_URL,
+        BASE_RPC_URL: cfg.BASE_RPC_URL ?? cfg.ANTSEED_FUNDING_RPC_URL,
+        BASE_CHANNELS_ADDRESS: cfg.BASE_CHANNELS_ADDRESS,
+        ANALYTICS_REFRESH_INTERVAL_SECONDS: cfg.ANALYTICS_REFRESH_INTERVAL_SECONDS
       }
     });
+  }
+
+  if (request.method === "GET" && url.pathname === "/analytics") {
+    const parsed = AnalyticsQuerySchema.safeParse({
+      days: url.searchParams.get("days") ?? undefined,
+      refresh: url.searchParams.get("refresh") ?? undefined
+    });
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    if (parsed.data.refresh) {
+      await refreshAnalytics(env, cfg);
+    }
+    const response = await readAnalytics(env.ANTSEED_KV, parsed.data.days);
+    return json(response);
   }
 
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/profile$/);

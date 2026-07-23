@@ -9,12 +9,14 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
 - Optional Base `AntseedBuyerOperator` bridge client that calls `depositForWithId(buyer, principal, bonus, id)`
 - Cron trigger every minute for stream bonus settlement checks
+- Analytics refresh runs on cron with a 6-hour interval guard and can be queried at `/analytics`
 
 ## Endpoints
 
 - `GET /health`
 - `GET /config/status`
 - `GET /config/values`
+- `GET /analytics`
 - `GET /v1/accounts/:account/profile`
 - `GET /v1/accounts/:account/credit-history`
 - `GET /v1/accounts/:account/outstanding`
@@ -24,6 +26,12 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/celo/events/record`
 - `POST /v1/channels/:channelId/close`
 - `POST /v1/channels/:channelId/withdraw`
+
+`GET /analytics` returns daily analytics and global totals:
+
+- query: `days` (default `30`, max `365`)
+- optional query: `refresh=true` to trigger an on-demand refresh before reading
+- response: `{ days, daily, global, lastRun }`
 
 `GET /v1/accounts/:account/profile` returns the wallet `UserCreditProfile` only.
 
@@ -54,6 +62,9 @@ Optional secrets/config:
 - `REGULAR_BONUS_BPS` - bonus basis points for deposits/non-stream sources, defaults to `1000` (10%).
 - `STREAMING_BONUS_BPS` - bonus basis points for stream sources, defaults to `2000` (20%).
 - `MIN_GD_STREAMED_FOR_BONUS` - minimum stream amount in G$ to issue stream credits, defaults to `4000`.
+- `BASE_RPC_URL` - optional explicit Base RPC URL for analytics (falls back to `ANTSEED_FUNDING_RPC_URL`).
+- `BASE_CHANNELS_ADDRESS` - Base AntseedChannels contract address used for analytics log ingestion.
+- `ANALYTICS_REFRESH_INTERVAL_SECONDS` - minimum time between analytics refresh runs, defaults to `21600` (6 hours).
 
 ## Config And Constants
 

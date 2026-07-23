@@ -62,6 +62,55 @@ test("config values exposes non-secret runtime constants", async () => {
   assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
 });
 
+test("GET /analytics returns daily window and global totals", async () => {
+  const kv = new MemoryKV();
+  await kv.put(
+    "analytics:daily:2026-07-23",
+    JSON.stringify({
+      date: "2026-07-23",
+      gdOneTimeDeposits: "100",
+      gdStreamed: "50",
+      gdTotalFlowRate: "2",
+      aiCreditsUsed: "10",
+      uniqueGdBuyers: 1,
+      uniqueCreditUsers: 1
+    })
+  );
+  await kv.put(
+    "analytics:global",
+    JSON.stringify({
+      gdOneTimeDeposits: "100",
+      gdStreamed: "50",
+      gdTotalFlowRate: "2",
+      aiCreditsUsed: "10",
+      uniqueGdBuyers: 1,
+      uniqueCreditUsers: 1
+    })
+  );
+  await kv.put(
+    "analytics:lastRun",
+    JSON.stringify({
+      celoLastBlock: "12",
+      baseLastBlock: "34",
+      refreshedAt: "2026-07-23T00:00:00.000Z"
+    })
+  );
+
+  const res = await worker.fetch(new Request("https://worker.test/analytics?days=1"), env({ ANTSEED_KV: kv as never }), {} as ExecutionContext);
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    days: number;
+    daily: Array<{ date: string; gdOneTimeDeposits: string }>;
+    global: { aiCreditsUsed: string };
+    lastRun: { baseLastBlock: string };
+  };
+  assert.equal(body.days, 1);
+  assert.equal(body.daily.length, 1);
+  assert.equal(body.daily[0].gdOneTimeDeposits, "100");
+  assert.equal(body.global.aiCreditsUsed, "10");
+  assert.equal(body.lastRun.baseLastBlock, "34");
+});
+
 test("GET /v1/accounts/:account/profile returns profile only", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
