@@ -5,6 +5,7 @@ import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
+import { AnalyticsClient } from "./analytics.js";
 
 const CeloEventsRecordSchema = z
   .object({
@@ -208,6 +209,10 @@ export default {
       failed,
       elapsedMs: Date.now() - startedAt
     });
+
+    // Run analytics aggregation on every 6-hour cron invocation.
+    const analyticsClient = new AnalyticsClient({ kv: env.ANTSEED_KV, cfg });
+    ctx.waitUntil(analyticsClient.runAggregation());
   }
 };
 
@@ -561,6 +566,17 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       txHash: redactHash(bridge.txHash)
     });
     return json({ channelId, action, bridge });
+  }
+
+  if (request.method === "GET" && url.pathname === "/v1/analytics") {
+    const daysParam = url.searchParams.get("days");
+    const days = daysParam ? Number(daysParam) : 30;
+    if (!Number.isInteger(days) || days < 1 || days > 365) {
+      return json({ error: "days must be an integer between 1 and 365" }, 400);
+    }
+    const analyticsClient = new AnalyticsClient({ kv: env.ANTSEED_KV, cfg });
+    const analytics = await analyticsClient.getAnalytics(days);
+    return json({ ok: true, ...analytics });
   }
 
   return json({ error: "not found" }, 404);

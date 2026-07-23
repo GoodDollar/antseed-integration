@@ -20,6 +20,13 @@ export interface Env {
   REGULAR_BONUS_BPS?: string;
   STREAMING_BONUS_BPS?: string;
   MIN_GD_STREAMED_FOR_BONUS?: string;
+
+  /** Base RPC used for analytics channel log fetches. */
+  BASE_RPC_URL?: string;
+  /** Optional Blockscout API base URL for Base analytics logs (e.g. https://base.blockscout.com/api). */
+  BASE_BLOCKSCOUT_URL?: string;
+  /** Antseed Channels contract on Base used for AI credits usage analytics. */
+  ANTSEED_CHANNELS_ADDRESS?: string;
 }
 
 export type RuntimeConfig = {
@@ -40,6 +47,9 @@ export type RuntimeConfig = {
   REGULAR_BONUS_BPS: bigint;
   STREAMING_BONUS_BPS: bigint;
   MIN_STREAM_BONUS_WEI: bigint;
+  BASE_RPC_URL?: string;
+  BASE_BLOCKSCOUT_URL?: string;
+  ANTSEED_CHANNELS_ADDRESS?: string;
 };
 
 export function configFromEnv(env: Env): RuntimeConfig {
@@ -59,7 +69,10 @@ export function configFromEnv(env: Env): RuntimeConfig {
     MAX_BONUS_CAP_USD: parseUnits(env.MAX_BONUS_CAP_USD || "100", 18),
     REGULAR_BONUS_BPS: bigintEnv(env.REGULAR_BONUS_BPS, 1_000n),
     STREAMING_BONUS_BPS: bigintEnv(env.STREAMING_BONUS_BPS, 2_000n),
-    MIN_STREAM_BONUS_WEI: parseEther(env.MIN_GD_STREAMED_FOR_BONUS || "4000")
+    MIN_STREAM_BONUS_WEI: parseEther(env.MIN_GD_STREAMED_FOR_BONUS || "4000"),
+    BASE_RPC_URL: env.BASE_RPC_URL,
+    BASE_BLOCKSCOUT_URL: env.BASE_BLOCKSCOUT_URL,
+    ANTSEED_CHANNELS_ADDRESS: env.ANTSEED_CHANNELS_ADDRESS
   };
 }
 
