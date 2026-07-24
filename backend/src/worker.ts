@@ -214,8 +214,21 @@ export default {
     });
 
     try {
-      const analyticsSummary = await runAnalyticsAggregation(env);
-      logInfo("cron.analytics.summary", analyticsSummary);
+      const store = new KVAnalyticsStore(env.ANTSEED_KV);
+      // const state = undefined;
+      const state = await store.getState();
+      if (!state) {
+        logInfo("cron.analytics.first-run");
+        const startDate = new Date("2026-07-02T00:00:00Z");
+        while (startDate < new Date()) {
+          logInfo(`Running analytics aggregation for ${startDate.toISOString().slice(0, 10)}`);
+          await runAnalyticsAggregation(env, startDate);
+          startDate.setUTCDate(startDate.getUTCDate() + 1);
+        }
+      } else {
+        const analyticsSummary = await runAnalyticsAggregation(env);
+        logInfo("cron.analytics.summary", analyticsSummary);
+      }
     } catch (error) {
       logError("cron.analytics.failed", {
         message: errorMessage(error)
@@ -301,24 +314,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   }
 
   if (request.method === "POST" && url.pathname === "/v1/analytics/refresh") {
-    const store = new KVAnalyticsStore(env.ANTSEED_KV);
-    // const state = undefined;
-    const state = await store.getState();
-    if (!state) {
-      logInfo("analytics.refresh.first-run");
-      const startDate = new Date("2026-07-02T00:00:00Z");
-      while (startDate < new Date()) {
-        logInfo(`Running analytics aggregation for ${startDate.toISOString().slice(0, 10)}`);
-        await runAnalyticsAggregation(env, startDate);
-        startDate.setUTCDate(startDate.getUTCDate() + 1);
-      }
-      return json({});
-    } else {
-      const startDate = new Date("2026-07-16T00:00:00Z");
-
-      const summary = await runAnalyticsAggregation(env, startDate);
-      return json(summary);
-    }
+    const summary = await runAnalyticsAggregation(env);
+    return json(summary);
   }
 
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/profile$/);
