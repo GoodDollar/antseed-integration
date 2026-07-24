@@ -652,6 +652,8 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     throw new Error(`cannot fund credit with status ${entry.fundingStatus}`);
   }
   const buyer = entry.buyerAddress || entry.account;
+  const principalUsd = BigInt(entry.principalUsd);
+  const bonusUsd = BigInt(entry.bonusUsd);
   logInfo("funding.start", {
     entryId: entry.id,
     source: entry.source,
@@ -661,8 +663,29 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     bonusUsd: entry.bonusUsd,
     totalCreditUsd: entry.totalCreditUsd
   });
+  if (principalUsd + bonusUsd === 0n) {
+    logInfo("funding.skipped.zero-amount", {
+      entryId: entry.id,
+      source: entry.source,
+      account: redactAddress(entry.account),
+      buyer: redactAddress(buyer)
+    });
+    const updated = await store.markFundingResult(entry, {
+      funded: true,
+      error: undefined
+    });
+    return {
+      ...updated,
+      bridge: {
+        enabled: antseedFundingVault.enabled,
+        buyer,
+        amountUsd: "0",
+        skipped: true
+      }
+    };
+  }
   try {
-    const bridge = await antseedFundingVault.depositForBuyerWithId(buyer, BigInt(entry.principalUsd), BigInt(entry.bonusUsd), entry.id);
+    const bridge = await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id);
     if (!bridge.enabled) {
       logWarn("funding.bridge.disabled", {
         entryId: entry.id,
