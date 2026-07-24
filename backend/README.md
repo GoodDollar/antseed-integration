@@ -8,16 +8,18 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - KV namespace binding: `ANTSEED_KV`
 - Celo `CeloGdAntSeedVault` tx-log ingestion for G$ deposits and Superfluid stream updates
 - Optional Base `AntseedBuyerOperator` bridge client that calls `depositForWithId(buyer, principal, bonus, id)`
-- Cron trigger every minute for stream bonus settlement checks
+- Cron trigger every 6 hours for stream bonus settlement checks and analytics aggregation
 
 ## Endpoints
 
 - `GET /health`
 - `GET /config/status`
 - `GET /config/values`
+- `GET /v1/analytics`
 - `GET /v1/accounts/:account/profile`
 - `GET /v1/accounts/:account/credit-history`
 - `GET /v1/accounts/:account/outstanding`
+- `POST /v1/analytics/refresh`
 - `POST /v1/accounts/:account/stream-credits`
 - `POST /v1/accounts/:account/operator-consent`
 - `POST /v1/accounts/:account/withdraw`
@@ -38,6 +40,17 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `{ "txHash": "0x..." }`
 - `{ "account": "0x...", "fromBlock": "0x...", "toBlock": "latest" }`
 
+`GET /analytics` returns daily analytics (last 30 days by default).
+
+- query: `days` (default `30`, max `365`)
+- response: `{ days, daily, global, lastRun }`
+- `daily` — one record per UTC day, newest last; the current day is always recomputed from midnight to now on each refresh and its snapshot is overwritten
+- `global` — all-time totals composed as persisted closed-day totals plus the current day's live snapshot
+- `lastRun.finalizedThroughDate` — the most recent closed day whose values have been merged into persisted globals
+- Base usage (`aiCreditsUsedWei`, `uniqueCreditUsers`) is filtered to known buyers only; known buyers are learned from Celo vault `buyer` fields.
+
+`POST /v1/analytics/refresh` recomputes the current UTC day from midnight to now, overwrites the day snapshot, finalizes any closed days into persisted globals, and returns a summary.
+
 ## Setup
 
 ```bash
@@ -54,6 +67,9 @@ Optional secrets/config:
 - `REGULAR_BONUS_BPS` - bonus basis points for deposits/non-stream sources, defaults to `1000` (10%).
 - `STREAMING_BONUS_BPS` - bonus basis points for stream sources, defaults to `2000` (20%).
 - `MIN_GD_STREAMED_FOR_BONUS` - minimum stream amount in G$ to issue stream credits, defaults to `4000`.
+- `CELO_BLOCKSCOUT_API_URL` - Blockscout API URL for Celo logs (defaults to `https://celo.blockscout.com/api`).
+- `BASE_BLOCKSCOUT_API_URL` - Blockscout API URL for Base logs (defaults to `https://base.blockscout.com/api`).
+- `ANTSEED_CHANNELS_ADDRESS` - Antseed Channels contract address on Base used for AI credit usage metrics.
 
 ## Config And Constants
 

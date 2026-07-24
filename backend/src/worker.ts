@@ -5,6 +5,7 @@ import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
+import { getAnalyticsWindow, runAnalyticsAggregation, KVAnalyticsStore } from "./analytics.js";
 
 const CeloEventsRecordSchema = z
   .object({
@@ -83,6 +84,9 @@ const SuperfluidStreamsResponseSchema = z.object({
       })
     )
   })
+});
+const AnalyticsQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(365).default(30)
 });
 
 const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superfluid.dev/celo-mainnet/protocol-v1";
@@ -208,6 +212,36 @@ export default {
       failed,
       elapsedMs: Date.now() - startedAt
     });
+
+    try {
+      const store = new KVAnalyticsStore(env.ANTSEED_KV);
+      // const state = undefined;
+      const state = await store.getState();
+      if (!state) {
+        logInfo("cron.analytics.first-run");
+        const startDate = new Date("2026-07-02T00:00:00Z");
+        while (startDate < new Date()) {
+          logInfo(`Running analytics aggregation for ${startDate.toISOString().slice(0, 10)}`);
+          await runAnalyticsAggregation(env, startDate);
+          startDate.setUTCDate(startDate.getUTCDate() + 1);
+        }
+      } else {
+        const analyticsSummary = await runAnalyticsAggregation(env);
+        logInfo("cron.analytics.summary", analyticsSummary);
+      }
+    } catch (error) {
+      logError("cron.analytics.failed", {
+        message: errorMessage(error)
+      });
+      ctx.waitUntil(
+        notifySlackOnRequestError(env, {
+          method: "SCHEDULED",
+          path: "/v1/analytics/refresh",
+          body: undefined,
+          message: errorMessage(error)
+        })
+      );
+    }
   }
 };
 
@@ -268,6 +302,20 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         SUPERFLUID_SUBGRAPH_URL: cfg.SUPERFLUID_SUBGRAPH_URL ?? SUPERFLUID_CELO_SUBGRAPH_URL
       }
     });
+  }
+
+  if (request.method === "GET" && url.pathname === "/v1/analytics") {
+    const parsed = AnalyticsQuerySchema.safeParse({
+      days: url.searchParams.get("days") ?? undefined
+    });
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const analytics = await getAnalyticsWindow(env, parsed.data.days);
+    return json(analytics);
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/analytics/refresh") {
+    const summary = await runAnalyticsAggregation(env);
+    return json(summary);
   }
 
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/profile$/);
