@@ -21,7 +21,6 @@ function emit(level: LogLevel, event: string, data?: LogData): void {
     console.warn(event, payload);
     return;
   }
-  console.log(event, payload);
 }
 
 export function logInfo(event: string, data?: LogData): void {
