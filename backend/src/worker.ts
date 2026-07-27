@@ -691,7 +691,7 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     const bridge =
       principalUsd + bonusUsd > 0n
         ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
-        : { enabled: antseedFundingVault.enabled, buyer, amountUsd: entry.totalCreditUsd };
+        : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
     if (principalUsd + bonusUsd === 0n) {
       logInfo("funding.skipped.zero-amount", {
         entryId: entry.id,
