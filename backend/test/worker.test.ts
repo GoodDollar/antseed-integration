@@ -174,6 +174,24 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
     const historyBody = (await historyRes.json()) as { items: Array<{ id: string; source: string }> };
     assert.equal(historyBody.items.length, 1);
     assert.equal(historyBody.items[0].source, "deposit");
+
+    const retryRes = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
+    assert.equal(retryRes.status, 200);
+    const retryBody = (await retryRes.json()) as {
+      events: Array<{ id: string; fundingStatus: string; bridge?: { alreadyFunded?: boolean } }>;
+    };
+    assert.equal(retryBody.events.length, 1);
+    assert.equal(retryBody.events[0].id, body.events[0].id);
+    assert.equal(retryBody.events[0].fundingStatus, "funded");
+    assert.equal(retryBody.events[0].bridge?.alreadyFunded, true);
   } finally {
     globalThis.fetch = originalFetch;
   }

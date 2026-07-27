@@ -648,10 +648,26 @@ function createStreamFundingId(account: string, date: Date): string {
 }
 
 async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFundingVault: AntSeedFundingVaultClient): Promise<{ [key: string]: unknown }> {
-  if (entry.fundingStatus === "funded") {
-    throw new Error(`cannot fund credit with status ${entry.fundingStatus}`);
-  }
   const buyer = entry.buyerAddress || entry.account;
+  if (entry.fundingStatus === "funded") {
+    logInfo("funding.already-funded", {
+      entryId: entry.id,
+      source: entry.source,
+      account: redactAddress(entry.account),
+      buyer: redactAddress(buyer),
+      fundingTxHash: redactHash(entry.fundingTxHash)
+    });
+    return {
+      ...entry,
+      bridge: {
+        enabled: antseedFundingVault.enabled,
+        buyer,
+        amountUsd: entry.totalCreditUsd,
+        txHash: entry.fundingTxHash,
+        alreadyFunded: true
+      }
+    };
+  }
   const principalUsd = BigInt(entry.principalUsd);
   const bonusUsd = BigInt(entry.bonusUsd);
   logInfo("funding.start", {
