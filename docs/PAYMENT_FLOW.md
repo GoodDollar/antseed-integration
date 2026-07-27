@@ -29,7 +29,7 @@ User deposits/streams G$ to CeloGdAntSeedVault on Celo
   -> Worker marks GdCreditEntry fundingStatus = "funded" / "failed"
 ```
 
-Pending or failed entries are visible at `GET /v1/accounts/:account/outstanding` and can be retried by re-submitting the same `txHash` (idempotency prevents double-funding). Zero-amount stream updates are recorded as funded no-ops so they do not surface as payment failures.
+Pending or failed entries are visible at `GET /v1/accounts/:account/outstanding`. Pending entries can be retried by re-submitting the same `txHash` (idempotency prevents double-funding). Zero-amount stream updates are recorded as funded no-ops so they do not surface as payment failures.
 
 AI request proxying and developer tool auth are **not yet implemented** in this Worker. Those capabilities will be added in a future phase.
 
