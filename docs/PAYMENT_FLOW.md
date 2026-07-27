@@ -20,16 +20,17 @@ User deposits/streams G$ to CeloGdAntSeedVault on Celo
        unverified accounts: bonus = 0
        monthly cap enforced per root account via monthly-bonus KV key
   -> Worker records GdCreditEntry in KV (fundingStatus = "pending")
-  -> If principal + bonus == 0 (e.g. stream create / StreamUpdated with totalFlowWei = 0):
-       mark entry "funded" without calling Base (rate metadata only; accrual funded later via cron/stream-credits)
-  -> Else Worker calls AntSeedFundingVaultClient.depositForBuyerWithId(buyer, principal, bonus, id)
+       deposit with gdAmountWei = 0 is not recorded
+       streamUpdate with totalFlowWei = 0 is recorded
+  -> Worker calls AntSeedFundingVaultClient.depositForBuyerWithId only when principal + bonus > 0
+       zero streamUpdate credits skip Base and are marked "funded"
      -> checks usedDepositIds[keccak256(id)] on-chain (idempotency guard)
      -> AntseedBuyerOperator.depositForWithId(buyer, principal, bonus, id)
         -> IAntseedDeposits.deposit(buyer, principal + bonus)
   -> Worker marks GdCreditEntry fundingStatus = "funded" / "failed"
 ```
 
-Pending or failed entries are visible at `GET /v1/accounts/:account/outstanding`. Pending entries can be retried by re-submitting the same `txHash` (idempotency prevents double-funding). Zero-amount stream updates are recorded as funded no-ops so they do not surface as payment failures.
+Pending or failed entries are visible at `GET /v1/accounts/:account/outstanding`. Pending entries can be retried by re-submitting the same `txHash` (idempotency prevents double-funding). Zero-amount stream updates are recorded as funded no-ops so they do not surface as payment failures. Zero-amount deposits are not recorded.
 
 AI request proxying and developer tool auth are **not yet implemented** in this Worker. Those capabilities will be added in a future phase.
 

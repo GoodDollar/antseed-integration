@@ -320,6 +320,14 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
       if (event.kind === "deposit") {
+        if (event.gdAmountWei === 0n) {
+          logInfo("celo.events.record.deposit.skipped.zero-amount", {
+            txHash: redactHash(event.txHash),
+            logIndex: event.logIndex,
+            account: redactAddress(event.account)
+          });
+          continue;
+        }
         const depositId = `${event.txHash}:${event.logIndex}`;
         const entry = await store.recordGdCredit({
           id: depositId,
@@ -679,30 +687,19 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     bonusUsd: entry.bonusUsd,
     totalCreditUsd: entry.totalCreditUsd
   });
-  if (principalUsd + bonusUsd === 0n) {
-    logInfo("funding.skipped.zero-amount", {
-      entryId: entry.id,
-      source: entry.source,
-      account: redactAddress(entry.account),
-      buyer: redactAddress(buyer)
-    });
-    const updated = await store.markFundingResult(entry, {
-      funded: true,
-      error: undefined
-    });
-    return {
-      ...updated,
-      bridge: {
-        enabled: antseedFundingVault.enabled,
-        buyer,
-        amountUsd: "0",
-        skipped: true
-      }
-    };
-  }
   try {
-    const bridge = await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id);
-    if (!bridge.enabled) {
+    const bridge =
+      principalUsd + bonusUsd > 0n
+        ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
+        : { enabled: antseedFundingVault.enabled, buyer, amountUsd: entry.totalCreditUsd };
+    if (principalUsd + bonusUsd === 0n) {
+      logInfo("funding.skipped.zero-amount", {
+        entryId: entry.id,
+        source: entry.source,
+        account: redactAddress(entry.account),
+        buyer: redactAddress(buyer)
+      });
+    } else if (!bridge.enabled) {
       logWarn("funding.bridge.disabled", {
         entryId: entry.id,
         source: entry.source,

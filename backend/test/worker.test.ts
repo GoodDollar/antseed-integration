@@ -597,7 +597,8 @@ test("/v1/celo/events/record marks zero totalFlowWei StreamUpdated as funded wit
         principalUsd: string;
         bonusUsd: string;
         fundingError?: string;
-        bridge?: { skipped?: boolean; amountUsd?: string };
+        fundingTxHash?: string;
+        bridge?: { amountUsd?: string; txHash?: string };
       }>;
     };
     assert.equal(body.events.length, 1);
@@ -607,9 +608,56 @@ test("/v1/celo/events/record marks zero totalFlowWei StreamUpdated as funded wit
     assert.equal(body.events[0].principalUsd, "0");
     assert.equal(body.events[0].bonusUsd, "0");
     assert.equal(body.events[0].fundingError, undefined);
-    assert.equal(body.events[0].bridge?.skipped, true);
+    assert.equal(body.events[0].fundingTxHash, undefined);
     assert.equal(body.events[0].bridge?.amountUsd, "0");
+    assert.equal(body.events[0].bridge?.txHash, undefined);
     assert.equal(baseRpcCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/v1/celo/events/record skips zero-amount deposit credits", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const txHash = `0x${"6".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const originalFetch = globalThis.fetch;
+
+  try {
+    const testEnv = env({ CELO_RPC_URL: "https://celo.rpc.local", CELO_VAULT_ADDRESS: celoVault });
+    const depositLog = encodeVaultEventLog("GdDeposited", [account, buyer, 0n, "0x"], celoVault, txHash, 0);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "eth_call") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: "0x0000000000000000000000000000000000000000000000000000000000000000"
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [depositLog] } });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
+
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { events: unknown[] };
+    assert.equal(body.events.length, 0);
+
+    const historyRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+    assert.equal(historyRes.status, 200);
+    const historyBody = (await historyRes.json()) as { items: unknown[] };
+    assert.equal(historyBody.items.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
