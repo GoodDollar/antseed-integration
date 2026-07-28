@@ -91,6 +91,62 @@ test("config values exposes non-secret runtime constants", async () => {
   assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
 });
 
+test("GET /v1/analytics returns analytics window with CORS headers", async () => {
+  const res = await worker.fetch(new Request("https://worker.test/v1/analytics?days=2"), env(), {} as ExecutionContext);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("access-control-allow-origin"), "*");
+  const body = (await res.json()) as { days: number; daily: Array<{ date: string }>; lastRun: { currentDate: string } };
+  assert.equal(body.days, 2);
+  assert.equal(body.daily.length, 2);
+  assert.equal(body.daily[1].date, body.lastRun.currentDate);
+});
+
+test("POST /v1/analytics/refresh returns aggregation summary", async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
+      if (url.searchParams.get("action") === "getblocknobytime") {
+        return Response.json({
+          status: "1",
+          message: "OK",
+          result: "123"
+        });
+      }
+
+      if (url.searchParams.get("action") === "getLogs") {
+        return Response.json({
+          status: "0",
+          message: "No records found",
+          result: []
+        });
+      }
+
+      throw new Error(`unexpected fetch ${url.toString()}`);
+    }) as typeof fetch;
+
+    const res = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), env(), {} as ExecutionContext);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      currentDate: string;
+      celo: { scanned: number; matched: number };
+      base: { scanned: number; matched: number };
+      streams: { senders: number };
+    };
+    assert.equal(body.ok, true);
+    assert.match(body.currentDate, /^\d{4}-\d{2}-\d{2}$/);
+    assert.equal(body.celo.scanned, 0);
+    assert.equal(body.celo.matched, 0);
+    assert.equal(body.base.scanned, 0);
+    assert.equal(body.base.matched, 0);
+    assert.equal(body.streams.senders, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("GET /v1/accounts/:account/profile returns profile only", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
