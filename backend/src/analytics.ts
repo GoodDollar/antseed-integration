@@ -122,7 +122,8 @@ export async function runAnalyticsAggregation(env: Env, now = new Date()): Promi
   };
 
   const finalizedDates = await finalizeClosedDays(store, state, currentDate, now);
-  const dayWindow = getUtcDayWindow(now);
+  const isCurrentDay = dayFromDate(now) === dayFromDate(new Date());
+  const dayWindow = getUtcDayWindow(now, isCurrentDay ? "until-now" : "full-day");
   const aggregate = createDailyAggregate();
   const knownBuyers = await store.getBuyerRegistry();
   const discoveredBuyers = new Set<string>();
