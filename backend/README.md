@@ -40,8 +40,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `{ "txHash": "0x..." }`
 - `{ "account": "0x...", "fromBlock": "0x...", "toBlock": "latest" }`
 
-`GET /analytics` returns daily analytics (last 30 days by default).
-
+`GET /v1/analytics` returns daily analytics (last 30 days by default).
 - query: `days` (default `30`, max `365`)
 - response: `{ days, daily, global, lastRun }`
 - `daily` — one record per UTC day, newest last; the current day is always recomputed from midnight to now on each refresh and its snapshot is overwritten
