@@ -214,9 +214,8 @@ export default {
     });
 
     try {
-      const store = new KVAnalyticsStore(env.ANTSEED_KV);
-      // const state = undefined;
-      const state = await store.getState();
+      const analyticsStore = new KVAnalyticsStore(env.ANTSEED_KV);
+      const state = await analyticsStore.getState();
       if (!state) {
         logInfo("cron.analytics.first-run");
         const startDate = new Date("2026-07-02T00:00:00Z");
