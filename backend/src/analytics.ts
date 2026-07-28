@@ -673,11 +673,13 @@ async function getBlockByTimestamp(apiUrl: string, timestamp: number, closest: "
   const payload = (await response.json()) as {
     status?: string;
     message?: string;
-    result: { blockNumber: string };
+    result?: string | { blockNumber?: string };
   };
 
   if (payload.result && payload.status !== "0") {
-    return parseNumberish(payload.result?.blockNumber ?? payload.result);
+    const blockValue = typeof payload.result === "string" ? payload.result : payload.result.blockNumber;
+    if (!blockValue) throw new Error("Explorer getblocknobytime missing blockNumber");
+    return parseNumberish(blockValue);
   }
 
   throw new Error(`Explorer getblocknobytime failed: ${payload.message ?? "unknown"}`);
