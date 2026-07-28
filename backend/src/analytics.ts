@@ -1,4 +1,5 @@
 import { Interface } from "ethers";
+import { decodeBuyerFromUserData } from "./celo-events.js";
 import { Env } from "./env.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress } from "./logging.js";
 
@@ -16,6 +17,7 @@ type ExplorerLog = {
 
 type StreamSnapshot = {
   sender: string;
+  buyerAddress?: string;
   flowRateWeiPerSecond: bigint;
   totalStreamedWei: bigint;
 };
@@ -129,6 +131,8 @@ export async function runAnalyticsAggregation(env: Env, now = new Date()): Promi
   const discoveredBuyers = new Set<string>();
 
   const celoMetrics = await collectCeloDayMetrics(cfg, dayWindow, aggregate, discoveredBuyers);
+
+  const streamMetrics = await collectStreamDayMetrics(cfg, dayWindow, aggregate, now, discoveredBuyers);
   if (discoveredBuyers.size > 0) {
     await store.addBuyersToRegistry([...discoveredBuyers]);
     for (const buyer of discoveredBuyers) knownBuyers.add(buyer);
@@ -136,8 +140,6 @@ export async function runAnalyticsAggregation(env: Env, now = new Date()): Promi
   logInfo("getting base metrics....");
   const baseMetrics = await collectBaseDayMetrics(cfg, dayWindow, aggregate, knownBuyers);
   logInfo("got base metrics....");
-
-  const streamMetrics = await collectStreamDayMetrics(cfg, dayWindow, aggregate, now);
   logInfo("building dialy reocrd....");
 
   const dailyRecord = buildDailyRecord(currentDate, aggregate, now);
@@ -406,11 +408,15 @@ async function collectStreamDayMetrics(
   cfg: AnalyticsConfig,
   dayWindow: UtcDayWindow,
   aggregate: DailyAggregate,
-  now: Date
+  now: Date,
+  discoveredBuyers: Set<string>
 ): Promise<{ senders: number; totalFlowRateWeiPerSecond: string }> {
   const snapshots = await fetchStreamSnapshots(cfg, now, dayWindow.startUnix);
 
   for (const snapshot of snapshots) {
+    if (snapshot.buyerAddress) {
+      discoveredBuyers.add(snapshot.buyerAddress);
+    }
     aggregate.gdTotalFlowRateWeiPerSecond += snapshot.flowRateWeiPerSecond;
     if (snapshot.totalStreamedWei > 0n) {
       aggregate.gdStreamedWei += snapshot.totalStreamedWei;
@@ -457,7 +463,7 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
     return [];
   }
 
-  const snapshotsBySender = new Map<string, { flowRateWeiPerSecond: bigint; totalStreamedWei: bigint }>();
+  const snapshotsBySender = new Map<string, { buyerAddress?: string; flowRateWeiPerSecond: bigint; totalStreamedWei: bigint }>();
   const pageSize = 1000;
   let skip = 0;
   const nowUnix = Math.floor(now.getTime() / 1000);
@@ -475,6 +481,9 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
             currentFlowRate
             streamedUntilUpdatedAt
             updatedAtTimestamp
+            flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
+              userData
+            }
           }
         }
       `,
@@ -508,6 +517,9 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
           currentFlowRate: string;
           streamedUntilUpdatedAt: string;
           updatedAtTimestamp: string;
+          flowUpdatedEvents?: Array<{
+            userData: string;
+          }>;
         }>;
       };
     };
@@ -518,13 +530,16 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
       const currentFlowRate = BigInt(stream.currentFlowRate || "0");
       const streamedUntilUpdatedAt = BigInt(stream.streamedUntilUpdatedAt || "0");
       const updatedAtTimestamp = parseNumberish(stream.updatedAtTimestamp || "0");
+      const buyerAddress = decodeBuyerFromUserData(stream.flowUpdatedEvents?.[0]?.userData);
       const totalStreamedWei = streamedWithinDay(streamedUntilUpdatedAt, currentFlowRate, updatedAtTimestamp, dayStartUnix, nowUnix);
       const existing = snapshotsBySender.get(sender);
       if (existing) {
+        existing.buyerAddress ??= buyerAddress;
         existing.flowRateWeiPerSecond += currentFlowRate;
         existing.totalStreamedWei += totalStreamedWei;
       } else {
         snapshotsBySender.set(sender, {
+          buyerAddress,
           flowRateWeiPerSecond: currentFlowRate,
           totalStreamedWei
         });
@@ -537,6 +552,7 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
 
   return [...snapshotsBySender.entries()].map(([sender, value]) => ({
     sender,
+    buyerAddress: value.buyerAddress,
     flowRateWeiPerSecond: value.flowRateWeiPerSecond,
     totalStreamedWei: value.totalStreamedWei
   }));

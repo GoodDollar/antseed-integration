@@ -652,6 +652,103 @@ test("analytics refresh excludes base usage for buyers outside known buyer regis
   }
 });
 
+test("analytics refresh includes base usage for buyers learned from stream userData", { concurrency: false }, async () => {
+  const testEnv = env({
+    CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+    SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+  });
+
+  const account = "0x0000000000000000000000000000000000000abc";
+  const streamBuyer = "0x0000000000000000000000000000000000000def";
+  const seller = "0x0000000000000000000000000000000000000fed";
+  const channelId = `0x${"5".repeat(64)}`;
+  const now = new Date("2026-07-24T12:00:00.000Z");
+  const timestamp = Math.floor(now.getTime() / 1000) - 60;
+  const encodedBuyerUserData = `0x${"0".repeat(24)}${streamBuyer.slice(2)}`;
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
+      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+
+      if (url.host === "celo.blockscout.test") {
+        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
+          return Response.json({ status: "1", message: "OK", result: "100" });
+        }
+        if (url.searchParams.get("module") === "logs") {
+          return Response.json({ status: "0", message: "No records found", result: "No records found" });
+        }
+      }
+
+      if (url.host === "base.blockscout.test") {
+        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
+          return Response.json({ status: "1", message: "OK", result: "200" });
+        }
+        if (url.searchParams.get("module") === "logs") {
+          const topic0 = url.searchParams.get("topic0")?.toLowerCase();
+          const settledTopic = ChannelsEvents.getEvent("ChannelSettled")?.topicHash.toLowerCase();
+          if (topic0 === settledTopic) {
+            return Response.json({
+              status: "1",
+              message: "OK",
+              result: [
+                encodeChannelLog(
+                  "ChannelSettled",
+                  [channelId, streamBuyer, seller, 3_000_000n, 500_000n, 1_000_000n, 0n, "0x"],
+                  testEnv.ANTSEED_CHANNELS_ADDRESS!,
+                  `0x${"c".repeat(64)}`,
+                  1,
+                  211,
+                  timestamp
+                )
+              ]
+            });
+          }
+          return Response.json({ status: "0", message: "No records found", result: "No records found" });
+        }
+      }
+
+      if (url.host === "superfluid.test") {
+        const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
+        if (body.variables.skip > 0) {
+          return Response.json({ data: { streams: [] } });
+        }
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "0",
+                streamedUntilUpdatedAt: "1000000000000000000",
+                updatedAtTimestamp: String(timestamp),
+                flowUpdatedEvents: [{ userData: encodedBuyerUserData }]
+              }
+            ]
+          }
+        });
+      }
+
+      throw new Error(`unexpected fetch url: ${url.toString()}`);
+    }) as typeof fetch;
+
+    await import("../src/analytics.js").then(async ({ KVAnalyticsStore, getAnalyticsWindow, runAnalyticsAggregation }) => {
+      await runAnalyticsAggregation(testEnv, now);
+      const analyticsBody = await getAnalyticsWindow(testEnv, 1, now);
+      const buyerRegistry = await new KVAnalyticsStore(testEnv.ANTSEED_KV).getBuyerRegistry();
+
+      assert.equal(analyticsBody.daily[0].aiCreditsUsedWei, "500000");
+      assert.equal(analyticsBody.daily[0].uniqueCreditUsers, 1);
+      assert.ok(buyerRegistry.has(streamBuyer.toLowerCase()));
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("analytics refresh finalizes previous day into persisted globals once day rolls over", { concurrency: false }, async () => {
   const testEnv = env({
     CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
