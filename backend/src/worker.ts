@@ -219,6 +219,8 @@ export default {
       if (!state) {
         logInfo("cron.analytics.first-run");
         const startDate = new Date("2026-07-02T00:00:00Z");
+        // TODO: Persist a backfill cursor and process a bounded number of days per cron tick;
+        // this first-run catch-up loop can exceed scheduled execution limits as the date range grows.
         while (startDate < new Date()) {
           logInfo("cron.analytics.backfill.day", { date: startDate.toISOString().slice(0, 10) });
           await runAnalyticsAggregation(env, startDate);
