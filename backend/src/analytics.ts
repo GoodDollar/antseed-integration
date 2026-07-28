@@ -129,7 +129,6 @@ export async function runAnalyticsAggregation(env: Env, now = new Date()): Promi
   const discoveredBuyers = new Set<string>();
 
   const celoMetrics = await collectCeloDayMetrics(cfg, dayWindow, aggregate, discoveredBuyers);
-  logInfo("got celo metrics");
   if (discoveredBuyers.size > 0) {
     await store.addBuyersToRegistry([...discoveredBuyers]);
     for (const buyer of discoveredBuyers) knownBuyers.add(buyer);
