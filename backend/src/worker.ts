@@ -220,7 +220,7 @@ export default {
         logInfo("cron.analytics.first-run");
         const startDate = new Date("2026-07-02T00:00:00Z");
         while (startDate < new Date()) {
-          logInfo(`Running analytics aggregation for ${startDate.toISOString().slice(0, 10)}`);
+          logInfo("cron.analytics.backfill.day", { date: startDate.toISOString().slice(0, 10) });
           await runAnalyticsAggregation(env, startDate);
           startDate.setUTCDate(startDate.getUTCDate() + 1);
         }
