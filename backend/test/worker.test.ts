@@ -174,6 +174,24 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
     const historyBody = (await historyRes.json()) as { items: Array<{ id: string; source: string }> };
     assert.equal(historyBody.items.length, 1);
     assert.equal(historyBody.items[0].source, "deposit");
+
+    const retryRes = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
+    assert.equal(retryRes.status, 200);
+    const retryBody = (await retryRes.json()) as {
+      events: Array<{ id: string; fundingStatus: string; bridge?: { alreadyFunded?: boolean } }>;
+    };
+    assert.equal(retryBody.events.length, 1);
+    assert.equal(retryBody.events[0].id, body.events[0].id);
+    assert.equal(retryBody.events[0].fundingStatus, "funded");
+    assert.equal(retryBody.events[0].bridge?.alreadyFunded, true);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -511,6 +529,135 @@ test("/v1/celo/events/record processes StreamUpdated logs into stream credits", 
     // verified + stream source → 20% bonus: 200 × 20% = 40
     assert.equal(body.events[0].bonusUsd, "40");
     assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/v1/celo/events/record marks zero totalFlowWei StreamUpdated as funded without Base deposit", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const txHash = `0x${"5".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const goodIdAddr = "0x0000000000000000000000000000000000001234";
+  const originalFetch = globalThis.fetch;
+
+  try {
+    const testEnv = env({
+      CELO_RPC_URL: "https://celo.rpc.local",
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GOODID_ADDRESS: goodIdAddr,
+      ANTSEED_FUNDING_RPC_URL: "https://base.rpc.local",
+      ANTSEED_FUNDING_VAULT_ADDRESS: "0x0000000000000000000000000000000000000b01",
+      ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY: "0x" + "1".repeat(64)
+    });
+
+    const streamLog = encodeVaultEventLog(
+      "StreamUpdated",
+      [account, buyer, 385_802_469_136n, 1_000_000_000_000_000_000n, 0n],
+      celoVault,
+      txHash,
+      0
+    );
+
+    let baseRpcCalls = 0;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const target = String(url);
+      if (target.includes("base.rpc.local")) {
+        baseRpcCalls += 1;
+        return Response.json({ jsonrpc: "2.0", id: 1, result: "0x0" });
+      }
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "eth_call") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: "0x000000000000000000000000abababababababababababababababababababab"
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [streamLog] } });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
+
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      events: Array<{
+        source: string;
+        fundingStatus: string;
+        gdAmountWei: string;
+        principalUsd: string;
+        bonusUsd: string;
+        fundingError?: string;
+        fundingTxHash?: string;
+        bridge?: { amountUsd?: string; txHash?: string };
+      }>;
+    };
+    assert.equal(body.events.length, 1);
+    assert.equal(body.events[0].source, "streamUpdate");
+    assert.equal(body.events[0].fundingStatus, "funded");
+    assert.equal(body.events[0].gdAmountWei, "0");
+    assert.equal(body.events[0].principalUsd, "0");
+    assert.equal(body.events[0].bonusUsd, "0");
+    assert.equal(body.events[0].fundingError, undefined);
+    assert.equal(body.events[0].fundingTxHash, undefined);
+    assert.equal(body.events[0].bridge?.amountUsd, "0");
+    assert.equal(body.events[0].bridge?.txHash, undefined);
+    assert.equal(baseRpcCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/v1/celo/events/record skips zero-amount deposit credits", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const txHash = `0x${"6".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const originalFetch = globalThis.fetch;
+
+  try {
+    const testEnv = env({ CELO_RPC_URL: "https://celo.rpc.local", CELO_VAULT_ADDRESS: celoVault });
+    const depositLog = encodeVaultEventLog("GdDeposited", [account, buyer, 0n, "0x"], celoVault, txHash, 0);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "eth_call") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: "0x0000000000000000000000000000000000000000000000000000000000000000"
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [depositLog] } });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      {} as ExecutionContext
+    );
+
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { events: unknown[] };
+    assert.equal(body.events.length, 0);
+
+    const historyRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+    assert.equal(historyRes.status, 200);
+    const historyBody = (await historyRes.json()) as { items: unknown[] };
+    assert.equal(historyBody.items.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
