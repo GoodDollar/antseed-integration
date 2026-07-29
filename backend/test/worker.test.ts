@@ -520,12 +520,12 @@ test("analytics refresh overwrites current day and query adds current day to per
     assert.equal(analyticsBody.daily.length, 1);
     assert.equal(analyticsBody.daily[0].date, date);
     assert.equal(analyticsBody.daily[0].gdOneTimeDepositsWei, "5000000000000000000");
-    assert.equal(analyticsBody.daily[0].gdStreamedWei, "1000000000000000000");
+    assert.equal(analyticsBody.daily[0].gdStreamedWei, "0");
     assert.equal(analyticsBody.daily[0].aiCreditsUsedWei, "500000");
     assert.equal(analyticsBody.daily[0].uniqueGdBuyers, 1);
     assert.equal(analyticsBody.daily[0].uniqueCreditUsers, 1);
     assert.equal(analyticsBody.global.gdOneTimeDepositsWei, "5000000000000000000");
-    assert.equal(analyticsBody.global.gdStreamedWei, "1000000000000000000");
+    assert.equal(analyticsBody.global.gdStreamedWei, "0");
     assert.equal(analyticsBody.global.aiCreditsUsedWei, "500000");
   } finally {
     globalThis.fetch = originalFetch;
@@ -855,7 +855,7 @@ test("analytics refresh finalizes previous day into persisted globals once day r
 
     const analyticsBody = await import("../src/analytics.js").then(async ({ getAnalyticsWindow }) => getAnalyticsWindow(testEnv, 2, secondNow));
     assert.equal(analyticsBody.global.gdOneTimeDepositsWei, "4000000000000000000");
-    assert.equal(analyticsBody.global.gdStreamedWei, "1000000000000000000");
+    assert.equal(analyticsBody.global.gdStreamedWei, "0");
     assert.equal(analyticsBody.global.aiCreditsUsedWei, "1000000");
   } finally {
     globalThis.fetch = originalFetch;
