@@ -36,6 +36,7 @@ export type AnalyticsDailyRecord = {
   uniqueGdBuyers: number;
   uniqueCreditUsers: number;
   updatedAt: string;
+  missing?: boolean;
 };
 
 export type AnalyticsGlobalTotals = {
@@ -115,24 +116,25 @@ const ZERO_DAILY = {
   uniqueCreditUsers: 0
 };
 
-export async function runAnalyticsAggregation(env: Env, now = new Date()): Promise<AnalyticsRunSummary> {
+export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Promise<AnalyticsRunSummary> {
   const cfg = analyticsConfigFromEnv(env);
   const store = new KVAnalyticsStore(env.ANTSEED_KV);
-  const currentDate = dayFromDate(now);
+  const runDay = dayFromDate(runAt);
   const state = (await store.getState()) ?? {
-    updatedAt: now.toISOString()
+    updatedAt: runAt.toISOString()
   };
+  const currentDate = resolveRunDate(state, runAt, runDay);
+  const windowEnd = currentDate === runDay ? runAt : new Date(`${currentDate}T23:59:59.999Z`);
 
-  const finalizedDates = await finalizeClosedDays(store, state, currentDate, now);
-  const isCurrentDay = dayFromDate(now) === dayFromDate(new Date());
-  const dayWindow = getUtcDayWindow(now, isCurrentDay ? "until-now" : "full-day");
+  const isCurrentDay = currentDate === runDay;
+  const dayWindow = getUtcDayWindow(windowEnd, isCurrentDay ? "until-now" : "full-day");
   const aggregate = createDailyAggregate();
   const knownBuyers = await store.getBuyerRegistry();
   const discoveredBuyers = new Set<string>();
 
   const celoMetrics = await collectCeloDayMetrics(cfg, dayWindow, aggregate, discoveredBuyers);
 
-  const streamMetrics = await collectStreamDayMetrics(cfg, dayWindow, aggregate, now, discoveredBuyers);
+  const streamMetrics = await collectStreamDayMetrics(cfg, dayWindow, aggregate, windowEnd, discoveredBuyers);
   if (discoveredBuyers.size > 0) {
     await store.addBuyersToRegistry([...discoveredBuyers]);
     for (const buyer of discoveredBuyers) knownBuyers.add(buyer);
@@ -142,14 +144,15 @@ export async function runAnalyticsAggregation(env: Env, now = new Date()): Promi
   logInfo("got base metrics....");
   logInfo("building dialy reocrd....");
 
-  const dailyRecord = buildDailyRecord(currentDate, aggregate, now);
+  const dailyRecord = buildDailyRecord(currentDate, aggregate, windowEnd);
   await store.replaceDaily(currentDate, dailyRecord, [...aggregate.gdBuyers], [...aggregate.creditUsers]);
   const latestState = await store.getState();
   await store.putState({
     finalizedThroughDate: latestState?.finalizedThroughDate,
-    updatedAt: now.toISOString()
+    updatedAt: windowEnd.toISOString()
   });
 
+  const finalizedDates = await finalizeClosedDays(store, state, runDay, runAt);
   logInfo("analytics.sync.end", {
     currentDate,
     finalizedDates,
@@ -167,6 +170,18 @@ export async function runAnalyticsAggregation(env: Env, now = new Date()): Promi
     base: baseMetrics,
     streams: streamMetrics
   };
+}
+
+export function resolveRunDate(state: AnalyticsState, requestedDate: Date, runDay: string): string {
+  const requested = dayFromDate(requestedDate);
+  if (state.finalizedThroughDate) {
+    const next = nextDate(state.finalizedThroughDate);
+    if (next && next <= runDay) {
+      return next;
+    }
+  }
+
+  return requested <= runDay ? requested : runDay;
 }
 
 export async function getAnalyticsWindow(env: Env, days = 30, now = new Date()): Promise<AnalyticsResponse> {
@@ -221,7 +236,8 @@ export class KVAnalyticsStore {
     return {
       date,
       ...ZERO_DAILY,
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      missing: true
     };
   }
 
@@ -295,6 +311,15 @@ async function finalizeClosedDays(store: KVAnalyticsStore, state: AnalyticsState
   let cursor = startDate;
   while (cursor <= yesterday) {
     const day = await store.getDaily(cursor);
+    //dont finalize if a day is missing
+    if (day.missing) {
+      // log warning
+      logWarn("analytics.finalize.skipped", {
+        reason: "missing_daily_record",
+        date: cursor
+      });
+      break;
+    }
     global = addDailyToGlobal(global, day, now.toISOString());
     finalizedDates.push(cursor);
     const next = nextDate(cursor);
@@ -303,8 +328,9 @@ async function finalizeClosedDays(store: KVAnalyticsStore, state: AnalyticsState
   }
 
   await store.putGlobal(global);
+  const finalizedThroughDate = finalizedDates.length > 0 ? finalizedDates[finalizedDates.length - 1] : state.finalizedThroughDate;
   await store.putState({
-    finalizedThroughDate: finalizedDates[finalizedDates.length - 1],
+    finalizedThroughDate,
     updatedAt: now.toISOString()
   });
   return finalizedDates;
@@ -479,10 +505,10 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
           ) {
             sender { id }
             currentFlowRate
-            streamedUntilUpdatedAt
             updatedAtTimestamp
             flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
               userData
+              oldFlowRate
             }
           }
         }
@@ -515,10 +541,10 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
         streams?: Array<{
           sender: { id: string };
           currentFlowRate: string;
-          streamedUntilUpdatedAt: string;
           updatedAtTimestamp: string;
           flowUpdatedEvents?: Array<{
             userData: string;
+            oldFlowRate?: string;
           }>;
         }>;
       };
@@ -528,10 +554,11 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
     for (const stream of batch) {
       const sender = stream.sender.id.toLowerCase();
       const currentFlowRate = BigInt(stream.currentFlowRate || "0");
-      const streamedUntilUpdatedAt = BigInt(stream.streamedUntilUpdatedAt || "0");
+      const previousFlowRateRaw = stream.flowUpdatedEvents?.[0]?.oldFlowRate;
+      const previousFlowRate = previousFlowRateRaw !== undefined ? BigInt(previousFlowRateRaw || "0") : undefined;
       const updatedAtTimestamp = parseNumberish(stream.updatedAtTimestamp || "0");
       const buyerAddress = decodeBuyerFromUserData(stream.flowUpdatedEvents?.[0]?.userData);
-      const totalStreamedWei = streamedWithinDay(streamedUntilUpdatedAt, currentFlowRate, updatedAtTimestamp, dayStartUnix, nowUnix);
+      const totalStreamedWei = streamedWithinDay(previousFlowRate, currentFlowRate, updatedAtTimestamp, dayStartUnix, nowUnix);
       const existing = snapshotsBySender.get(sender);
       if (existing) {
         existing.buyerAddress ??= buyerAddress;
@@ -748,14 +775,32 @@ function dedupeAccounts(accounts: string[]): string[] {
   return [...new Set(accounts.map((account) => account.toLowerCase()))].sort();
 }
 
-function streamedWithinDay(streamedUntilUpdatedAt: bigint, currentFlowRate: bigint, updatedAtTimestamp: number, dayStartUnix: number, nowUnix: number): bigint {
-  if (updatedAtTimestamp >= dayStartUnix) {
-    const boundedActiveSeconds = BigInt(Math.max(0, nowUnix - updatedAtTimestamp));
-    return streamedUntilUpdatedAt + currentFlowRate * boundedActiveSeconds;
+function streamedWithinDay(
+  previousFlowRate: bigint | undefined,
+  currentFlowRate: bigint,
+  updatedAtTimestamp: number,
+  dayStartUnix: number,
+  nowUnix: number
+): bigint {
+  if (nowUnix <= dayStartUnix) {
+    return 0n;
   }
+  let streamed = 0n;
+  if (updatedAtTimestamp >= dayStartUnix) {
+    const boundedUpdatedAt = Math.min(updatedAtTimestamp, nowUnix);
+    const postUpdateSeconds = BigInt(Math.max(0, nowUnix - boundedUpdatedAt));
+    streamed += currentFlowRate * postUpdateSeconds;
+    if (previousFlowRate !== undefined) {
+      const preUpdateSeconds = BigInt(Math.max(0, boundedUpdatedAt - dayStartUnix));
+      streamed += previousFlowRate * preUpdateSeconds;
+    }
+    return streamed;
+  }
+
   if (currentFlowRate === 0n) {
     return 0n;
   }
+
   const boundedUpdatedAt = Math.max(updatedAtTimestamp, dayStartUnix);
   const activeSeconds = BigInt(Math.max(0, nowUnix - boundedUpdatedAt));
   return currentFlowRate * activeSeconds;
