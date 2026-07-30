@@ -7,6 +7,9 @@ import { GdCreditEntry } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 import { getAnalyticsWindow, runAnalyticsAggregation, KVAnalyticsStore } from "./analytics.js";
 
+const ANALYTICS_REFRESH_COOLDOWN_MS = 60 * 60 * 1000;
+const ANALYTICS_REFRESH_LAST_RUN_KEY = "analytics:refresh:last-run-at";
+
 const CeloEventsRecordSchema = z
   .object({
     txHash: z
@@ -216,6 +219,7 @@ export default {
     try {
       const summaries: Array<{ currentDate: string; finalizedDates: string[] }> = [];
       const maxRunsPerTick = 2;
+      // TODO: replace bounded loop with persisted backfill cursor when we need broader historical catch-up.
       const todayDate = new Date().toISOString().slice(0, 10);
       for (let i = 0; i < maxRunsPerTick; i += 1) {
         const analyticsSummary = await runAnalyticsAggregation(env);
@@ -316,6 +320,19 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   }
 
   if (request.method === "POST" && url.pathname === "/v1/analytics/refresh") {
+    const lastRefreshAt = await readAnalyticsRefreshTimestamp(env.ANTSEED_KV);
+    const now = Date.now();
+    if (lastRefreshAt !== undefined && now - lastRefreshAt < ANALYTICS_REFRESH_COOLDOWN_MS) {
+      const retryAfterSeconds = Math.ceil((ANALYTICS_REFRESH_COOLDOWN_MS - (now - lastRefreshAt)) / 1000);
+      return json(
+        {
+          error: "analytics refresh is rate-limited",
+          retryAfterSeconds
+        },
+        429
+      );
+    }
+    await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
     const summary = await runAnalyticsAggregation(env);
     return json(summary);
   }
@@ -695,6 +712,14 @@ function cors(response: Response): Response {
 function createStreamFundingId(account: string, date: Date): string {
   const day = date.toISOString().slice(0, 10); // YYYY-MM-DD
   return `stream:${day}:${account.toLowerCase()}`;
+}
+
+async function readAnalyticsRefreshTimestamp(kv: Pick<KVNamespace, "get">): Promise<number | undefined> {
+  const raw = await kv.get(ANALYTICS_REFRESH_LAST_RUN_KEY);
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return parsed;
 }
 
 async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFundingVault: AntSeedFundingVaultClient): Promise<{ [key: string]: unknown }> {

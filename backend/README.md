@@ -48,7 +48,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `lastRun.finalizedThroughDate` — the most recent closed day whose values have been merged into persisted globals
 - Base usage (`aiCreditsUsedWei`, `uniqueCreditUsers`) is filtered to known buyers only; known buyers are learned from Celo vault `buyer` fields.
 
-`POST /v1/analytics/refresh` recomputes the current UTC day from midnight to now, overwrites the day snapshot, finalizes any closed days into persisted globals, and returns a summary.
+`POST /v1/analytics/refresh` recomputes the current UTC day from midnight to now, overwrites the day snapshot, finalizes any closed days into persisted globals, and returns a summary. This endpoint is rate-limited to one invocation per hour.
 
 ## Setup
 

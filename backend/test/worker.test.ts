@@ -147,6 +147,46 @@ test("POST /v1/analytics/refresh returns aggregation summary", async () => {
   }
 });
 
+test("POST /v1/analytics/refresh is rate-limited to one call per hour", async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
+      if (url.searchParams.get("action") === "getblocknobytime") {
+        return Response.json({
+          status: "1",
+          message: "OK",
+          result: "123"
+        });
+      }
+
+      if (url.searchParams.get("action") === "getLogs") {
+        return Response.json({
+          status: "0",
+          message: "No records found",
+          result: []
+        });
+      }
+
+      throw new Error(`unexpected fetch ${url.toString()}`);
+    }) as typeof fetch;
+
+    const testEnv = env();
+    const first = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), testEnv, {} as ExecutionContext);
+    assert.equal(first.status, 200);
+
+    const second = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), testEnv, {} as ExecutionContext);
+    assert.equal(second.status, 429);
+    const body = (await second.json()) as { error: string; retryAfterSeconds: number };
+    assert.equal(body.error, "analytics refresh is rate-limited");
+    assert.equal(body.retryAfterSeconds > 0, true);
+    assert.equal(body.retryAfterSeconds <= 3600, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("GET /v1/accounts/:account/profile returns profile only", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
