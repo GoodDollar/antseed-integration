@@ -755,17 +755,17 @@ test("analytics refresh includes base usage for buyers learned from stream userD
       if (url.host === "superfluid.test") {
         const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
         if (body.variables.skip > 0) {
-          return Response.json({ data: { streams: [] } });
+          return Response.json({ data: { streamPeriods: [] } });
         }
         return Response.json({
           data: {
-            streams: [
+            streamPeriods: [
               {
                 sender: { id: account },
-                currentFlowRate: "0",
-                streamedUntilUpdatedAt: "1000000000000000000",
-                updatedAtTimestamp: String(timestamp),
-                flowUpdatedEvents: [{ userData: encodedBuyerUserData }]
+                flowRate: "0",
+                startedAtTimestamp: String(timestamp),
+                stoppedAtTimestamp: null,
+                userData: encodedBuyerUserData
               }
             ]
           }
@@ -909,7 +909,7 @@ test("scheduled analytics seeds a 30-day backfill cursor on fresh KV", { concurr
   const now = new Date();
   const expectedFirstDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const expectedSecondDate = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const expectedThirdDate = new Date(now.getTime() - 28 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const expectedCursorDate = now.toISOString().slice(0, 10);
 
   const originalFetch = globalThis.fetch;
   try {
@@ -936,7 +936,7 @@ test("scheduled analytics seeds a 30-day backfill cursor on fresh KV", { concurr
 
     assert.notEqual(firstDaily, null);
     assert.notEqual(secondDaily, null);
-    assert.equal(cursor, expectedThirdDate);
+    assert.equal(cursor, expectedCursorDate);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -104,16 +104,24 @@ test("runAnalyticsAggregation calculates streamed G$ across a mid-day flow updat
       if (url.host === "superfluid.test") {
         const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
         if (body.variables.skip > 0) {
-          return Response.json({ data: { streams: [] } });
+          return Response.json({ data: { streamPeriods: [] } });
         }
         return Response.json({
           data: {
-            streams: [
+            streamPeriods: [
               {
                 sender: { id: "0x0000000000000000000000000000000000000abc" },
-                currentFlowRate: "4",
-                updatedAtTimestamp: String(updatedAtTimestamp),
-                flowUpdatedEvents: [{ userData: "0x", oldFlowRate: "2" }]
+                flowRate: "2",
+                startedAtTimestamp: String(dayStartUnix),
+                stoppedAtTimestamp: String(updatedAtTimestamp),
+                userData: "0x"
+              },
+              {
+                sender: { id: "0x0000000000000000000000000000000000000abc" },
+                flowRate: "4",
+                startedAtTimestamp: String(updatedAtTimestamp),
+                stoppedAtTimestamp: null,
+                userData: "0x"
               }
             ]
           }
@@ -174,16 +182,17 @@ test("runAnalyticsAggregation calculates streamed G$ for streams active since be
       if (url.host === "superfluid.test") {
         const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
         if (body.variables.skip > 0) {
-          return Response.json({ data: { streams: [] } });
+          return Response.json({ data: { streamPeriods: [] } });
         }
         return Response.json({
           data: {
-            streams: [
+            streamPeriods: [
               {
                 sender: { id: "0x0000000000000000000000000000000000000abc" },
-                currentFlowRate: "3",
-                updatedAtTimestamp: String(updatedAtTimestamp),
-                flowUpdatedEvents: [{ userData: "0x" }]
+                flowRate: "3",
+                startedAtTimestamp: String(updatedAtTimestamp),
+                stoppedAtTimestamp: null,
+                userData: "0x"
               }
             ]
           }
