@@ -278,6 +278,16 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ account: profile.account, profile });
   }
 
+  const buyersMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/buyers$/);
+  if (request.method === "GET" && buyersMatch) {
+    const account = decodeURIComponent(buyersMatch[1]).toLowerCase();
+    const profile = await store.getUser(account);
+    return json({
+      account: profile.account,
+      buyers: profile.buyers.map((buyer) => buyer.address)
+    });
+  }
+
   const creditHistoryMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/credit-history$/);
   if (request.method === "GET" && creditHistoryMatch) {
     const account = decodeURIComponent(creditHistoryMatch[1]);

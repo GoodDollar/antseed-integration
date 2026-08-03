@@ -61,6 +61,10 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 **Profile** (`GET /v1/accounts/:account/profile`):
 - returns the user's `UserCreditProfile`, including the payer's consented public `buyers` list
 
+**Buyers** (`GET /v1/accounts/:account/buyers`):
+- returns only the payer's public buyer addresses
+- response: `{ account, buyers }` where `buyers` is `string[]`
+
 **Credit history** (`GET /v1/accounts/:account/credit-history`):
 - returns paginated `GdCreditEntry` records newest-first
 - query params: `limit` (default 20, max 100), `offset` (default 0), optional `source`, `fundingStatus`, `from` / `to` (ISO `createdAt` range, inclusive)

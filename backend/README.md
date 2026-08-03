@@ -16,6 +16,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `GET /config/status`
 - `GET /config/values`
 - `GET /v1/accounts/:account/profile`
+- `GET /v1/accounts/:account/buyers`
 - `GET /v1/accounts/:account/credit-history`
 - `GET /v1/accounts/:account/outstanding`
 - `POST /v1/accounts/:account/stream-credits`
@@ -27,6 +28,10 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/channels/:channelId/withdraw`
 
 `GET /v1/accounts/:account/profile` returns the wallet `UserCreditProfile`, including the payer's public `buyers` list (`address` + `consentedAt`).
+
+`GET /v1/accounts/:account/buyers` returns only the payer's public buyer addresses:
+
+- response: `{ account, buyers }` where `buyers` is `string[]`
 
 `POST /v1/accounts/:buyer/operator-consent` body:
 

@@ -78,6 +78,54 @@ test("GET /v1/accounts/:account/profile returns profile only", async () => {
   assert.equal(body.gdCredits, undefined);
 });
 
+test("GET /v1/accounts/:account/buyers returns buyer addresses only", async () => {
+  const testEnv = env();
+  const account = "0x0000000000000000000000000000000000000abc";
+  const emptyRes = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/buyers`),
+    testEnv,
+    {} as ExecutionContext
+  );
+  assert.equal(emptyRes.status, 200);
+  const emptyBody = (await emptyRes.json()) as { account: string; buyers: string[] };
+  assert.equal(emptyBody.account, account);
+  assert.deepEqual(emptyBody.buyers, []);
+
+  await testEnv.ANTSEED_KV.put(
+    `user:${account}`,
+    JSON.stringify({
+      account,
+      rootAccount: account,
+      createdAt: "2026-08-03T00:00:00.000Z",
+      updatedAt: "2026-08-03T00:00:00.000Z",
+      totalGdDepositedWei: "0",
+      totalPrincipalUsd: "0",
+      totalBonusUsd: "0",
+      totalGDStreamedWei: "0",
+      totalOutstandingFundingUsd: "0",
+      streamFlowRateWeiPerSecond: "0",
+      buyers: [
+        { address: "0x0000000000000000000000000000000000000b01", consentedAt: "2026-08-01T00:00:00.000Z" },
+        { address: "0x0000000000000000000000000000000000000b02", consentedAt: "2026-08-02T00:00:00.000Z" }
+      ]
+    })
+  );
+
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/buyers`),
+    testEnv,
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { account: string; buyers: string[]; profile?: unknown };
+  assert.equal(body.account, account);
+  assert.deepEqual(body.buyers, [
+    "0x0000000000000000000000000000000000000b01",
+    "0x0000000000000000000000000000000000000b02"
+  ]);
+  assert.equal(body.profile, undefined);
+});
+
 test("GET /v1/accounts/:account/credit-history returns paginated empty history", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
