@@ -39,9 +39,9 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `signature` — buyer EIP-712 signature
 - `payer` — connected wallet public address that owns the buyer list
 
-On successful on-chain accept (`bridge.enabled = true`), the buyer public address is appended to the payer profile buyers list (idempotent). Private keys are never stored.
+On successful on-chain accept (`bridge.enabled = true`), the buyer public address is appended to the payer buyers list stored at `user-buyers:<payer>` (idempotent). Private keys are never stored. Payer authorization via EIP-712 is planned but not enforced yet.
 
-`POST /v1/accounts/:account/buyers/backfill-from-credits` is a developer helper that unions distinct `buyerAddress` values from the account's credit history into the payer buyers list.
+`POST /v1/accounts/:account/buyers/backfill-from-credits` is a developer helper that unions distinct `buyerAddress` values from the account's credit history into the payer buyers list. Requires header `x-admin-secret` matching Worker secret `ADMIN_API_SECRET` (defaults to `dev-admin-secret` when unset; returns `401` if wrong).
 
 `GET /v1/accounts/:account/credit-history` returns paginated `GdCreditEntry` history (newest first):
 
@@ -66,6 +66,7 @@ npm run build
 Optional secrets/config:
 
 - `SLACK_WEBHOOK_URL` - receives a notification when a fetch request ends with an uncaught exception. The payload includes the request method, path, raw body, and error message.
+- `ADMIN_API_SECRET` - shared secret for developer/admin endpoints such as buyers backfill; send as `x-admin-secret`. Defaults to `dev-admin-secret` when unset.
 - `MAX_BONUS_CAP_USD` - monthly per-root-account bonus cap (token units, 18 decimals), defaults to `100`.
 - `REGULAR_BONUS_BPS` - bonus basis points for deposits/non-stream sources, defaults to `1000` (10%).
 - `STREAMING_BONUS_BPS` - bonus basis points for stream sources, defaults to `2000` (20%).

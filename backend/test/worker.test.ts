@@ -462,6 +462,23 @@ test("POST /v1/accounts/:account/operator-consent returns 400 when payer is miss
   assert.equal(res.status, 400);
 });
 
+test("POST /v1/accounts/:account/operator-consent returns 400 on invalid buyer address", async () => {
+  const res = await worker.fetch(
+    new Request("https://worker.test/v1/accounts/not-an-address/operator-consent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nonce: "0",
+        signature: `0x${"a".repeat(130)}`,
+        payer: "0x0000000000000000000000000000000000000def"
+      })
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(res.status, 400);
+});
+
 test("POST /v1/accounts/:account/operator-consent returns enabled:false when vault not configured", async () => {
   const buyer = "0x0000000000000000000000000000000000000abc";
   const payer = "0x0000000000000000000000000000000000000def";
@@ -491,17 +508,47 @@ test("POST /v1/accounts/:account/operator-consent returns enabled:false when vau
   assert.deepEqual(body.buyers, []);
 });
 
-test("POST /v1/accounts/:account/buyers/backfill-from-credits returns empty when no credits", async () => {
+test("POST /v1/accounts/:account/buyers/backfill-from-credits requires admin secret", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(
+  const missingSecret = await worker.fetch(
     new Request(`https://worker.test/v1/accounts/${account}/buyers/backfill-from-credits`, {
       method: "POST"
     }),
     env(),
     {} as ExecutionContext
   );
-  assert.equal(res.status, 200);
-  const body = (await res.json()) as {
+  assert.equal(missingSecret.status, 401);
+
+  const unauthorized = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/buyers/backfill-from-credits`, {
+      method: "POST",
+      headers: { "x-admin-secret": "wrong" }
+    }),
+    env({ ADMIN_API_SECRET: "custom-admin-secret" }),
+    {} as ExecutionContext
+  );
+  assert.equal(unauthorized.status, 401);
+
+  const defaultSecret = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/buyers/backfill-from-credits`, {
+      method: "POST",
+      headers: { "x-admin-secret": "dev-admin-secret" }
+    }),
+    env(),
+    {} as ExecutionContext
+  );
+  assert.equal(defaultSecret.status, 200);
+
+  const ok = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${account}/buyers/backfill-from-credits`, {
+      method: "POST",
+      headers: { "x-admin-secret": "custom-admin-secret" }
+    }),
+    env({ ADMIN_API_SECRET: "custom-admin-secret" }),
+    {} as ExecutionContext
+  );
+  assert.equal(ok.status, 200);
+  const body = (await ok.json()) as {
     account: string;
     added: unknown[];
     skipped: unknown[];

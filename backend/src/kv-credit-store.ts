@@ -5,6 +5,7 @@ import { logInfo, logWarn, redactAddress } from "./logging.js";
 type KV = Pick<KVNamespace, "get" | "put">;
 
 const USER_PREFIX = "user:";
+const USER_BUYERS_PREFIX = "user-buyers:";
 const GD_CREDIT_PREFIX = "gd-credit:";
 const USER_GD_CREDITS_PREFIX = "user-gd-credits:";
 const MONTHLY_BONUS_PREFIX = "monthly-bonus:";
@@ -45,7 +46,6 @@ export class KVCreditStore {
     const month = monthKey(input.date ?? new Date());
     const bonus = calculateCreditWithBonus(input.gdAmountWei, input.source, input.isVerified, input.gdPrice, input.regularBonusBps, input.streamingBonusBps);
 
-    // Enforce per-root-account monthly bonus cap
     let effectiveBonusUsd = bonus.bonusUsd;
     if (effectiveBonusUsd > 0n && input.maxBonusCapUsd > 0n) {
       const monthlyBonusUsed = await this.getMonthlyBonusUsed(rootAccount, month);
@@ -206,32 +206,56 @@ export class KVCreditStore {
   }
 
   async getUser(account: string): Promise<UserCreditProfile> {
-    const normalized = normalizeAccount(account);
-    const saved = await this.getJson<Partial<UserCreditProfile>>(`${USER_PREFIX}${normalized}`);
-    return normalizeProfile(saved, normalized);
+    const profile = await this.getUserRecord(account);
+    return {
+      ...profile,
+      buyers: await this.getBuyers(profile.account)
+    };
+  }
+
+  async getBuyers(payer: string): Promise<PayerBuyer[]> {
+    const normalizedPayer = normalizeAccount(payer);
+    const saved = await this.getJson<PayerBuyer[]>(`${USER_BUYERS_PREFIX}${normalizedPayer}`);
+    if (Array.isArray(saved)) {
+      return normalizeBuyers(saved);
+    }
+
+    const legacy = await this.getJson<Partial<UserCreditProfile>>(`${USER_PREFIX}${normalizedPayer}`);
+    const legacyBuyers = normalizeBuyers(legacy?.buyers);
+    if (legacyBuyers.length === 0) {
+      return [];
+    }
+
+    await this.putJson(`${USER_BUYERS_PREFIX}${normalizedPayer}`, legacyBuyers);
+    if (legacy) {
+      await this.putJson(`${USER_PREFIX}${normalizedPayer}`, profileForStorage(normalizeProfile(legacy, normalizedPayer)));
+    }
+    logInfo("kv.payer.buyers-migrated", {
+      payer: redactAddress(normalizedPayer),
+      buyerCount: legacyBuyers.length
+    });
+    return legacyBuyers;
   }
 
   async addBuyerToPayer(payer: string, buyer: string, consentedAt?: string): Promise<UserCreditProfile> {
     const normalizedPayer = normalizeAccount(payer);
     const normalizedBuyer = normalizeAccount(buyer);
-    const current = await this.getUser(normalizedPayer);
-    const existing = current.buyers.find((item) => item.address === normalizedBuyer);
+    const buyers = await this.getBuyers(normalizedPayer);
+    const existing = buyers.find((item) => item.address === normalizedBuyer);
     if (existing) {
-      return current;
+      const profile = await this.getUserRecord(normalizedPayer);
+      return { ...profile, buyers };
     }
     const now = consentedAt ?? new Date().toISOString();
-    const next: UserCreditProfile = {
-      ...current,
-      updatedAt: new Date().toISOString(),
-      buyers: [...current.buyers, { address: normalizedBuyer, consentedAt: now }]
-    };
-    await this.putJson(`${USER_PREFIX}${normalizedPayer}`, next);
+    const nextBuyers = [...buyers, { address: normalizedBuyer, consentedAt: now }];
+    await this.putJson(`${USER_BUYERS_PREFIX}${normalizedPayer}`, nextBuyers);
     logInfo("kv.payer.buyer-added", {
       payer: redactAddress(normalizedPayer),
       buyer: redactAddress(normalizedBuyer),
-      buyerCount: next.buyers.length
+      buyerCount: nextBuyers.length
     });
-    return next;
+    const profile = await this.getUserRecord(normalizedPayer);
+    return { ...profile, buyers: nextBuyers };
   }
 
   async backfillBuyersFromCredits(payer: string): Promise<{
@@ -240,8 +264,8 @@ export class KVCreditStore {
     skipped: string[];
   }> {
     const normalizedPayer = normalizeAccount(payer);
-    const current = await this.getUser(normalizedPayer);
-    const known = new Set(current.buyers.map((item) => item.address));
+    const currentBuyers = await this.getBuyers(normalizedPayer);
+    const known = new Set(currentBuyers.map((item) => item.address));
     const earliestByBuyer = new Map<string, string>();
     const credits = await this.getGdCredits(normalizedPayer);
     for (const entry of credits) {
@@ -255,7 +279,7 @@ export class KVCreditStore {
 
     const added: PayerBuyer[] = [];
     const skipped: string[] = [];
-    let buyers = [...current.buyers];
+    let buyers = [...currentBuyers];
     for (const [buyer, consentedAt] of earliestByBuyer) {
       if (known.has(buyer)) {
         skipped.push(buyer);
@@ -267,23 +291,25 @@ export class KVCreditStore {
       added.push(record);
     }
 
+    const profile = await this.getUserRecord(normalizedPayer);
     if (added.length === 0) {
-      return { profile: current, added, skipped };
+      return { profile: { ...profile, buyers }, added, skipped };
     }
 
-    const next: UserCreditProfile = {
-      ...current,
-      updatedAt: new Date().toISOString(),
-      buyers
-    };
-    await this.putJson(`${USER_PREFIX}${normalizedPayer}`, next);
+    await this.putJson(`${USER_BUYERS_PREFIX}${normalizedPayer}`, buyers);
     logInfo("kv.payer.buyers-backfilled", {
       payer: redactAddress(normalizedPayer),
       added: added.length,
       skipped: skipped.length,
-      buyerCount: next.buyers.length
+      buyerCount: buyers.length
     });
-    return { profile: next, added, skipped };
+    return { profile: { ...profile, buyers }, added, skipped };
+  }
+
+  private async getUserRecord(account: string): Promise<UserCreditProfile> {
+    const normalized = normalizeAccount(account);
+    const saved = await this.getJson<Partial<UserCreditProfile>>(`${USER_PREFIX}${normalized}`);
+    return normalizeProfile(saved, normalized);
   }
 
   private async addGdCreditToAccount(account: string, entryId: string): Promise<void> {
@@ -308,18 +334,18 @@ export class KVCreditStore {
   private async updateUser(account: string, rootAccount: string | undefined, mutate: (profile: UserCreditProfile) => UserCreditProfile): Promise<void> {
     const normalized = normalizeAccount(account);
     const normalizedRoot = normalizeAccount(rootAccount ?? account);
-    const current = await this.getUser(normalized);
+    const current = await this.getUserRecord(normalized);
     const next = mutate({ ...current, rootAccount: normalizedRoot });
-    await this.putJson(`${USER_PREFIX}${normalized}`, next);
+    await this.putJson(`${USER_PREFIX}${normalized}`, profileForStorage(next));
 
     if (normalizedRoot !== normalized) {
-      const rootCurrent = await this.getUser(normalizedRoot);
+      const rootCurrent = await this.getUserRecord(normalizedRoot);
       const rootNext = mutate({
         ...rootCurrent,
         account: normalizedRoot,
         rootAccount: normalizedRoot
       });
-      await this.putJson(`${USER_PREFIX}${normalizedRoot}`, rootNext);
+      await this.putJson(`${USER_PREFIX}${normalizedRoot}`, profileForStorage(rootNext));
     }
   }
 
@@ -333,16 +359,18 @@ export class KVCreditStore {
   }
 }
 
+function normalizeBuyers(saved: Partial<PayerBuyer>[] | undefined): PayerBuyer[] {
+  if (!Array.isArray(saved)) return [];
+  return saved
+    .filter((item): item is PayerBuyer => Boolean(item?.address) && Boolean(item?.consentedAt))
+    .map((item) => ({
+      address: normalizeAccount(item.address),
+      consentedAt: item.consentedAt
+    }));
+}
+
 function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account: string): UserCreditProfile {
   const createdAt = saved?.createdAt ?? new Date().toISOString();
-  const buyers = Array.isArray(saved?.buyers)
-    ? saved.buyers
-        .filter((item): item is PayerBuyer => Boolean(item?.address) && Boolean(item?.consentedAt))
-        .map((item) => ({
-          address: normalizeAccount(item.address),
-          consentedAt: item.consentedAt
-        }))
-    : [];
   return {
     account,
     rootAccount: saved?.rootAccount ?? account,
@@ -355,8 +383,13 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingUsd: saved?.totalOutstandingFundingUsd ?? "0",
     lastStreamCreditAt: saved?.lastStreamCreditAt,
-    buyers
+    buyers: []
   };
+}
+
+function profileForStorage(profile: UserCreditProfile): Omit<UserCreditProfile, "buyers"> {
+  const { buyers: _buyers, ...rest } = profile;
+  return rest;
 }
 
 function normalizeAccount(account: string): string {

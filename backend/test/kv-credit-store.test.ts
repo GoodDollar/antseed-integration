@@ -285,7 +285,8 @@ test("getUser returns default profile for unknown account", async () => {
 });
 
 test("addBuyerToPayer appends public buyer idempotently on payer only", async () => {
-  const store = new KVCreditStore(new MemoryKV() as never);
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
   await store.recordGdCredit({
     id: "deposit:buyer-link",
     account: "0xPAYER",
@@ -309,6 +310,60 @@ test("addBuyerToPayer appends public buyer idempotently on payer only", async ()
 
   const root = await store.getUser("0xROOT");
   assert.deepEqual(root.buyers, []);
+
+  const storedUser = (await kv.get("user:0xpayer", "json")) as { buyers?: unknown };
+  assert.equal(storedUser.buyers, undefined);
+  const storedBuyers = (await kv.get("user-buyers:0xpayer", "json")) as Array<{ address: string }>;
+  assert.equal(storedBuyers.length, 1);
+  assert.equal(storedBuyers[0].address, "0xbuyer");
+});
+
+test("buyers survive concurrent credit profile updates via separate KV key", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.addBuyerToPayer("0xPAYER", "0xBUYER", "2026-08-03T12:00:00.000Z");
+  await store.recordGdCredit({
+    id: "deposit:after-buyer",
+    account: "0xPAYER",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapUsd: 100_000_000n
+  });
+  const user = await store.getUser("0xPAYER");
+  assert.equal(user.buyers.length, 1);
+  assert.equal(user.buyers[0].address, "0xbuyer");
+  assert.notEqual(user.totalGdDepositedWei, "0");
+});
+
+test("getBuyers migrates legacy buyers embedded in user profile", async () => {
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  await kv.put(
+    "user:0xpayer",
+    JSON.stringify({
+      account: "0xpayer",
+      rootAccount: "0xpayer",
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+      totalGdDepositedWei: "0",
+      totalPrincipalUsd: "0",
+      totalBonusUsd: "0",
+      totalGDStreamedWei: "0",
+      totalOutstandingFundingUsd: "0",
+      streamFlowRateWeiPerSecond: "0",
+      buyers: [{ address: "0xBUYER", consentedAt: "2026-08-01T00:00:00.000Z" }]
+    })
+  );
+
+  const buyers = await store.getBuyers("0xPAYER");
+  assert.equal(buyers.length, 1);
+  assert.equal(buyers[0].address, "0xbuyer");
+  const migrated = (await kv.get("user-buyers:0xpayer", "json")) as Array<{ address: string }>;
+  assert.equal(migrated[0].address, "0xbuyer");
+  const storedUser = (await kv.get("user:0xpayer", "json")) as { buyers?: unknown };
+  assert.equal(storedUser.buyers, undefined);
 });
 
 test("backfillBuyersFromCredits unions credit buyerAddress values", async () => {

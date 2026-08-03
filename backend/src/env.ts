@@ -7,6 +7,7 @@ export interface Env {
   ANTSEED_FUNDING_VAULT_ADDRESS?: string;
   ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY?: string;
   SLACK_WEBHOOK_URL?: string;
+  ADMIN_API_SECRET?: string;
 
   GD_CUSD_PRICE?: string;
   CELO_RPC_URL?: string;

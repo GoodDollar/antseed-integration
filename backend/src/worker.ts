@@ -69,6 +69,9 @@ const ChannelOpSchema = z.object({
     .regex(/^0x[0-9a-fA-F]+$/)
     .optional()
 });
+const AddressParamSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
+const ADMIN_SECRET_HEADER = "x-admin-secret";
+const DEFAULT_ADMIN_API_SECRET = "dev-admin-secret";
 const SuperfluidStreamsResponseSchema = z.object({
   data: z.object({
     streams: z.array(
@@ -273,18 +276,20 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/profile$/);
   if (request.method === "GET" && accountMatch) {
-    const account = decodeURIComponent(accountMatch[1]);
+    const account = parseAddressParam(accountMatch[1]);
+    if (!account) return json({ error: "invalid account address" }, 400);
     const profile = await store.getUser(account);
     return json({ account: profile.account, profile });
   }
 
   const buyersMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/buyers$/);
   if (request.method === "GET" && buyersMatch) {
-    const account = decodeURIComponent(buyersMatch[1]).toLowerCase();
-    const profile = await store.getUser(account);
+    const account = parseAddressParam(buyersMatch[1]);
+    if (!account) return json({ error: "invalid account address" }, 400);
+    const buyers = await store.getBuyers(account);
     return json({
-      account: profile.account,
-      buyers: profile.buyers.map((buyer) => buyer.address)
+      account,
+      buyers: buyers.map((buyer) => buyer.address)
     });
   }
 
@@ -512,11 +517,13 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
   const operatorConsentMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator-consent$/);
   if (request.method === "POST" && operatorConsentMatch) {
-    const buyer = decodeURIComponent(operatorConsentMatch[1]).toLowerCase();
+    const buyer = parseAddressParam(operatorConsentMatch[1]);
+    if (!buyer) return json({ error: "invalid buyer address" }, 400);
     const body = await parseJson(request);
     const parsed = OperatorConsentSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
     const payer = parsed.data.payer.toLowerCase();
+    // TODO: require payer EIP-712 authorization over { buyer, nonce } before writing payer-scoped buyers; payer is currently caller-supplied and unauthenticated.
     logInfo("operator.consent.request", {
       buyer: redactAddress(buyer),
       payer: redactAddress(payer),
@@ -538,7 +545,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
   const buyersBackfillMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/buyers\/backfill-from-credits$/);
   if (request.method === "POST" && buyersBackfillMatch) {
-    const account = decodeURIComponent(buyersBackfillMatch[1]).toLowerCase();
+    const adminError = requireAdminSecret(request, env);
+    if (adminError) return adminError;
+    const account = parseAddressParam(buyersBackfillMatch[1]);
+    if (!account) return json({ error: "invalid account address" }, 400);
     logInfo("buyers.backfill.request", { account: redactAddress(account) });
     const result = await store.backfillBuyersFromCredits(account);
     logInfo("buyers.backfill.result", {
@@ -610,6 +620,31 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   }
 
   return json({ error: "not found" }, 404);
+}
+
+function parseAddressParam(raw: string): string | undefined {
+  const decoded = decodeURIComponent(raw);
+  const parsed = AddressParamSchema.safeParse(decoded);
+  if (!parsed.success) return undefined;
+  return parsed.data.toLowerCase();
+}
+
+function requireAdminSecret(request: Request, env: Env): Response | undefined {
+  const configured = env.ADMIN_API_SECRET || DEFAULT_ADMIN_API_SECRET;
+  const provided = request.headers.get(ADMIN_SECRET_HEADER) ?? "";
+  if (!timingSafeEqual(provided, configured)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+  return undefined;
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) {
+    out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return out === 0;
 }
 
 async function parseJson(request: Request): Promise<unknown> {

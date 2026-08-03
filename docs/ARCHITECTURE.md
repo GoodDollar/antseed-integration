@@ -75,13 +75,16 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 
 **Operator consent** (`POST /v1/accounts/:buyer/operator-consent`):
 - body: `nonce`, buyer EIP-712 `signature`, and `payer` (connected wallet public address)
+- path `buyer` and body `payer` must be valid `0x` addresses
 - calls `AntseedBuyerOperator.acceptBuyerOperator(buyer, nonce, sig)`
-- on successful on-chain accept (`bridge.enabled = true`), appends the buyer to the payer's KV `buyers` list (idempotent; public address + `consentedAt` only)
+- on successful on-chain accept (`bridge.enabled = true`), appends the buyer to `user-buyers:<payer>` (idempotent; public address + `consentedAt` only)
+- payer EIP-712 authorization over `{ buyer, nonce }` is preferred before writing payer-scoped buyers, but is not enforced yet (`payer` is currently caller-supplied)
 - response: `{ buyer, payer, bridge, buyers }`
 
 **Buyers backfill (developer)** (`POST /v1/accounts/:account/buyers/backfill-from-credits`):
+- requires `x-admin-secret` matching `ADMIN_API_SECRET` (defaults to `dev-admin-secret` when unset)
 - scans the account's `GdCreditEntry` records for distinct `buyerAddress` values
-- appends any missing public buyers to the payer profile (idempotent)
+- appends any missing public buyers to `user-buyers:<account>` (idempotent)
 - response: `{ account, added, skipped, buyers, profile }`
 
 **Principal withdraw** (`POST /v1/accounts/:account/withdraw`):
@@ -129,7 +132,8 @@ Future payment mechanisms (sponsorships, org budgets, subscriptions, multi-buyer
 
 The Worker binds `ANTSEED_KV` and persists:
 
-- `user:<account>` — `UserCreditProfile` aggregate, written for both the depositor wallet and the GoodID root wallet when they differ; tracks `totalGdDepositedWei`, `totalPrincipalUsd`, `totalBonusUsd`, `totalGDStreamedWei`, `totalOutstandingFundingUsd`, `streamFlowRateWeiPerSecond`, `lastStreamCreditAt`, and payer-scoped public `buyers` (`address` + `consentedAt`). Buyer list updates from operator consent / developer backfill write only the payer wallet key, not the GoodID root key.
+- `user:<account>` — `UserCreditProfile` aggregate, written for both the depositor wallet and the GoodID root wallet when they differ; tracks `totalGdDepositedWei`, `totalPrincipalUsd`, `totalBonusUsd`, `totalGDStreamedWei`, `totalOutstandingFundingUsd`, `streamFlowRateWeiPerSecond`, `lastStreamCreditAt`. Does not store buyers (avoids lost updates against credit ingestion).
+- `user-buyers:<payer>` — payer-scoped public buyers list (`address` + `consentedAt`); updated by operator consent and developer backfill only on the payer wallet key, not the GoodID root key. Legacy buyers embedded in `user:<payer>` are migrated on read.
 - `user-gd-credits:<account>` — bounded list (last 500) of `gd-credit` entry IDs for the account
 - `gd-credit:<id>` — individual `GdCreditEntry`: source, amounts, `fundingStatus` (`pending` → `funded` or `failed`), `fundingTxHash`, `fundingError`, `buyerAddress`
 - `monthly-bonus:<rootAccount>:YYYY-MM` — cumulative bonus issued to the root account in that calendar month; used to enforce `MAX_BONUS_CAP_USD`
