@@ -220,11 +220,12 @@ export default {
 
     try {
       const summaries: Array<{ currentDate: string; finalizedDates: string[] }> = [];
-      const maxRunsPerTick = 2;
+      let maxRunsPerTick = 2;
       const runAt = new Date();
       const todayDate = runAt.toISOString().slice(0, 10);
       let cursorDate = await readAnalyticsBackfillCursorDate(env.ANTSEED_KV);
       if (!cursorDate) {
+        maxRunsPerTick = ANALYTICS_CRON_BACKFILL_DAYS;
         cursorDate = dateDaysAgo(runAt, ANALYTICS_CRON_BACKFILL_DAYS);
         await env.ANTSEED_KV.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
       }
