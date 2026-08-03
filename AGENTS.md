@@ -143,6 +143,8 @@ If real deployed backend URLs are not provided in an issue, use Storybook/fixtur
 - Keep `fundingStatus` lifecycle (`pending` → `funded` / `failed`) on `GdCreditEntry` correct.
 - Include tests for credit-bonus calculations, KV persistence, and Worker routes when modifying those areas.
 - Update docs when changing user-visible flows, payment boundaries, or API contracts.
+- Add function/methods documentation for new methods or where missing
+- Add inline comments where complicated or long code
 
 ### Ask first
 

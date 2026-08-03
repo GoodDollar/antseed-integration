@@ -494,28 +494,33 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
   let skip = 0;
   const nowUnix = Math.floor(now.getTime() / 1000);
 
+  // get streams that are either active or stopped within the day window
   while (true) {
     const body = {
       query: `
-        query StreamsPage($receiver: String!, $token: String!, $first: Int!, $skip: Int!) {
-          streams(
-            where: { receiver: $receiver, token: $token }
+        query StreamPeriodsPage($receiver: String!, $token: String!, $daysago: BigInt!, $first: Int!, $skip: Int!) {
+          streamPeriods(
+            where: {
+              or: [
+                { receiver: $receiver, token: $token, stoppedAtTimestamp: null }
+                { receiver: $receiver, token: $token, stoppedAtTimestamp_gt: $daysago }
+              ]
+            }
             first: $first
             skip: $skip
           ) {
             sender { id }
-            currentFlowRate
-            updatedAtTimestamp
-            flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
-              userData
-              oldFlowRate
-            }
+            flowRate
+            startedAtTimestamp
+            stoppedAtTimestamp
+            userData
           }
         }
       `,
       variables: {
         receiver: cfg.celoStreamReceiverAddress,
         token: cfg.celoSuperTokenAddress,
+        daysago: String(dayStartUnix),
         first: pageSize,
         skip
       }
@@ -538,37 +543,40 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
 
     const json = (await response.json()) as {
       data?: {
-        streams?: Array<{
+        streamPeriods?: Array<{
           sender: { id: string };
-          currentFlowRate: string;
-          updatedAtTimestamp: string;
-          flowUpdatedEvents?: Array<{
-            userData: string;
-            oldFlowRate?: string;
-          }>;
+          flowRate: string;
+          startedAtTimestamp: string;
+          stoppedAtTimestamp: string | null;
+          userData: string;
         }>;
       };
     };
 
-    const batch = json.data?.streams ?? [];
-    for (const stream of batch) {
-      const sender = stream.sender.id.toLowerCase();
-      const currentFlowRate = BigInt(stream.currentFlowRate || "0");
-      const previousFlowRateRaw = stream.flowUpdatedEvents?.[0]?.oldFlowRate;
-      const previousFlowRate = previousFlowRateRaw !== undefined ? BigInt(previousFlowRateRaw || "0") : undefined;
-      const updatedAtTimestamp = parseNumberish(stream.updatedAtTimestamp || "0");
-      const buyerAddress = decodeBuyerFromUserData(stream.flowUpdatedEvents?.[0]?.userData);
-      const totalStreamedWei = streamedWithinDay(previousFlowRate, currentFlowRate, updatedAtTimestamp, dayStartUnix, nowUnix);
+    const batch = json.data?.streamPeriods ?? [];
+    for (const period of batch) {
+      const sender = period.sender.id.toLowerCase();
+      const flowRate = BigInt(period.flowRate || "0");
+      const startedAt = parseNumberish(period.startedAtTimestamp || "0");
+      const stoppedAt = period.stoppedAtTimestamp ? parseNumberish(period.stoppedAtTimestamp) : null;
+      const buyerAddress = decodeBuyerFromUserData(period.userData);
+
+      // intersect period with the day window to get seconds streamed today
+      const effectiveStart = Math.max(startedAt, dayStartUnix);
+      const effectiveEnd = Math.min(stoppedAt ?? nowUnix, nowUnix);
+      const activeSeconds = BigInt(Math.max(0, effectiveEnd - effectiveStart));
+      const streamedWei = flowRate * activeSeconds;
+
       const existing = snapshotsBySender.get(sender);
       if (existing) {
         existing.buyerAddress ??= buyerAddress;
-        existing.flowRateWeiPerSecond += currentFlowRate;
-        existing.totalStreamedWei += totalStreamedWei;
+        existing.totalStreamedWei += streamedWei;
+        if (stoppedAt === null) existing.flowRateWeiPerSecond += flowRate;
       } else {
         snapshotsBySender.set(sender, {
           buyerAddress,
-          flowRateWeiPerSecond: currentFlowRate,
-          totalStreamedWei
+          flowRateWeiPerSecond: stoppedAt === null ? flowRate : 0n,
+          totalStreamedWei: streamedWei
         });
       }
     }
@@ -773,37 +781,6 @@ function nextDate(date: string): string | undefined {
 
 function dedupeAccounts(accounts: string[]): string[] {
   return [...new Set(accounts.map((account) => account.toLowerCase()))].sort();
-}
-
-function streamedWithinDay(
-  previousFlowRate: bigint | undefined,
-  currentFlowRate: bigint,
-  updatedAtTimestamp: number,
-  dayStartUnix: number,
-  nowUnix: number
-): bigint {
-  if (nowUnix <= dayStartUnix) {
-    return 0n;
-  }
-  let streamed = 0n;
-  if (updatedAtTimestamp >= dayStartUnix) {
-    const boundedUpdatedAt = Math.min(updatedAtTimestamp, nowUnix);
-    const postUpdateSeconds = BigInt(Math.max(0, nowUnix - boundedUpdatedAt));
-    streamed += currentFlowRate * postUpdateSeconds;
-    if (previousFlowRate !== undefined) {
-      const preUpdateSeconds = BigInt(Math.max(0, boundedUpdatedAt - dayStartUnix));
-      streamed += previousFlowRate * preUpdateSeconds;
-    }
-    return streamed;
-  }
-
-  if (currentFlowRate === 0n) {
-    return 0n;
-  }
-
-  const boundedUpdatedAt = Math.max(updatedAtTimestamp, dayStartUnix);
-  const activeSeconds = BigInt(Math.max(0, nowUnix - boundedUpdatedAt));
-  return currentFlowRate * activeSeconds;
 }
 
 function getTopicHash(iface: Interface, eventName: string): string {
