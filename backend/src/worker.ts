@@ -45,7 +45,8 @@ const WithdrawPrincipalSchema = z.object({
 });
 const OperatorConsentSchema = z.object({
   nonce: z.string().regex(/^\d+$/),
-  signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
+  signature: z.string().regex(/^0x[0-9a-fA-F]+$/),
+  payer: z.string().regex(/^0x[0-9a-fA-F]{40}$/)
 });
 const CreditHistoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
@@ -505,17 +506,44 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const body = await parseJson(request);
     const parsed = OperatorConsentSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const payer = parsed.data.payer.toLowerCase();
     logInfo("operator.consent.request", {
       buyer: redactAddress(buyer),
+      payer: redactAddress(payer),
       nonce: parsed.data.nonce
     });
     const bridge = await antseedFundingVault.acceptBuyerOperator(buyer, BigInt(parsed.data.nonce), parsed.data.signature);
     logInfo("operator.consent.result", {
       buyer: redactAddress(buyer),
+      payer: redactAddress(payer),
       enabled: bridge.enabled,
       txHash: redactHash(bridge.txHash)
     });
-    return json({ buyer, bridge });
+    let profile = await store.getUser(payer);
+    if (bridge.enabled) {
+      profile = await store.addBuyerToPayer(payer, buyer);
+    }
+    return json({ buyer, payer, bridge, buyers: profile.buyers });
+  }
+
+  const buyersBackfillMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/buyers\/backfill-from-credits$/);
+  if (request.method === "POST" && buyersBackfillMatch) {
+    const account = decodeURIComponent(buyersBackfillMatch[1]).toLowerCase();
+    logInfo("buyers.backfill.request", { account: redactAddress(account) });
+    const result = await store.backfillBuyersFromCredits(account);
+    logInfo("buyers.backfill.result", {
+      account: redactAddress(account),
+      added: result.added.length,
+      skipped: result.skipped.length,
+      buyerCount: result.profile.buyers.length
+    });
+    return json({
+      account: result.profile.account,
+      added: result.added,
+      skipped: result.skipped,
+      buyers: result.profile.buyers,
+      profile: result.profile
+    });
   }
 
   const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);

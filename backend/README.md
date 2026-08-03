@@ -20,12 +20,23 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `GET /v1/accounts/:account/outstanding`
 - `POST /v1/accounts/:account/stream-credits`
 - `POST /v1/accounts/:account/operator-consent`
+- `POST /v1/accounts/:account/buyers/backfill-from-credits`
 - `POST /v1/accounts/:account/withdraw`
 - `POST /v1/celo/events/record`
 - `POST /v1/channels/:channelId/close`
 - `POST /v1/channels/:channelId/withdraw`
 
-`GET /v1/accounts/:account/profile` returns the wallet `UserCreditProfile` only.
+`GET /v1/accounts/:account/profile` returns the wallet `UserCreditProfile`, including the payer's public `buyers` list (`address` + `consentedAt`).
+
+`POST /v1/accounts/:buyer/operator-consent` body:
+
+- `nonce` — operator-consent nonce
+- `signature` — buyer EIP-712 signature
+- `payer` — connected wallet public address that owns the buyer list
+
+On successful on-chain accept (`bridge.enabled = true`), the buyer public address is appended to the payer profile buyers list (idempotent). Private keys are never stored.
+
+`POST /v1/accounts/:account/buyers/backfill-from-credits` is a developer helper that unions distinct `buyerAddress` values from the account's credit history into the payer buyers list.
 
 `GET /v1/accounts/:account/credit-history` returns paginated `GdCreditEntry` history (newest first):
 

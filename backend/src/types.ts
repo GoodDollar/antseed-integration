@@ -18,6 +18,11 @@ export type CreditReservation = {
   updatedAt: string;
 };
 
+export type PayerBuyer = {
+  address: string;
+  consentedAt: string;
+};
+
 export type UserCreditProfile = {
   account: string;
   rootAccount: string;
@@ -30,6 +35,7 @@ export type UserCreditProfile = {
   totalOutstandingFundingUsd: string;
   streamFlowRateWeiPerSecond: string;
   lastStreamCreditAt: string | undefined;
+  buyers: PayerBuyer[];
 };
 
 export type GdCreditEntry = {

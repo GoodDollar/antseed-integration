@@ -281,6 +281,80 @@ test("getUser returns default profile for unknown account", async () => {
   assert.equal(user.totalBonusUsd, "0");
   assert.equal(user.totalOutstandingFundingUsd, "0");
   assert.equal(user.streamFlowRateWeiPerSecond, "0");
+  assert.deepEqual(user.buyers, []);
+});
+
+test("addBuyerToPayer appends public buyer idempotently on payer only", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.recordGdCredit({
+    id: "deposit:buyer-link",
+    account: "0xPAYER",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapUsd: 100_000_000n,
+    buyerAddress: "0xBUYER"
+  });
+
+  const first = await store.addBuyerToPayer("0xPAYER", "0xBUYER", "2026-08-03T12:00:00.000Z");
+  assert.equal(first.buyers.length, 1);
+  assert.equal(first.buyers[0].address, "0xbuyer");
+  assert.equal(first.buyers[0].consentedAt, "2026-08-03T12:00:00.000Z");
+
+  const second = await store.addBuyerToPayer("0xPAYER", "0xBUYER", "2026-08-04T12:00:00.000Z");
+  assert.equal(second.buyers.length, 1);
+  assert.equal(second.buyers[0].consentedAt, "2026-08-03T12:00:00.000Z");
+
+  const root = await store.getUser("0xROOT");
+  assert.deepEqual(root.buyers, []);
+});
+
+test("backfillBuyersFromCredits unions credit buyerAddress values", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  await store.recordGdCredit({
+    id: "deposit:bf1",
+    account: "0xPAYER",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    gdPrice: GD_PRICE,
+    isVerified: false,
+    maxBonusCapUsd: 100_000_000n,
+    buyerAddress: "0xBUYER1"
+  });
+  await store.recordGdCredit({
+    id: "deposit:bf2",
+    account: "0xPAYER",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    gdPrice: GD_PRICE,
+    isVerified: false,
+    maxBonusCapUsd: 100_000_000n,
+    buyerAddress: "0xBUYER2"
+  });
+  await store.recordGdCredit({
+    id: "deposit:bf3",
+    account: "0xPAYER",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    gdPrice: GD_PRICE,
+    isVerified: false,
+    maxBonusCapUsd: 100_000_000n,
+    buyerAddress: "0xBUYER1"
+  });
+  await store.addBuyerToPayer("0xPAYER", "0xBUYER1", "2026-01-01T00:00:00.000Z");
+
+  const result = await store.backfillBuyersFromCredits("0xPAYER");
+  assert.equal(result.added.length, 1);
+  assert.equal(result.added[0].address, "0xbuyer2");
+  assert.deepEqual(result.skipped, ["0xbuyer1"]);
+  assert.equal(result.profile.buyers.length, 2);
+  assert.equal(result.profile.buyers.map((b) => b.address).sort().join(","), "0xbuyer1,0xbuyer2");
+
+  const again = await store.backfillBuyersFromCredits("0xPAYER");
+  assert.equal(again.added.length, 0);
+  assert.equal(again.skipped.length, 2);
 });
 
 test("markFundingResult updates lastStreamCreditAt for stream sources", async () => {

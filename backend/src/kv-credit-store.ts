@@ -1,5 +1,5 @@
 import { calculateCreditWithBonus, monthKey } from "./credit-bonus.js";
-import { GdCreditEntry, UserCreditProfile } from "./types.js";
+import { GdCreditEntry, PayerBuyer, UserCreditProfile } from "./types.js";
 import { logInfo, logWarn, redactAddress } from "./logging.js";
 
 type KV = Pick<KVNamespace, "get" | "put">;
@@ -211,6 +211,81 @@ export class KVCreditStore {
     return normalizeProfile(saved, normalized);
   }
 
+  async addBuyerToPayer(payer: string, buyer: string, consentedAt?: string): Promise<UserCreditProfile> {
+    const normalizedPayer = normalizeAccount(payer);
+    const normalizedBuyer = normalizeAccount(buyer);
+    const current = await this.getUser(normalizedPayer);
+    const existing = current.buyers.find((item) => item.address === normalizedBuyer);
+    if (existing) {
+      return current;
+    }
+    const now = consentedAt ?? new Date().toISOString();
+    const next: UserCreditProfile = {
+      ...current,
+      updatedAt: new Date().toISOString(),
+      buyers: [...current.buyers, { address: normalizedBuyer, consentedAt: now }]
+    };
+    await this.putJson(`${USER_PREFIX}${normalizedPayer}`, next);
+    logInfo("kv.payer.buyer-added", {
+      payer: redactAddress(normalizedPayer),
+      buyer: redactAddress(normalizedBuyer),
+      buyerCount: next.buyers.length
+    });
+    return next;
+  }
+
+  async backfillBuyersFromCredits(payer: string): Promise<{
+    profile: UserCreditProfile;
+    added: PayerBuyer[];
+    skipped: string[];
+  }> {
+    const normalizedPayer = normalizeAccount(payer);
+    const current = await this.getUser(normalizedPayer);
+    const known = new Set(current.buyers.map((item) => item.address));
+    const earliestByBuyer = new Map<string, string>();
+    const credits = await this.getGdCredits(normalizedPayer);
+    for (const entry of credits) {
+      const buyer = entry.buyerAddress ? normalizeAccount(entry.buyerAddress) : undefined;
+      if (!buyer) continue;
+      const prev = earliestByBuyer.get(buyer);
+      if (!prev || entry.createdAt < prev) {
+        earliestByBuyer.set(buyer, entry.createdAt);
+      }
+    }
+
+    const added: PayerBuyer[] = [];
+    const skipped: string[] = [];
+    let buyers = [...current.buyers];
+    for (const [buyer, consentedAt] of earliestByBuyer) {
+      if (known.has(buyer)) {
+        skipped.push(buyer);
+        continue;
+      }
+      const record: PayerBuyer = { address: buyer, consentedAt };
+      buyers = [...buyers, record];
+      known.add(buyer);
+      added.push(record);
+    }
+
+    if (added.length === 0) {
+      return { profile: current, added, skipped };
+    }
+
+    const next: UserCreditProfile = {
+      ...current,
+      updatedAt: new Date().toISOString(),
+      buyers
+    };
+    await this.putJson(`${USER_PREFIX}${normalizedPayer}`, next);
+    logInfo("kv.payer.buyers-backfilled", {
+      payer: redactAddress(normalizedPayer),
+      added: added.length,
+      skipped: skipped.length,
+      buyerCount: next.buyers.length
+    });
+    return { profile: next, added, skipped };
+  }
+
   private async addGdCreditToAccount(account: string, entryId: string): Promise<void> {
     const key = `${USER_GD_CREDITS_PREFIX}${account}`;
     const ids = (await this.getJson<string[]>(key)) ?? [];
@@ -260,6 +335,14 @@ export class KVCreditStore {
 
 function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account: string): UserCreditProfile {
   const createdAt = saved?.createdAt ?? new Date().toISOString();
+  const buyers = Array.isArray(saved?.buyers)
+    ? saved.buyers
+        .filter((item): item is PayerBuyer => Boolean(item?.address) && Boolean(item?.consentedAt))
+        .map((item) => ({
+          address: normalizeAccount(item.address),
+          consentedAt: item.consentedAt
+        }))
+    : [];
   return {
     account,
     rootAccount: saved?.rootAccount ?? account,
@@ -271,7 +354,8 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
     totalPrincipalUsd: saved?.totalPrincipalUsd ?? "0",
     totalGDStreamedWei: saved?.totalGDStreamedWei ?? "0",
     totalOutstandingFundingUsd: saved?.totalOutstandingFundingUsd ?? "0",
-    lastStreamCreditAt: saved?.lastStreamCreditAt
+    lastStreamCreditAt: saved?.lastStreamCreditAt,
+    buyers
   };
 }
 
