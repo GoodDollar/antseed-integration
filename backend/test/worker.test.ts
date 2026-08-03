@@ -902,6 +902,46 @@ test("analytics refresh finalizes previous day into persisted globals once day r
   }
 });
 
+test("scheduled analytics seeds a 30-day backfill cursor on fresh KV", { concurrency: false }, async () => {
+  const testEnv = env({
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api"
+  });
+  const now = new Date();
+  const expectedFirstDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const expectedSecondDate = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const expectedThirdDate = new Date(now.getTime() - 28 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (urlInput: string | URL | Request) => {
+      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+      if (url.host === "base.blockscout.test") {
+        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
+          return Response.json({ status: "1", message: "OK", result: "200" });
+        }
+        if (url.searchParams.get("module") === "logs" && url.searchParams.get("action") === "getLogs") {
+          return Response.json({ status: "0", message: "No records found", result: "No records found" });
+        }
+      }
+      throw new Error(`unexpected fetch url: ${url.toString()}`);
+    }) as typeof fetch;
+
+    const event = { scheduledTime: now.getTime(), cron: "0 */6 * * *" } as unknown as ScheduledEvent;
+    const ctx = { waitUntil: () => undefined } as unknown as ExecutionContext;
+    await worker.scheduled(event, testEnv, ctx);
+
+    const firstDaily = await testEnv.ANTSEED_KV.get(`analytics:daily:${expectedFirstDate}`, "json");
+    const secondDaily = await testEnv.ANTSEED_KV.get(`analytics:daily:${expectedSecondDate}`, "json");
+    const cursor = await testEnv.ANTSEED_KV.get("analytics:cron:backfill-cursor");
+
+    assert.notEqual(firstDaily, null);
+    assert.notEqual(secondDaily, null);
+    assert.equal(cursor, expectedThirdDate);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("analytics refresh collects logs beyond the explorer 1000-result cap", { concurrency: false }, async () => {
   const testEnv = env({
     CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",

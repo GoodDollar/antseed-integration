@@ -9,6 +9,8 @@ import { getAnalyticsWindow, runAnalyticsAggregation, KVAnalyticsStore } from ".
 
 const ANALYTICS_REFRESH_COOLDOWN_MS = 60 * 60 * 1000;
 const ANALYTICS_REFRESH_LAST_RUN_KEY = "analytics:refresh:last-run-at";
+const ANALYTICS_CRON_BACKFILL_DAYS = 30;
+const ANALYTICS_CRON_BACKFILL_CURSOR_KEY = "analytics:cron:backfill-cursor";
 
 const CeloEventsRecordSchema = z
   .object({
@@ -219,17 +221,27 @@ export default {
     try {
       const summaries: Array<{ currentDate: string; finalizedDates: string[] }> = [];
       const maxRunsPerTick = 2;
+      const runAt = new Date();
+      const todayDate = runAt.toISOString().slice(0, 10);
+      let cursorDate = await readAnalyticsBackfillCursorDate(env.ANTSEED_KV);
+      if (!cursorDate) {
+        cursorDate = dateDaysAgo(runAt, ANALYTICS_CRON_BACKFILL_DAYS);
+        await env.ANTSEED_KV.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
+      }
       // TODO: replace bounded loop with persisted backfill cursor when we need broader historical catch-up.
-      const todayDate = new Date().toISOString().slice(0, 10);
       for (let i = 0; i < maxRunsPerTick; i += 1) {
-        const analyticsSummary = await runAnalyticsAggregation(env);
+        const aggregationRunAt = cursorDate === todayDate ? runAt : new Date(`${cursorDate}T23:59:59.999Z`);
+        const analyticsSummary = await runAnalyticsAggregation(env, aggregationRunAt);
         summaries.push({
           currentDate: analyticsSummary.currentDate,
           finalizedDates: analyticsSummary.finalizedDates
         });
-        if (analyticsSummary.currentDate === todayDate) {
+        if (cursorDate === todayDate) {
           break;
         }
+        const nextCursorDate = nextUtcDate(cursorDate);
+        cursorDate = nextCursorDate && nextCursorDate <= todayDate ? nextCursorDate : todayDate;
+        await env.ANTSEED_KV.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
       }
       logInfo("cron.analytics.summary", {
         runs: summaries.length,
@@ -720,6 +732,25 @@ async function readAnalyticsRefreshTimestamp(kv: Pick<KVNamespace, "get">): Prom
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 0) return undefined;
   return parsed;
+}
+
+async function readAnalyticsBackfillCursorDate(kv: Pick<KVNamespace, "get">): Promise<string | undefined> {
+  const raw = await kv.get(ANALYTICS_CRON_BACKFILL_CURSOR_KEY);
+  if (!raw || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return undefined;
+  return raw;
+}
+
+function dateDaysAgo(date: Date, days: number): string {
+  const shifted = new Date(date.getTime());
+  shifted.setUTCDate(shifted.getUTCDate() - days);
+  return shifted.toISOString().slice(0, 10);
+}
+
+function nextUtcDate(date: string): string | undefined {
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return undefined;
+  parsed.setUTCDate(parsed.getUTCDate() + 1);
+  return parsed.toISOString().slice(0, 10);
 }
 
 async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFundingVault: AntSeedFundingVaultClient): Promise<{ [key: string]: unknown }> {
