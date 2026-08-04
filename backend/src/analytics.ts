@@ -542,6 +542,7 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
     }
 
     const json = (await response.json()) as {
+      errors?: Array<any>;
       data?: {
         streamPeriods?: Array<{
           sender: { id: string };
@@ -553,6 +554,15 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
       };
     };
 
+    // if error field is present, log and throw
+    if (!json.data || json.errors) {
+      logError("analytics.streams.subgraph_error", {
+        url: cfg.superfluidSubgraphUrl,
+        body,
+        response: json
+      });
+      throw new Error(`Superfluid subgraph error: ${errorMessage(json)}`);
+    }
     const batch = json.data?.streamPeriods ?? [];
     for (const period of batch) {
       const sender = period.sender.id.toLowerCase();
