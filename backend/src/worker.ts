@@ -400,6 +400,14 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
       if (event.kind === "deposit") {
+        if (event.gdAmountWei === 0n) {
+          logInfo("celo.events.record.deposit.skipped.zero-amount", {
+            txHash: redactHash(event.txHash),
+            logIndex: event.logIndex,
+            account: redactAddress(event.account)
+          });
+          continue;
+        }
         const depositId = `${event.txHash}:${event.logIndex}`;
         const entry = await store.recordGdCredit({
           id: depositId,
@@ -755,10 +763,28 @@ function nextUtcDate(date: string): string | undefined {
 }
 
 async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFundingVault: AntSeedFundingVaultClient): Promise<{ [key: string]: unknown }> {
-  if (entry.fundingStatus === "funded") {
-    throw new Error(`cannot fund credit with status ${entry.fundingStatus}`);
-  }
   const buyer = entry.buyerAddress || entry.account;
+  if (entry.fundingStatus === "funded") {
+    logInfo("funding.already-funded", {
+      entryId: entry.id,
+      source: entry.source,
+      account: redactAddress(entry.account),
+      buyer: redactAddress(buyer),
+      fundingTxHash: redactHash(entry.fundingTxHash)
+    });
+    return {
+      ...entry,
+      bridge: {
+        enabled: antseedFundingVault.enabled,
+        buyer,
+        amountUsd: entry.totalCreditUsd,
+        txHash: entry.fundingTxHash,
+        alreadyFunded: true
+      }
+    };
+  }
+  const principalUsd = BigInt(entry.principalUsd);
+  const bonusUsd = BigInt(entry.bonusUsd);
   logInfo("funding.start", {
     entryId: entry.id,
     source: entry.source,
@@ -769,8 +795,18 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     totalCreditUsd: entry.totalCreditUsd
   });
   try {
-    const bridge = await antseedFundingVault.depositForBuyerWithId(buyer, BigInt(entry.principalUsd), BigInt(entry.bonusUsd), entry.id);
-    if (!bridge.enabled) {
+    const bridge =
+      principalUsd + bonusUsd > 0n
+        ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
+        : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
+    if (principalUsd + bonusUsd === 0n) {
+      logInfo("funding.skipped.zero-amount", {
+        entryId: entry.id,
+        source: entry.source,
+        account: redactAddress(entry.account),
+        buyer: redactAddress(buyer)
+      });
+    } else if (!bridge.enabled) {
       logWarn("funding.bridge.disabled", {
         entryId: entry.id,
         source: entry.source,
