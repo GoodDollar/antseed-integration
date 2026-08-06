@@ -219,31 +219,7 @@ export default {
     });
 
     try {
-      const summaries: Array<{ currentDate: string; finalizedDates: string[] }> = [];
-      let maxRunsPerTick = 2;
-      const runAt = new Date();
-      const todayDate = runAt.toISOString().slice(0, 10);
-      let cursorDate = await readAnalyticsBackfillCursorDate(env.ANTSEED_KV);
-      if (!cursorDate) {
-        maxRunsPerTick = ANALYTICS_CRON_BACKFILL_DAYS;
-        cursorDate = dateDaysAgo(runAt, ANALYTICS_CRON_BACKFILL_DAYS);
-        await env.ANTSEED_KV.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
-      }
-      // TODO: replace bounded loop with persisted backfill cursor when we need broader historical catch-up.
-      for (let i = 0; i < maxRunsPerTick; i += 1) {
-        const aggregationRunAt = cursorDate === todayDate ? runAt : new Date(`${cursorDate}T23:59:59.999Z`);
-        const analyticsSummary = await runAnalyticsAggregation(env, aggregationRunAt);
-        summaries.push({
-          currentDate: analyticsSummary.currentDate,
-          finalizedDates: analyticsSummary.finalizedDates
-        });
-        if (cursorDate === todayDate) {
-          break;
-        }
-        const nextCursorDate = nextUtcDate(cursorDate);
-        cursorDate = nextCursorDate && nextCursorDate <= todayDate ? nextCursorDate : todayDate;
-        await env.ANTSEED_KV.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
-      }
+      const summaries = await backFillAnalytics(env.ANTSEED_KV, ANALYTICS_CRON_BACKFILL_DAYS);
       logInfo("cron.analytics.summary", {
         runs: summaries.length,
         summaries: JSON.stringify(summaries)
@@ -264,6 +240,33 @@ export default {
   }
 };
 
+async function backFillAnalytics(env: Env, maxRunsPerTick = 2) {
+  const kv = env.ANTSEED_KV;
+  const summaries: Array<{ currentDate: string; finalizedDates: string[] }> = [];
+  const runAt = new Date();
+  const todayDate = runAt.toISOString().slice(0, 10);
+  let cursorDate = await readAnalyticsBackfillCursorDate(kv);
+  if (!cursorDate) {
+    cursorDate = dateDaysAgo(runAt, ANALYTICS_CRON_BACKFILL_DAYS);
+    await kv.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
+  }
+  // TODO: replace bounded loop with persisted backfill cursor when we need broader historical catch-up.
+  for (let i = 0; i < maxRunsPerTick; i += 1) {
+    const aggregationRunAt = cursorDate === todayDate ? runAt : new Date(`${cursorDate}T23:59:59.999Z`);
+    const analyticsSummary = await runAnalyticsAggregation(env, aggregationRunAt);
+    summaries.push({
+      currentDate: analyticsSummary.currentDate,
+      finalizedDates: analyticsSummary.finalizedDates
+    });
+    if (cursorDate === todayDate) {
+      break;
+    }
+    const nextCursorDate = nextUtcDate(cursorDate);
+    cursorDate = nextCursorDate && nextCursorDate <= todayDate ? nextCursorDate : todayDate;
+    await kv.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
+  }
+  return summaries;
+}
 async function route(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const cfg = configFromEnv(env);
@@ -346,8 +349,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       );
     }
     await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
-    const summary = await runAnalyticsAggregation(env);
-    return json(summary);
+    const summaries = await backFillAnalytics(env.ANTSEED_KV);
+    return json(summaries);
   }
 
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/profile$/);
