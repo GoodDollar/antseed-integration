@@ -513,7 +513,9 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
             flowRate
             startedAtTimestamp
             stoppedAtTimestamp
-            userData
+            stream {
+              userData
+            }
           }
         }
       `,
@@ -549,7 +551,9 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
           flowRate: string;
           startedAtTimestamp: string;
           stoppedAtTimestamp: string | null;
-          userData: string;
+          stream: {
+            userData: string;
+          };
         }>;
       };
     };
@@ -569,7 +573,7 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
       const flowRate = BigInt(period.flowRate || "0");
       const startedAt = parseNumberish(period.startedAtTimestamp || "0");
       const stoppedAt = period.stoppedAtTimestamp ? parseNumberish(period.stoppedAtTimestamp) : null;
-      const buyerAddress = decodeBuyerFromUserData(period.userData);
+      const buyerAddress = decodeBuyerFromUserData(period.stream.userData);
 
       // intersect period with the day window to get seconds streamed today
       const effectiveStart = Math.max(startedAt, dayStartUnix);
