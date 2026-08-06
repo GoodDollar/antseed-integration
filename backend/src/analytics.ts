@@ -1,19 +1,11 @@
 import { Interface } from "ethers";
+import { createPublicClient, fallback, http, toHex, type Address, type Chain, type Hex, type Log, type PublicClient } from "viem";
+import { base, celo } from "viem/chains";
 import { decodeBuyerFromUserData } from "./celo-events.js";
 import { Env } from "./env.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress } from "./logging.js";
 
 type KV = Pick<KVNamespace, "get" | "put">;
-
-type ExplorerLog = {
-  address: string;
-  topics: string[];
-  data: string;
-  transactionHash: string;
-  logIndex: string;
-  blockNumber: string;
-  timeStamp: string;
-};
 
 type StreamSnapshot = {
   sender: string;
@@ -105,7 +97,23 @@ const STATE_KEY = "analytics:state";
 const BUYER_REGISTRY_KEY = "analytics:buyers:registry";
 const GD_BUYERS_PREFIX = "analytics:buyers:gd:";
 const CREDIT_USERS_PREFIX = "analytics:buyers:credits:";
-const EXPLORER_LOG_BATCH_LIMIT = 1000;
+const CELO_CHAIN_ID = 42220;
+const BASE_CHAIN_ID = 8453;
+const RPCS_CACHE_PREFIX = "analytics:rpcs:";
+const RPCS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CHAINLIST_RPCS_URL = "https://chainlist.org/rpcs.json";
+const LOG_BATCH_BLOCKS = 5000n;
+const LOG_BATCH_WORKERS = 5;
+const LOG_BATCH_DELAY_MS = 500;
+const BASE_BLOCKS_PER_SECOND = 0.5;
+const TIMESTAMP_SEARCH_WINDOW_SECONDS = 6 * 60 * 60;
+const CELO_FALLBACK_RPCS = ["https://forno.celo.org", "https://rpc.ankr.com/celo"];
+const BASE_FALLBACK_RPCS = ["https://mainnet.base.org", "https://rpc.ankr.com/base"];
+
+type RpcCacheEntry = {
+  rpcs: string[];
+  fetchedAt: string;
+};
 
 const ZERO_DAILY = {
   gdOneTimeDepositsWei: "0",
@@ -119,6 +127,8 @@ const ZERO_DAILY = {
 export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Promise<AnalyticsRunSummary> {
   const cfg = analyticsConfigFromEnv(env);
   const store = new KVAnalyticsStore(env.ANTSEED_KV);
+  const celoClient = await createChainClient(env.ANTSEED_KV, CELO_CHAIN_ID, celo, CELO_FALLBACK_RPCS);
+  const baseClient = await createChainClient(env.ANTSEED_KV, BASE_CHAIN_ID, base, BASE_FALLBACK_RPCS);
   const runDay = dayFromDate(runAt);
   const state = (await store.getState()) ?? {
     updatedAt: runAt.toISOString()
@@ -132,7 +142,7 @@ export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Pro
   const knownBuyers = await store.getBuyerRegistry();
   const discoveredBuyers = new Set<string>();
 
-  const celoMetrics = await collectCeloDayMetrics(cfg, dayWindow, aggregate, discoveredBuyers);
+  const celoMetrics = await collectCeloDayMetrics(cfg, celoClient, dayWindow, aggregate, discoveredBuyers);
 
   const streamMetrics = await collectStreamDayMetrics(cfg, dayWindow, aggregate, windowEnd, discoveredBuyers);
   if (discoveredBuyers.size > 0) {
@@ -140,7 +150,7 @@ export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Pro
     for (const buyer of discoveredBuyers) knownBuyers.add(buyer);
   }
   logInfo("getting base metrics....");
-  const baseMetrics = await collectBaseDayMetrics(cfg, dayWindow, aggregate, knownBuyers);
+  const baseMetrics = await collectBaseDayMetrics(cfg, baseClient, dayWindow, aggregate, knownBuyers);
   logInfo("got base metrics....");
   logInfo("building dialy reocrd....");
 
@@ -338,6 +348,7 @@ async function finalizeClosedDays(store: KVAnalyticsStore, state: AnalyticsState
 
 async function collectCeloDayMetrics(
   cfg: AnalyticsConfig,
+  client: PublicClient,
   dayWindow: UtcDayWindow,
   aggregate: DailyAggregate,
   discoveredBuyers: Set<string>
@@ -353,11 +364,11 @@ async function collectCeloDayMetrics(
 
   const range = await getExplorerBlockRange(cfg.celoBlockscoutUrl, dayWindow);
 
-  const logs = await getExplorerEvents(cfg.celoBlockscoutUrl, {
-    address: cfg.celoVaultAddress,
-    topic0: getTopicHash(CELO_VAULT_EVENTS, "GdDeposited"),
-    fromBlock: range.fromBlock,
-    toBlock: range.toBlock
+  const logs = await fetchLogsByRange(client, {
+    address: cfg.celoVaultAddress as Address,
+    topic0: getTopicHash(CELO_VAULT_EVENTS, "GdDeposited") as Hex,
+    fromBlock: BigInt(range.fromBlock),
+    toBlock: BigInt(range.toBlock)
   });
   logInfo("analytics.celo.scan", {
     range,
@@ -366,7 +377,7 @@ async function collectCeloDayMetrics(
   });
   let matched = 0;
   for (const log of logs) {
-    const decoded = decodeEventSafe(CELO_VAULT_EVENTS, log);
+    const decoded = decodeViemEventSafe(CELO_VAULT_EVENTS, log);
     if (!decoded || decoded.name !== "GdDeposited") continue;
     matched += 1;
     aggregate.gdOneTimeDepositsWei += BigInt(decoded.args.gdAmount.toString());
@@ -384,6 +395,7 @@ async function collectCeloDayMetrics(
 
 async function collectBaseDayMetrics(
   cfg: AnalyticsConfig,
+  client: PublicClient,
   dayWindow: UtcDayWindow,
   aggregate: DailyAggregate,
   knownBuyers: Set<string>
@@ -392,25 +404,29 @@ async function collectBaseDayMetrics(
 
   let scanned = 0;
   let matched = 0;
-  const range = await getExplorerBlockRange(cfg.baseBlockscoutUrl, dayWindow);
-  logInfo("base range:", range);
+  const range = await getBlockRangeByTimestamp(client, dayWindow);
+  const logRange = {
+    fromBlock: range.fromBlock.toString(),
+    toBlock: range.toBlock.toString()
+  };
+  logInfo("base range:", logRange);
   for (const eventName of eventNames) {
-    const logs = await getExplorerEvents(cfg.baseBlockscoutUrl, {
-      address: cfg.baseChannelsAddress,
-      topic0: getTopicHash(BASE_CHANNEL_EVENTS, eventName),
+    const logs = await fetchLogsByRange(client, {
+      address: cfg.baseChannelsAddress as Address,
+      topic0: getTopicHash(BASE_CHANNEL_EVENTS, eventName) as Hex,
       fromBlock: range.fromBlock,
       toBlock: range.toBlock
     });
     logInfo("analytics.base.scan", {
       eventName,
-      range,
+      range: logRange,
       dayWindow,
       foundLogs: logs.length
     });
     scanned += logs.length;
 
     for (const log of logs) {
-      const decoded = decodeEventSafe(BASE_CHANNEL_EVENTS, log);
+      const decoded = decodeViemEventSafe(BASE_CHANNEL_EVENTS, log);
       if (!decoded) continue;
       const buyer = String(decoded.args.buyer).toLowerCase();
       if (!knownBuyers.has(buyer)) continue;
@@ -528,7 +544,7 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
       }
     };
 
-    const response = await retry(
+    const response = await retryWithBackoff(
       () =>
         fetch(cfg.superfluidSubgraphUrl, {
           method: "POST",
@@ -607,110 +623,152 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
   }));
 }
 
-async function getExplorerEvents(
-  apiUrl: string,
+async function fetchLogsByRange(
+  client: PublicClient,
   params: {
-    address: string;
-    topic0: string;
-    fromBlock: number;
-    toBlock: number;
+    address: Address;
+    topic0: Hex;
+    fromBlock: bigint;
+    toBlock: bigint;
   }
-): Promise<ExplorerLog[]> {
-  return getExplorerEventsByRange(apiUrl, params, params.fromBlock, params.toBlock);
-}
-
-async function getExplorerEventsByRange(
-  apiUrl: string,
-  params: {
-    address: string;
-    topic0: string;
-    fromBlock: number;
-    toBlock: number;
-  },
-  fromBlock: number,
-  toBlock: number
-): Promise<ExplorerLog[]> {
-  const batch = await fetchExplorerLogBatch(apiUrl, {
-    address: params.address,
-    topic0: params.topic0,
-    fromBlock,
-    toBlock
-  });
-
-  if (batch.length < EXPLORER_LOG_BATCH_LIMIT) {
-    return batch;
+): Promise<Log[]> {
+  if (params.toBlock < params.fromBlock) {
+    return [];
   }
 
-  if (fromBlock >= toBlock) {
-    logWarn("analytics.explorer.truncated", {
-      apiUrl,
-      address: redactAddress(params.address),
-      topic0: params.topic0,
+  const batches: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+  for (let fromBlock = params.fromBlock; fromBlock <= params.toBlock; fromBlock += LOG_BATCH_BLOCKS) {
+    const toBlock = fromBlock + LOG_BATCH_BLOCKS - 1n;
+    batches.push({
       fromBlock,
-      toBlock,
-      returned: batch.length
+      toBlock: toBlock <= params.toBlock ? toBlock : params.toBlock
     });
-    return dedupeExplorerLogs(batch);
   }
 
-  const midpoint = fromBlock + Math.floor((toBlock - fromBlock) / 2);
-  const left = await getExplorerEventsByRange(apiUrl, params, fromBlock, midpoint);
-  const right = await getExplorerEventsByRange(apiUrl, params, midpoint + 1, toBlock);
-  return dedupeExplorerLogs([...left, ...right]);
+  const results: Log[][] = new Array(batches.length);
+  let nextIndex = 0;
+
+  const worker = async (): Promise<void> => {
+    let firstRequest = true;
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= batches.length) {
+        return;
+      }
+
+      if (!firstRequest) {
+        await wait(LOG_BATCH_DELAY_MS);
+      }
+      firstRequest = false;
+
+      const batch = batches[index];
+      results[index] = await retryWithBackoff(
+        async () => {
+          const logs = await client.request({
+            method: "eth_getLogs",
+            params: [
+              {
+                address: params.address,
+                topics: [params.topic0],
+                fromBlock: toHex(batch.fromBlock),
+                toBlock: toHex(batch.toBlock)
+              }
+            ]
+          });
+          return logs as Log[];
+        },
+        3,
+        500
+      );
+    }
+  };
+
+  await Promise.all(new Array(LOG_BATCH_WORKERS).fill(null).map(() => worker()));
+  return results.flat();
 }
 
-async function fetchExplorerLogBatch(
-  apiUrl: string,
-  params: {
-    address: string;
-    topic0: string;
-    fromBlock: number;
-    toBlock: number;
-  }
-): Promise<ExplorerLog[]> {
-  const all: ExplorerLog[] = [];
-  const url = new URL(apiUrl);
-  url.searchParams.set("module", "logs");
-  url.searchParams.set("action", "getLogs");
-  url.searchParams.set("address", params.address);
-  url.searchParams.set("topic0", params.topic0);
-  url.searchParams.set("sort", "asc");
-  url.searchParams.set("offset", String(EXPLORER_LOG_BATCH_LIMIT));
-  url.searchParams.set("fromBlock", String(params.fromBlock));
-  url.searchParams.set("toBlock", String(params.toBlock));
-
-  const response = await retry(() => fetch(url), 3, 300);
-  if (!response.ok) {
-    throw new Error(`Explorer HTTP ${response.status}`);
-  }
-
-  const payload = (await response.json()) as {
-    status?: string;
-    message?: string;
-    result?: ExplorerLog[] | string;
-  };
-  if (Array.isArray(payload.result)) {
-    all.push(...payload.result);
-    return all;
-  }
-
-  if (typeof payload.result === "string" && payload.result.toLowerCase().includes("no records")) {
-    return all;
-  }
-
-  if (payload.status === "0" && payload.message?.toLowerCase().includes("no records")) {
-    return all;
-  }
-
-  logWarn("analytics.explorer.unexpected", {
-    apiUrl,
-    address: redactAddress(params.address),
-    topic0: params.topic0,
-    fromBlock: params.fromBlock,
-    toBlock: params.toBlock,
-    payload
+async function createChainClient(kv: KV, chainId: number, chain: Chain, fallbackRpcs: string[]): Promise<PublicClient> {
+  const rpcUrls = await getChainRpcUrls(kv, chainId, fallbackRpcs);
+  return createPublicClient({
+    chain,
+    transport: fallback(rpcUrls.map((rpcUrl) => http(rpcUrl)))
   });
-  return all;
+}
+
+async function getChainRpcUrls(kv: KV, chainId: number, fallbackRpcs: string[]): Promise<string[]> {
+  const key = `${RPCS_CACHE_PREFIX}${chainId}`;
+  const cached = (await kv.get(key, "json")) as RpcCacheEntry | null;
+  if (cached?.fetchedAt) {
+    const fetchedAtMs = Date.parse(cached.fetchedAt);
+    if (!Number.isNaN(fetchedAtMs) && Date.now() - fetchedAtMs < RPCS_CACHE_TTL_MS) {
+      const cachedUrls = sanitizeRpcUrls(cached.rpcs);
+      if (cachedUrls.length > 0) {
+        return cachedUrls;
+      }
+    }
+  }
+
+  try {
+    const fetchedUrls = await fetchRpcsFromChainlist(chainId);
+    if (fetchedUrls.length > 0) {
+      await kv.put(
+        key,
+        JSON.stringify({
+          rpcs: fetchedUrls,
+          fetchedAt: new Date().toISOString()
+        } satisfies RpcCacheEntry)
+      );
+      return fetchedUrls;
+    }
+  } catch (error) {
+    logWarn("analytics.rpc.chainlist_failed", {
+      chainId,
+      message: errorMessage(error)
+    });
+  }
+
+  return sanitizeRpcUrls(fallbackRpcs);
+}
+
+async function fetchRpcsFromChainlist(chainId: number): Promise<string[]> {
+  const ALLOWED_DOMAINS = ["chainlist.org"];
+  const chainlistUrl = new URL(CHAINLIST_RPCS_URL);
+  if (!ALLOWED_DOMAINS.includes(chainlistUrl.hostname)) {
+    throw new Error("Chainlist domain not allowed");
+  }
+  if (!["http:", "https:"].includes(chainlistUrl.protocol)) {
+    throw new Error("Chainlist protocol not allowed");
+  }
+
+  const response = await retryWithBackoff(() => fetch(chainlistUrl.href), 3, 500);
+  if (!response.ok) {
+    throw new Error(`Chainlist HTTP ${response.status}`);
+  }
+
+  const payload = (await response.json()) as Array<{
+    chainId?: number;
+    rpc?: Array<string | { url?: string }>;
+  }>;
+
+  const chain = payload.find((entry) => entry.chainId === chainId);
+  if (!chain?.rpc) {
+    return [];
+  }
+
+  const urls = chain.rpc.map((entry) => (typeof entry === "string" ? entry : (entry.url ?? ""))).filter((entry) => Boolean(entry));
+
+  return sanitizeRpcUrls(urls);
+}
+
+function sanitizeRpcUrls(urls: string[]): string[] {
+  const deduped = new Set<string>();
+  for (const url of urls) {
+    if (!url.startsWith("https://")) continue;
+    if (url.includes("${")) continue;
+    deduped.add(url);
+  }
+  return [...deduped];
 }
 
 async function getExplorerBlockRange(apiUrl: string, dayWindow: UtcDayWindow): Promise<{ fromBlock: number; toBlock: number }> {
@@ -722,6 +780,76 @@ async function getExplorerBlockRange(apiUrl: string, dayWindow: UtcDayWindow): P
   };
 }
 
+async function getBlockRangeByTimestamp(client: PublicClient, dayWindow: UtcDayWindow): Promise<{ fromBlock: bigint; toBlock: bigint }> {
+  const fromBlock = await getBlockByTimestampViem(client, dayWindow.startUnix, "after", BASE_BLOCKS_PER_SECOND);
+  const toBlock = await getBlockByTimestampViem(client, dayWindow.endUnix, "before", BASE_BLOCKS_PER_SECOND);
+  return {
+    fromBlock,
+    toBlock: toBlock >= fromBlock ? toBlock : fromBlock
+  };
+}
+
+async function getBlockByTimestampViem(client: PublicClient, timestamp: number, closest: "before" | "after", blocksPerSecond: number): Promise<bigint> {
+  const latest = await retryWithBackoff(() => client.getBlock({ blockTag: "latest" }), 3, 300);
+  const latestNumber = latest.number;
+  if (latestNumber === null) {
+    throw new Error("latest block number missing");
+  }
+
+  const latestTimestamp = Number(latest.timestamp);
+  if (timestamp >= latestTimestamp) {
+    return latestNumber;
+  }
+
+  const estimatedBlocksAgo = BigInt(Math.max(0, Math.floor((latestTimestamp - timestamp) * blocksPerSecond)));
+  const estimatedBlock = estimatedBlocksAgo >= latestNumber ? 0n : latestNumber - estimatedBlocksAgo;
+  const windowBlocks = BigInt(Math.max(1, Math.ceil(blocksPerSecond * TIMESTAMP_SEARCH_WINDOW_SECONDS)));
+
+  let low = estimatedBlock >= windowBlocks ? estimatedBlock - windowBlocks : 0n;
+  let high = estimatedBlock + windowBlocks <= latestNumber ? estimatedBlock + windowBlocks : latestNumber;
+
+  let lowTimestamp = Number((await retryWithBackoff(() => client.getBlock({ blockNumber: low }), 3, 300)).timestamp);
+  let highTimestamp = Number((await retryWithBackoff(() => client.getBlock({ blockNumber: high }), 3, 300)).timestamp);
+
+  while (timestamp < lowTimestamp && low > 0n) {
+    high = low;
+    low = low > windowBlocks ? low - windowBlocks : 0n;
+    lowTimestamp = Number((await retryWithBackoff(() => client.getBlock({ blockNumber: low }), 3, 300)).timestamp);
+  }
+
+  while (timestamp > highTimestamp && high < latestNumber) {
+    low = high;
+    high = high + windowBlocks <= latestNumber ? high + windowBlocks : latestNumber;
+    highTimestamp = Number((await retryWithBackoff(() => client.getBlock({ blockNumber: high }), 3, 300)).timestamp);
+  }
+
+  let best = closest === "after" ? latestNumber : 0n;
+
+  while (low <= high) {
+    const mid = (low + high) / 2n;
+    const block = await retryWithBackoff(() => client.getBlock({ blockNumber: mid }), 3, 300);
+    const blockTimestamp = Number(block.timestamp);
+
+    if (blockTimestamp === timestamp) {
+      return mid;
+    }
+
+    if (blockTimestamp < timestamp) {
+      if (closest === "before") best = mid;
+      low = mid + 1n;
+      continue;
+    }
+
+    if (closest === "after") best = mid;
+    if (mid === 0n) {
+      break;
+    }
+    high = mid - 1n;
+  }
+
+  return best;
+}
+
 async function getBlockByTimestamp(apiUrl: string, timestamp: number, closest: "before" | "after"): Promise<number> {
   const url = new URL(apiUrl);
   url.searchParams.set("module", "block");
@@ -729,7 +857,7 @@ async function getBlockByTimestamp(apiUrl: string, timestamp: number, closest: "
   url.searchParams.set("timestamp", String(timestamp));
   url.searchParams.set("closest", closest);
 
-  const response = await retry(() => fetch(url), 3, 300);
+  const response = await retryWithBackoff(() => fetch(url.href), 3, 300);
   if (!response.ok) {
     throw new Error(`Explorer HTTP ${response.status}`);
   }
@@ -803,14 +931,20 @@ function getTopicHash(iface: Interface, eventName: string): string {
   return event.topicHash;
 }
 
-function decodeEventSafe(iface: Interface, log: ExplorerLog) {
+function decodeViemEventSafe(iface: Interface, log: Log) {
   try {
-    log.topics = log.topics.filter((topic) => topic);
-    return iface.parseLog(log);
+    const topics = log.topics.filter((topic): topic is Hex => Boolean(topic));
+    if (topics.length === 0) {
+      return null;
+    }
+    return iface.parseLog({
+      data: log.data,
+      topics
+    });
   } catch (error) {
     logWarn("analytics.decode.failed", {
-      txHash: log.transactionHash,
-      logIndex: log.logIndex,
+      txHash: log.transactionHash ?? "unknown",
+      logIndex: log.logIndex?.toString() ?? "unknown",
       message: errorMessage(error)
     });
     return null;
@@ -823,21 +957,7 @@ function parseNumberish(value: string | number): number {
   return Number.parseInt(value, 10);
 }
 
-function dedupeExplorerLogs(logs: ExplorerLog[]): ExplorerLog[] {
-  const seen = new Set<string>();
-  const deduped: ExplorerLog[] = [];
-
-  for (const log of logs) {
-    const key = `${log.transactionHash}:${log.logIndex}`.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(log);
-  }
-
-  return deduped;
-}
-
-async function retry<T>(fn: () => Promise<T>, retries: number, waitMs: number): Promise<T> {
+async function retryWithBackoff<T>(fn: () => Promise<T>, retries: number, baseWaitMs: number): Promise<T> {
   let attempt = 0;
   let lastError: unknown;
   while (attempt <= retries) {
@@ -847,7 +967,7 @@ async function retry<T>(fn: () => Promise<T>, retries: number, waitMs: number): 
       lastError = error;
       attempt += 1;
       if (attempt > retries) break;
-      await wait(waitMs);
+      await wait(baseWaitMs * 2 ** (attempt - 1));
     }
   }
   logError("analytics.retry.failed", {

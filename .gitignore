@@ -23,3 +23,6 @@ contracts/broadcast/
 # misc
 .DS_Store
 coverage/
+backend/package.json
+.wrangler
+.yarn

@@ -252,6 +252,7 @@ async function backFillAnalytics(env: Env, maxRunsPerTick = 2) {
   }
   // TODO: replace bounded loop with persisted backfill cursor when we need broader historical catch-up.
   for (let i = 0; i < maxRunsPerTick; i += 1) {
+    console.log(`analytics backfill run ${i + 1} of ${maxRunsPerTick}, cursorDate=${cursorDate}`);
     const aggregationRunAt = cursorDate === todayDate ? runAt : new Date(`${cursorDate}T23:59:59.999Z`);
     const analyticsSummary = await runAnalyticsAggregation(env, aggregationRunAt);
     summaries.push({
