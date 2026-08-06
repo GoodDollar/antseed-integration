@@ -219,7 +219,7 @@ export default {
     });
 
     try {
-      const summaries = await backFillAnalytics(env.ANTSEED_KV, ANALYTICS_CRON_BACKFILL_DAYS);
+      const summaries = await backFillAnalytics(env, ANALYTICS_CRON_BACKFILL_DAYS);
       logInfo("cron.analytics.summary", {
         runs: summaries.length,
         summaries: JSON.stringify(summaries)
@@ -245,7 +245,7 @@ async function backFillAnalytics(env: Env, maxRunsPerTick = 2) {
   const summaries: Array<{ currentDate: string; finalizedDates: string[] }> = [];
   const runAt = new Date();
   const todayDate = runAt.toISOString().slice(0, 10);
-  let cursorDate = await readAnalyticsBackfillCursorDate(kv);
+  let cursorDate = await readAnalyticsBackfillCursorDate(env.ANTSEED_KV);
   if (!cursorDate) {
     cursorDate = dateDaysAgo(runAt, ANALYTICS_CRON_BACKFILL_DAYS);
     await kv.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
@@ -349,7 +349,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       );
     }
     await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
-    const summaries = await backFillAnalytics(env.ANTSEED_KV);
+    const summaries = await backFillAnalytics(env);
     return json(summaries);
   }
 
