@@ -9,7 +9,7 @@ import { getAnalyticsWindow, runAnalyticsAggregation, KVAnalyticsStore } from ".
 
 const ANALYTICS_REFRESH_COOLDOWN_MS = 60 * 60 * 1000;
 const ANALYTICS_REFRESH_LAST_RUN_KEY = "analytics:refresh:last-run-at";
-const ANALYTICS_CRON_BACKFILL_DAYS = 30;
+const ANALYTICS_CRON_BACKFILL_DAYS = 40;
 const ANALYTICS_CRON_BACKFILL_CURSOR_KEY = "analytics:cron:backfill-cursor";
 
 const CeloEventsRecordSchema = z
@@ -255,6 +255,7 @@ async function backFillAnalytics(env: Env, maxRunsPerTick = 2) {
     console.log(`analytics backfill run ${i + 1} of ${maxRunsPerTick}, cursorDate=${cursorDate}`);
     const aggregationRunAt = cursorDate === todayDate ? runAt : new Date(`${cursorDate}T23:59:59.999Z`);
     const analyticsSummary = await runAnalyticsAggregation(env, aggregationRunAt);
+    console.log(`analytics backfill run ${i + 1} of ${maxRunsPerTick}, cursorDate=${cursorDate} completed`, analyticsSummary);
     summaries.push({
       currentDate: analyticsSummary.currentDate,
       finalizedDates: analyticsSummary.finalizedDates

@@ -142,8 +142,9 @@ export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Pro
   const knownBuyers = await store.getBuyerRegistry();
   const discoveredBuyers = new Set<string>();
 
+  console.log("Collecting celo metrics...");
   const celoMetrics = await collectCeloDayMetrics(cfg, celoClient, dayWindow, aggregate, discoveredBuyers);
-
+  console.log("Collecting stream metrics...");
   const streamMetrics = await collectStreamDayMetrics(cfg, dayWindow, aggregate, windowEnd, discoveredBuyers);
   if (discoveredBuyers.size > 0) {
     await store.addBuyersToRegistry([...discoveredBuyers]);
@@ -151,7 +152,6 @@ export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Pro
   }
   logInfo("getting base metrics....");
   const baseMetrics = await collectBaseDayMetrics(cfg, baseClient, dayWindow, aggregate, knownBuyers);
-  logInfo("got base metrics....");
   logInfo("building dialy reocrd....");
 
   const dailyRecord = buildDailyRecord(currentDate, aggregate, windowEnd);
@@ -453,7 +453,7 @@ async function collectStreamDayMetrics(
   now: Date,
   discoveredBuyers: Set<string>
 ): Promise<{ senders: number; totalFlowRateWeiPerSecond: string }> {
-  const snapshots = await fetchStreamSnapshots(cfg, now, dayWindow.startUnix);
+  const snapshots = await fetchStreamSnapshots(cfg, now, dayWindow.startUnix, dayWindow.endUnix);
 
   for (const snapshot of snapshots) {
     if (snapshot.buyerAddress) {
@@ -495,7 +495,7 @@ function addDailyToGlobal(global: AnalyticsGlobalTotals, day: AnalyticsDailyReco
   };
 }
 
-async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUnix: number): Promise<StreamSnapshot[]> {
+async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUnix: number, dayEndUnix: number): Promise<StreamSnapshot[]> {
   if (!cfg.celoSuperTokenAddress || !cfg.celoStreamReceiverAddress) {
     logWarn("analytics.streams.skipped", {
       reason: "missing_config",
@@ -518,8 +518,8 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
           streamPeriods(
             where: {
               or: [
-                { receiver: $receiver, token: $token, stoppedAtTimestamp: null }
-                { receiver: $receiver, token: $token, stoppedAtTimestamp_gt: $daysago }
+                { receiver: $receiver, token: $token, stoppedAtTimestamp: null, startedAtTimestamp_lte: $until },
+                { receiver: $receiver, token: $token, stoppedAtTimestamp_gt: $daysago, startedAtTimestamp_lte: $until }
               ]
             }
             first: $first
@@ -539,6 +539,7 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
         receiver: cfg.celoStreamReceiverAddress,
         token: cfg.celoSuperTokenAddress,
         daysago: String(dayStartUnix),
+        until: String(dayEndUnix),
         first: pageSize,
         skip
       }
@@ -732,14 +733,7 @@ async function getChainRpcUrls(kv: KV, chainId: number, fallbackRpcs: string[]):
 }
 
 async function fetchRpcsFromChainlist(chainId: number): Promise<string[]> {
-  const ALLOWED_DOMAINS = ["chainlist.org"];
   const chainlistUrl = new URL(CHAINLIST_RPCS_URL);
-  if (!ALLOWED_DOMAINS.includes(chainlistUrl.hostname)) {
-    throw new Error("Chainlist domain not allowed");
-  }
-  if (!["http:", "https:"].includes(chainlistUrl.protocol)) {
-    throw new Error("Chainlist protocol not allowed");
-  }
 
   const response = await retryWithBackoff(() => fetch(chainlistUrl.href), 3, 500);
   if (!response.ok) {
@@ -752,6 +746,8 @@ async function fetchRpcsFromChainlist(chainId: number): Promise<string[]> {
   }>;
 
   const chain = payload.find((entry) => entry.chainId === chainId);
+  console.log("got rpcs from chainlist", { chainId });
+
   if (!chain?.rpc) {
     return [];
   }
