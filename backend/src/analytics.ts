@@ -511,10 +511,11 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
   const nowUnix = Math.floor(now.getTime() / 1000);
 
   // get streams that are either active or stopped within the day window
+  let body = {};
   while (true) {
-    const body = {
+    body = {
       query: `
-        query StreamPeriodsPage($receiver: String!, $token: String!, $daysago: BigInt!, $first: Int!, $skip: Int!) {
+        query StreamPeriodsPage($receiver: String!, $token: String!, $daysago: BigInt!,$until:BigInt!, $first: Int!, $skip: Int!) {
           streamPeriods(
             where: {
               or: [
