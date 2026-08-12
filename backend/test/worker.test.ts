@@ -26,6 +26,13 @@ function env(overrides: Partial<Env> = {}): Env {
   } as Env;
 }
 
+function makeExecutionContext(): ExecutionContext {
+  return {
+    waitUntil(_promise: Promise<unknown>) {},
+    passThroughOnException() {}
+  } as unknown as ExecutionContext;
+}
+
 const ChannelsEvents = new Interface([
   "event Reserved(bytes32 indexed channelId,address indexed buyer,address indexed seller,uint128 maxAmount)",
   "event ChannelSettled(bytes32 indexed channelId,address indexed buyer,address indexed seller,uint128 cumulativeAmount,uint128 delta,uint128 totalSettled,uint256 platformFee,bytes metadata)"
@@ -54,15 +61,154 @@ function encodeChannelLog(
   };
 }
 
+function toHexQuantity(value: number | bigint): string {
+  const num = typeof value === "number" ? BigInt(value) : value;
+  return `0x${num.toString(16)}`;
+}
+
+function makeRpcBlock(blockNumber: bigint, timestamp: bigint) {
+  return {
+    number: toHexQuantity(blockNumber),
+    hash: `0x${"1".repeat(64)}`,
+    parentHash: `0x${"2".repeat(64)}`,
+    nonce: "0x0000000000000000",
+    sha3Uncles: `0x${"3".repeat(64)}`,
+    logsBloom: `0x${"0".repeat(512)}`,
+    transactionsRoot: `0x${"4".repeat(64)}`,
+    stateRoot: `0x${"5".repeat(64)}`,
+    receiptsRoot: `0x${"6".repeat(64)}`,
+    miner: "0x0000000000000000000000000000000000000000",
+    difficulty: "0x0",
+    totalDifficulty: "0x0",
+    extraData: "0x",
+    size: "0x0",
+    gasLimit: "0x1c9c380",
+    gasUsed: "0x0",
+    timestamp: toHexQuantity(timestamp),
+    transactions: [],
+    uncles: [],
+    baseFeePerGas: "0x1",
+    mixHash: `0x${"7".repeat(64)}`,
+    withdrawals: []
+  };
+}
+
+function blockNumberFromLog(log: { blockNumber?: string | number }): bigint {
+  if (typeof log.blockNumber === "number") return BigInt(log.blockNumber);
+  if (typeof log.blockNumber === "string") return log.blockNumber.startsWith("0x") ? BigInt(log.blockNumber) : BigInt(Number.parseInt(log.blockNumber, 10));
+  return 0n;
+}
+
+function buildOfflineAnalyticsFetchMock(options: {
+  dayStartUnix: number;
+  dayEndUnix: number;
+  baseBlockSeconds?: number;
+  explorerFromBlock?: number;
+  explorerToBlock?: number;
+  celoVaultAddress?: string;
+  baseChannelsAddress: string;
+  skipBaseRangeFilter?: boolean;
+  getCeloLogs?: () => Array<{ topics: string[]; blockNumber?: string | number }>;
+  getBaseLogsByTopic?: () => Record<string, Array<{ topics: string[]; blockNumber?: string | number }>>;
+  getStreamPeriods?: () => Array<{
+    sender: { id: string };
+    flowRate: string;
+    startedAtTimestamp: string;
+    stoppedAtTimestamp: string | null;
+    stream: { userData: string };
+  }>;
+}) {
+  const latestBaseBlock = 50_000_000n;
+  const latestBaseTimestamp = BigInt(options.dayEndUnix + 7200);
+  const baseBlockSeconds = BigInt(options.baseBlockSeconds ?? 2);
+
+  return (async (urlInput: string | URL | Request, init?: RequestInit) => {
+    const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+
+    if (url.host === "chainlist.org") {
+      return Response.json([
+        { chainId: 42220, rpc: ["https://celo.rpc.test"] },
+        { chainId: 8453, rpc: ["https://base.rpc.test"] }
+      ]);
+    }
+
+    if (url.host === "celo.blockscout.test" || url.host === "base.blockscout.test") {
+      if (url.searchParams.get("action") === "getblocknobytime") {
+        const closest = url.searchParams.get("closest");
+        const fromBlock = options.explorerFromBlock ?? 100;
+        const toBlock = options.explorerToBlock ?? 120;
+        const block = closest === "after" ? String(fromBlock) : String(toBlock);
+        return Response.json({ status: "1", message: "OK", result: block });
+      }
+    }
+
+    if (url.host === "superfluid.test") {
+      const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
+      if (body.variables.skip > 0) {
+        return Response.json({ data: { streamPeriods: [] } });
+      }
+      return Response.json({ data: { streamPeriods: options.getStreamPeriods ? options.getStreamPeriods() : [] } });
+    }
+
+    if (url.host === "celo.rpc.test" || url.host === "base.rpc.test") {
+      const body = JSON.parse(String(init?.body)) as {
+        id: number;
+        method: string;
+        params: Array<any>;
+      };
+
+      if (body.method === "eth_getLogs") {
+        const filter = body.params[0] as { address: string; topics?: string[]; fromBlock: string; toBlock: string };
+        const fromBlock = BigInt(filter.fromBlock);
+        const toBlock = BigInt(filter.toBlock);
+        const address = filter.address.toLowerCase();
+
+        let logs: Array<{ topics: string[]; blockNumber?: string | number }> = [];
+        if (options.celoVaultAddress && address === options.celoVaultAddress.toLowerCase()) {
+          logs = options.getCeloLogs ? options.getCeloLogs() : [];
+        } else if (address === options.baseChannelsAddress.toLowerCase()) {
+          const topic0 = (filter.topics?.[0] ?? "").toLowerCase();
+          const topicMap = options.getBaseLogsByTopic ? options.getBaseLogsByTopic() : {};
+          logs = topicMap[topic0] ?? [];
+        }
+
+        const shouldSkipFilter = options.skipBaseRangeFilter && address === options.baseChannelsAddress.toLowerCase();
+        const filtered = shouldSkipFilter
+          ? logs
+          : logs.filter((log) => {
+              const blockNumber = blockNumberFromLog(log);
+              return blockNumber >= fromBlock && blockNumber <= toBlock;
+            });
+
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: filtered });
+      }
+
+      if (body.method === "eth_getBlockByNumber") {
+        const blockTag = body.params[0] as string;
+        const blockNumber = blockTag === "latest" ? latestBaseBlock : BigInt(blockTag);
+        const delta = latestBaseBlock - blockNumber;
+        const timestamp = latestBaseTimestamp - delta * baseBlockSeconds;
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: makeRpcBlock(blockNumber, timestamp)
+        });
+      }
+    }
+
+    throw new Error(`unexpected fetch url: ${url.toString()}`);
+  }) as typeof fetch;
+}
+
 test("health exposes bridge status", async () => {
-  const res = await worker.fetch(new Request("https://worker.test/health"), env(), {} as ExecutionContext);
+  const res = await worker.fetch(new Request("https://worker.test/health"), env(), makeExecutionContext());
   assert.equal(res.status, 200);
   const body = (await res.json()) as { bridgeEnabled: boolean };
   assert.equal(body.bridgeEnabled, false);
 });
 
 test("config status documents celo-to-base bridge mode", async () => {
-  const res = await worker.fetch(new Request("https://worker.test/config/status"), env(), {} as ExecutionContext);
+  const res = await worker.fetch(new Request("https://worker.test/config/status"), env(), makeExecutionContext());
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
     bridge: { celoVaultEvents: boolean; baseBuyerOperatorEnabled: boolean; mode: string };
@@ -73,7 +219,7 @@ test("config status documents celo-to-base bridge mode", async () => {
 });
 
 test("config values exposes non-secret runtime constants", async () => {
-  const res = await worker.fetch(new Request("https://worker.test/config/values"), env(), {} as ExecutionContext);
+  const res = await worker.fetch(new Request("https://worker.test/config/values"), env(), makeExecutionContext());
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
     config: {
@@ -92,7 +238,7 @@ test("config values exposes non-secret runtime constants", async () => {
 });
 
 test("GET /v1/analytics returns analytics window with CORS headers", async () => {
-  const res = await worker.fetch(new Request("https://worker.test/v1/analytics?days=2"), env(), {} as ExecutionContext);
+  const res = await worker.fetch(new Request("https://worker.test/v1/analytics?days=2"), env(), makeExecutionContext());
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("access-control-allow-origin"), "*");
   const body = (await res.json()) as { days: number; daily: Array<{ date: string }>; lastRun: { currentDate: string } };
@@ -101,82 +247,74 @@ test("GET /v1/analytics returns analytics window with CORS headers", async () =>
   assert.equal(body.daily[1].date, body.lastRun.currentDate);
 });
 
-test("POST /v1/analytics/refresh returns aggregation summary", async () => {
+test("POST /v1/analytics/refresh returns aggregation summary", { concurrency: false }, async () => {
   const originalFetch = globalThis.fetch;
 
   try {
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
-      if (url.searchParams.get("action") === "getblocknobytime") {
-        return Response.json({
-          status: "1",
-          message: "OK",
-          result: "123"
-        });
-      }
+    const testEnv = env({
+      CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+      CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+      CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+      BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+      ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+      SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+    });
+    const now = new Date();
+    const dayStartUnix = Math.floor(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0)).getTime() / 1000);
+    const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
 
-      if (url.searchParams.get("action") === "getLogs") {
-        return Response.json({
-          status: "0",
-          message: "No records found",
-          result: []
-        });
-      }
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      celoVaultAddress: testEnv.CELO_VAULT_ADDRESS,
+      baseChannelsAddress: testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      getStreamPeriods: () => []
+    });
 
-      throw new Error(`unexpected fetch ${url.toString()}`);
-    }) as typeof fetch;
-
-    const res = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), env(), {} as ExecutionContext);
+    const res = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), testEnv, makeExecutionContext());
     assert.equal(res.status, 200);
-    const body = (await res.json()) as {
-      ok: boolean;
+    const body = (await res.json()) as Array<{
       currentDate: string;
-      celo: { scanned: number; matched: number };
-      base: { scanned: number; matched: number };
-      streams: { senders: number };
-    };
-    assert.equal(body.ok, true);
-    assert.match(body.currentDate, /^\d{4}-\d{2}-\d{2}$/);
-    assert.equal(body.celo.scanned, 0);
-    assert.equal(body.celo.matched, 0);
-    assert.equal(body.base.scanned, 0);
-    assert.equal(body.base.matched, 0);
-    assert.equal(body.streams.senders, 0);
+      finalizedDates: string[];
+    }>;
+    assert.equal(Array.isArray(body), true);
+    assert.equal(body.length > 0, true);
+    assert.equal(body.length <= 2, true);
+    assert.match(body[0].currentDate, /^\d{4}-\d{2}-\d{2}$/);
+    assert.equal(Array.isArray(body[0].finalizedDates), true);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("POST /v1/analytics/refresh is rate-limited to one call per hour", async () => {
+test("POST /v1/analytics/refresh is rate-limited to one call per hour", { concurrency: false }, async () => {
   const originalFetch = globalThis.fetch;
 
   try {
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
-      if (url.searchParams.get("action") === "getblocknobytime") {
-        return Response.json({
-          status: "1",
-          message: "OK",
-          result: "123"
-        });
-      }
+    const testEnv = env({
+      CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+      CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+      CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+      BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+      ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+      SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+    });
+    const now = new Date();
+    const dayStartUnix = Math.floor(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0)).getTime() / 1000);
+    const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
 
-      if (url.searchParams.get("action") === "getLogs") {
-        return Response.json({
-          status: "0",
-          message: "No records found",
-          result: []
-        });
-      }
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      celoVaultAddress: testEnv.CELO_VAULT_ADDRESS,
+      baseChannelsAddress: testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      getStreamPeriods: () => []
+    });
 
-      throw new Error(`unexpected fetch ${url.toString()}`);
-    }) as typeof fetch;
-
-    const testEnv = env();
-    const first = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), testEnv, {} as ExecutionContext);
+    const first = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), testEnv, makeExecutionContext());
     assert.equal(first.status, 200);
 
-    const second = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), testEnv, {} as ExecutionContext);
+    const second = await worker.fetch(new Request("https://worker.test/v1/analytics/refresh", { method: "POST" }), testEnv, makeExecutionContext());
     assert.equal(second.status, 429);
     const body = (await second.json()) as { error: string; retryAfterSeconds: number };
     assert.equal(body.error, "analytics refresh is rate-limited");
@@ -190,7 +328,7 @@ test("POST /v1/analytics/refresh is rate-limited to one call per hour", async ()
 test("GET /v1/accounts/:account/profile returns profile only", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/profile`), testEnv, {} as ExecutionContext);
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/profile`), testEnv, makeExecutionContext());
   assert.equal(res.status, 200);
   const body = (await res.json()) as { account: string; profile: { totalGdDepositedWei: string }; gdCredits?: unknown };
   assert.equal(body.account, account);
@@ -201,7 +339,7 @@ test("GET /v1/accounts/:account/profile returns profile only", async () => {
 test("GET /v1/accounts/:account/credit-history returns paginated empty history", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, makeExecutionContext());
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
     account: string;
@@ -221,14 +359,14 @@ test("GET /v1/accounts/:account/credit-history returns paginated empty history",
 
 test("GET /v1/accounts/:account/credit-history returns 400 on invalid query", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history?source=not-a-source`), env(), {} as ExecutionContext);
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history?source=not-a-source`), env(), makeExecutionContext());
   assert.equal(res.status, 400);
 });
 
 test("GET /v1/accounts/:account/outstanding returns outstanding funding info", async () => {
   const testEnv = env();
   const account = "0x0000000000000000000000000000000000000abc";
-  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/outstanding`), testEnv, {} as ExecutionContext);
+  const res = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/outstanding`), testEnv, makeExecutionContext());
   assert.equal(res.status, 200);
   const body = (await res.json()) as { account: string; outstandingFundingUsd: string; failedFundingCredits: unknown[] };
   assert.equal(body.account, account);
@@ -236,7 +374,7 @@ test("GET /v1/accounts/:account/outstanding returns outstanding funding info", a
   assert.equal(body.failedFundingCredits.length, 0);
 });
 
-test("/v1/celo/events/record processes deposit logs and records credits", async () => {
+test("/v1/celo/events/record processes deposit logs and records credits", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"2".repeat(64)}`;
@@ -274,7 +412,7 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
         body: JSON.stringify({ txHash })
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
     assert.equal(res.status, 200);
     const body = (await res.json()) as { events: Array<{ id: string; source: string; fundingStatus: string; principalUsd: string; buyerAddress?: string }> };
@@ -284,13 +422,13 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
     assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
 
     // Verify credit was recorded
-    const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/profile`), testEnv, {} as ExecutionContext);
+    const creditRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/profile`), testEnv, makeExecutionContext());
     assert.equal(creditRes.status, 200);
     const creditBody = (await creditRes.json()) as { profile: { totalGdDepositedWei: string }; gdCredits?: unknown };
     assert.equal(creditBody.gdCredits, undefined);
     assert.notEqual(creditBody.profile.totalGdDepositedWei, "0");
 
-    const historyRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+    const historyRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, makeExecutionContext());
     assert.equal(historyRes.status, 200);
     const historyBody = (await historyRes.json()) as { items: Array<{ id: string; source: string }> };
     assert.equal(historyBody.items.length, 1);
@@ -303,7 +441,7 @@ test("/v1/celo/events/record processes deposit logs and records credits", async 
         body: JSON.stringify({ txHash })
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
     assert.equal(retryRes.status, 200);
     const retryBody = (await retryRes.json()) as {
@@ -328,12 +466,12 @@ test("/v1/celo/events/record requires valid input", async () => {
       body: JSON.stringify({})
     }),
     testEnv,
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 400);
 });
 
-test("request exceptions send slack webhook with path, body, and error", async () => {
+test("request exceptions send slack webhook with path, body, and error", { concurrency: false }, async () => {
   const originalFetch = globalThis.fetch;
   const webhookCalls: Array<{ url: string; body: { text: string } }> = [];
   const pending: Array<Promise<unknown>> = [];
@@ -378,7 +516,7 @@ test("request exceptions send slack webhook with path, body, and error", async (
   }
 });
 
-test("POST /v1/accounts/:account/stream-credits returns no streams when none active", async () => {
+test("POST /v1/accounts/:account/stream-credits returns no streams when none active", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const celoVault = "0x0000000000000000000000000000000000000def";
   const gdSuperToken = "0x0000000000000000000000000000000000000fed";
@@ -411,7 +549,7 @@ test("POST /v1/accounts/:account/stream-credits returns no streams when none act
         headers: { "content-type": "application/json" }
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
     assert.equal(res.status, 200);
     const body = (await res.json()) as { account: string; streams: unknown[]; message: string };
@@ -423,14 +561,14 @@ test("POST /v1/accounts/:account/stream-credits returns no streams when none act
 });
 
 test("unknown route returns 404", async () => {
-  const res = await worker.fetch(new Request("https://worker.test/nonexistent"), env(), {} as ExecutionContext);
+  const res = await worker.fetch(new Request("https://worker.test/nonexistent"), env(), makeExecutionContext());
   assert.equal(res.status, 404);
   const body = (await res.json()) as { error: string };
   assert.equal(body.error, "not found");
 });
 
 test("OPTIONS returns CORS preflight", async () => {
-  const res = await worker.fetch(new Request("https://worker.test/anything", { method: "OPTIONS" }), env(), {} as ExecutionContext);
+  const res = await worker.fetch(new Request("https://worker.test/anything", { method: "OPTIONS" }), env(), makeExecutionContext());
   assert.equal(res.status, 204);
   assert.equal(res.headers.get("access-control-allow-origin"), "*");
 });
@@ -451,6 +589,8 @@ test("analytics refresh overwrites current day and query adds current day to per
   const channelId = `0x${"1".repeat(64)}`;
   const now = new Date("2026-07-24T12:00:00.000Z");
   const timestamp = Math.floor(now.getTime() / 1000) - 60;
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
   const date = now.toISOString().slice(0, 10);
 
   const celoDepositLog = {
@@ -465,7 +605,7 @@ test("analytics refresh overwrites current day and query adds current day to per
     testEnv.ANTSEED_CHANNELS_ADDRESS!,
     `0x${"3".repeat(64)}`,
     0,
-    210,
+    49_970_000,
     timestamp
   );
   const settledLog = encodeChannelLog(
@@ -474,7 +614,7 @@ test("analytics refresh overwrites current day and query adds current day to per
     testEnv.ANTSEED_CHANNELS_ADDRESS!,
     `0x${"4".repeat(64)}`,
     1,
-    211,
+    49_970_001,
     timestamp
   );
 
@@ -482,72 +622,27 @@ test("analytics refresh overwrites current day and query adds current day to per
   try {
     let celoAmountWei = 2_000_000_000_000_000_000n;
 
-    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
-      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+    const reservedTopic = ChannelsEvents.getEvent("Reserved")?.topicHash.toLowerCase() ?? "";
+    const settledTopic = ChannelsEvents.getEvent("ChannelSettled")?.topicHash.toLowerCase() ?? "";
 
-      if (url.host === "celo.blockscout.test") {
-        const module = url.searchParams.get("module");
-        const action = url.searchParams.get("action");
-        if (module === "block" && action === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "100" });
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      celoVaultAddress: testEnv.CELO_VAULT_ADDRESS,
+      baseChannelsAddress: testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      getCeloLogs: () => [
+        {
+          ...celoDepositLog,
+          ...encodeVaultEventLog("GdDeposited", [account, buyer, celoAmountWei, "0x"], testEnv.CELO_VAULT_ADDRESS!, `0x${"2".repeat(64)}`, 0),
+          blockNumber: "0x64"
         }
-        if (module === "proxy" && action === "eth_blockNumber") {
-          return Response.json({ result: "0x64" });
-        }
-        if (module === "logs" && action === "getLogs") {
-          const dynamicCeloLog = {
-            ...encodeVaultEventLog("GdDeposited", [account, buyer, celoAmountWei, "0x"], testEnv.CELO_VAULT_ADDRESS!, `0x${"2".repeat(64)}`, 0),
-            blockNumber: "0x64",
-            timeStamp: `0x${timestamp.toString(16)}`
-          };
-          return Response.json({ status: "1", message: "OK", result: [dynamicCeloLog] });
-        }
-      }
-
-      if (url.host === "base.blockscout.test") {
-        const module = url.searchParams.get("module");
-        const action = url.searchParams.get("action");
-        if (module === "block" && action === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "200" });
-        }
-        if (module === "proxy" && action === "eth_blockNumber") {
-          return Response.json({ result: "0xd3" });
-        }
-        if (module === "logs" && action === "getLogs") {
-          const topic0 = url.searchParams.get("topic0")?.toLowerCase();
-          const reservedTopic = ChannelsEvents.getEvent("Reserved")?.topicHash.toLowerCase();
-          const settledTopic = ChannelsEvents.getEvent("ChannelSettled")?.topicHash.toLowerCase();
-          if (topic0 === reservedTopic) {
-            return Response.json({ status: "1", message: "OK", result: [reservedLog] });
-          }
-          if (topic0 === settledTopic) {
-            return Response.json({ status: "1", message: "OK", result: [settledLog] });
-          }
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "superfluid.test") {
-        const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
-        if (body.variables.skip > 0) {
-          return Response.json({ data: { streams: [] } });
-        }
-        return Response.json({
-          data: {
-            streams: [
-              {
-                sender: { id: account },
-                currentFlowRate: "0",
-                streamedUntilUpdatedAt: "1000000000000000000",
-                updatedAtTimestamp: String(timestamp)
-              }
-            ]
-          }
-        });
-      }
-
-      throw new Error(`unexpected fetch url: ${url.toString()}`);
-    }) as typeof fetch;
+      ],
+      getBaseLogsByTopic: () => ({
+        [reservedTopic]: [reservedLog],
+        [settledTopic]: [settledLog]
+      }),
+      getStreamPeriods: () => []
+    });
 
     await import("../src/analytics.js").then(async ({ runAnalyticsAggregation }) => {
       await runAnalyticsAggregation(testEnv, now);
@@ -607,90 +702,48 @@ test("analytics refresh excludes base usage for buyers outside known buyer regis
   const channelId = `0x${"7".repeat(64)}`;
   const now = new Date("2026-07-24T12:00:00.000Z");
   const timestamp = Math.floor(now.getTime() / 1000) - 60;
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
 
   const originalFetch = globalThis.fetch;
   try {
-    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
-      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+    const settledTopic = ChannelsEvents.getEvent("ChannelSettled")?.topicHash.toLowerCase() ?? "";
+    const known = encodeChannelLog(
+      "ChannelSettled",
+      [channelId, knownBuyer, seller, 3_000_000n, 500_000n, 1_000_000n, 0n, "0x"],
+      testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      `0x${"9".repeat(64)}`,
+      1,
+      49_970_010,
+      timestamp
+    );
+    const unknown = encodeChannelLog(
+      "ChannelSettled",
+      [channelId, unknownBuyer, seller, 5_000_000n, 700_000n, 2_000_000n, 0n, "0x"],
+      testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      `0x${"6".repeat(64)}`,
+      2,
+      49_970_011,
+      timestamp
+    );
 
-      if (url.host === "celo.blockscout.test") {
-        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "100" });
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      celoVaultAddress: testEnv.CELO_VAULT_ADDRESS,
+      baseChannelsAddress: testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      getCeloLogs: () => [
+        {
+          ...encodeVaultEventLog("GdDeposited", [account, knownBuyer, 1_000_000_000_000_000_000n, "0x"], testEnv.CELO_VAULT_ADDRESS!, `0x${"8".repeat(64)}`, 0),
+          blockNumber: "0x64",
+          timeStamp: `0x${timestamp.toString(16)}`
         }
-        if (url.searchParams.get("module") === "logs") {
-          return Response.json({
-            status: "1",
-            message: "OK",
-            result: [
-              {
-                ...encodeVaultEventLog(
-                  "GdDeposited",
-                  [account, knownBuyer, 1_000_000_000_000_000_000n, "0x"],
-                  testEnv.CELO_VAULT_ADDRESS!,
-                  `0x${"8".repeat(64)}`,
-                  0
-                ),
-                blockNumber: "0x64",
-                timeStamp: `0x${timestamp.toString(16)}`
-              }
-            ]
-          });
-        }
-      }
-
-      if (url.host === "base.blockscout.test") {
-        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "200" });
-        }
-        if (url.searchParams.get("module") === "logs") {
-          const topic0 = url.searchParams.get("topic0")?.toLowerCase();
-          const settledTopic = ChannelsEvents.getEvent("ChannelSettled")?.topicHash.toLowerCase();
-          if (topic0 === settledTopic) {
-            const known = encodeChannelLog(
-              "ChannelSettled",
-              [channelId, knownBuyer, seller, 3_000_000n, 500_000n, 1_000_000n, 0n, "0x"],
-              testEnv.ANTSEED_CHANNELS_ADDRESS!,
-              `0x${"9".repeat(64)}`,
-              1,
-              211,
-              timestamp
-            );
-            const unknown = encodeChannelLog(
-              "ChannelSettled",
-              [channelId, unknownBuyer, seller, 5_000_000n, 700_000n, 2_000_000n, 0n, "0x"],
-              testEnv.ANTSEED_CHANNELS_ADDRESS!,
-              `0x${"6".repeat(64)}`,
-              2,
-              212,
-              timestamp
-            );
-            return Response.json({ status: "1", message: "OK", result: [known, unknown] });
-          }
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "superfluid.test") {
-        const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
-        if (body.variables.skip > 0) {
-          return Response.json({ data: { streams: [] } });
-        }
-        return Response.json({
-          data: {
-            streams: [
-              {
-                sender: { id: account },
-                currentFlowRate: "0",
-                streamedUntilUpdatedAt: "0",
-                updatedAtTimestamp: String(timestamp)
-              }
-            ]
-          }
-        });
-      }
-
-      throw new Error(`unexpected fetch url: ${url.toString()}`);
-    }) as typeof fetch;
+      ],
+      getBaseLogsByTopic: () => ({
+        [settledTopic]: [known, unknown]
+      }),
+      getStreamPeriods: () => []
+    });
 
     await import("../src/analytics.js").then(async ({ runAnalyticsAggregation }) => {
       await runAnalyticsAggregation(testEnv, now);
@@ -727,71 +780,42 @@ test("analytics refresh includes base usage for buyers learned from stream userD
   const now = new Date("2026-07-24T12:00:00.000Z");
   const timestamp = Math.floor(now.getTime() / 1000) - 60;
   const encodedBuyerUserData = `0x${"0".repeat(24)}${streamBuyer.slice(2)}`;
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
 
   const originalFetch = globalThis.fetch;
   try {
-    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
-      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+    const settledTopic = ChannelsEvents.getEvent("ChannelSettled")?.topicHash.toLowerCase() ?? "";
 
-      if (url.host === "celo.blockscout.test") {
-        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "100" });
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      celoVaultAddress: testEnv.CELO_VAULT_ADDRESS,
+      baseChannelsAddress: testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      getCeloLogs: () => [],
+      getBaseLogsByTopic: () => ({
+        [settledTopic]: [
+          encodeChannelLog(
+            "ChannelSettled",
+            [channelId, streamBuyer, seller, 3_000_000n, 500_000n, 1_000_000n, 0n, "0x"],
+            testEnv.ANTSEED_CHANNELS_ADDRESS!,
+            `0x${"c".repeat(64)}`,
+            1,
+            49_970_020,
+            timestamp
+          )
+        ]
+      }),
+      getStreamPeriods: () => [
+        {
+          sender: { id: account },
+          flowRate: "0",
+          startedAtTimestamp: String(timestamp),
+          stoppedAtTimestamp: null,
+          stream: { userData: encodedBuyerUserData }
         }
-        if (url.searchParams.get("module") === "logs") {
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "base.blockscout.test") {
-        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "200" });
-        }
-        if (url.searchParams.get("module") === "logs") {
-          const topic0 = url.searchParams.get("topic0")?.toLowerCase();
-          const settledTopic = ChannelsEvents.getEvent("ChannelSettled")?.topicHash.toLowerCase();
-          if (topic0 === settledTopic) {
-            return Response.json({
-              status: "1",
-              message: "OK",
-              result: [
-                encodeChannelLog(
-                  "ChannelSettled",
-                  [channelId, streamBuyer, seller, 3_000_000n, 500_000n, 1_000_000n, 0n, "0x"],
-                  testEnv.ANTSEED_CHANNELS_ADDRESS!,
-                  `0x${"c".repeat(64)}`,
-                  1,
-                  211,
-                  timestamp
-                )
-              ]
-            });
-          }
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "superfluid.test") {
-        const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
-        if (body.variables.skip > 0) {
-          return Response.json({ data: { streamPeriods: [] } });
-        }
-        return Response.json({
-          data: {
-            streamPeriods: [
-              {
-                sender: { id: account },
-                flowRate: "0",
-                startedAtTimestamp: String(timestamp),
-                stoppedAtTimestamp: null,
-                userData: encodedBuyerUserData
-              }
-            ]
-          }
-        });
-      }
-
-      throw new Error(`unexpected fetch url: ${url.toString()}`);
-    }) as typeof fetch;
+      ]
+    });
 
     await import("../src/analytics.js").then(async ({ KVAnalyticsStore, getAnalyticsWindow, runAnalyticsAggregation }) => {
       await runAnalyticsAggregation(testEnv, now);
@@ -817,135 +841,96 @@ test("analytics refresh finalizes previous day into persisted globals once day r
     SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
   });
 
-  const account = "0x0000000000000000000000000000000000000abc";
-  const buyer = "0x0000000000000000000000000000000000000def";
-  const seller = "0x0000000000000000000000000000000000000fed";
-  const channelId = `0x${"9".repeat(64)}`;
-  const firstNow = new Date("2026-07-23T10:00:00.000Z");
   const secondNow = new Date("2026-07-24T01:00:00.000Z");
+  const previousDate = "2026-07-23";
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
 
   const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+  const originalConsoleWarn = console.warn;
+  const originalConsoleError = console.error;
   try {
-    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
-      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+    // Aggregation emits verbose logs; muting console keeps this test fast and deterministic.
+    console.log = (() => {}) as typeof console.log;
+    console.warn = (() => {}) as typeof console.warn;
+    console.error = (() => {}) as typeof console.error;
 
-      const activeNow = url.host === "superfluid.test" ? (JSON.parse(String(init?.body)) as { variables: { skip: number } }).variables.skip : 0;
-      const timestamp = Math.floor(firstNow.getTime() / 1000) - 60;
+    await testEnv.ANTSEED_KV.put(
+      `analytics:daily:${previousDate}`,
+      JSON.stringify({
+        date: previousDate,
+        gdOneTimeDepositsWei: "2000000000000000000",
+        gdStreamedWei: "0",
+        gdTotalFlowRateWeiPerSecond: "0",
+        aiCreditsUsedWei: "500000",
+        uniqueGdBuyers: 1,
+        uniqueCreditUsers: 1,
+        updatedAt: "2026-07-23T23:59:59.000Z"
+      })
+    );
 
-      if (url.host === "celo.blockscout.test") {
-        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "100" });
-        }
-        if (url.searchParams.get("module") === "logs") {
-          return Response.json({
-            status: "1",
-            message: "OK",
-            result: [
-              {
-                ...encodeVaultEventLog(
-                  "GdDeposited",
-                  [account, buyer, 2_000_000_000_000_000_000n, "0x"],
-                  testEnv.CELO_VAULT_ADDRESS!,
-                  `0x${"a".repeat(64)}`,
-                  0
-                ),
-                blockNumber: "0x64",
-                timeStamp: `0x${timestamp.toString(16)}`
-              }
-            ]
-          });
-        }
-      }
-
-      if (url.host === "base.blockscout.test") {
-        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "200" });
-        }
-        if (url.searchParams.get("module") === "logs") {
-          const topic0 = url.searchParams.get("topic0")?.toLowerCase();
-          const settledTopic = ChannelsEvents.getEvent("ChannelSettled")?.topicHash.toLowerCase();
-          if (topic0 === settledTopic) {
-            return Response.json({
-              status: "1",
-              message: "OK",
-              result: [
-                encodeChannelLog(
-                  "ChannelSettled",
-                  [channelId, buyer, seller, 3_000_000n, 500_000n, 1_000_000n, 0n, "0x"],
-                  testEnv.ANTSEED_CHANNELS_ADDRESS!,
-                  `0x${"b".repeat(64)}`,
-                  1,
-                  211,
-                  timestamp
-                )
-              ]
-            });
-          }
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "superfluid.test") {
-        if (activeNow > 0) {
-          return Response.json({ data: { streams: [] } });
-        }
-        return Response.json({
-          data: {
-            streams: [
-              {
-                sender: { id: account },
-                currentFlowRate: "0",
-                streamedUntilUpdatedAt: "1000000000000000000",
-                updatedAtTimestamp: String(timestamp)
-              }
-            ]
-          }
-        });
-      }
-
-      throw new Error(`unexpected fetch url: ${url.toString()}`);
-    }) as typeof fetch;
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      celoVaultAddress: testEnv.CELO_VAULT_ADDRESS,
+      baseChannelsAddress: testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      getCeloLogs: () => [],
+      getBaseLogsByTopic: () => ({}),
+      getStreamPeriods: () => []
+    });
 
     await import("../src/analytics.js").then(async ({ runAnalyticsAggregation }) => {
-      await runAnalyticsAggregation(testEnv, firstNow);
       await runAnalyticsAggregation(testEnv, secondNow);
     });
 
     const analyticsBody = await import("../src/analytics.js").then(async ({ getAnalyticsWindow }) => getAnalyticsWindow(testEnv, 2, secondNow));
-    assert.equal(analyticsBody.global.gdOneTimeDepositsWei, "4000000000000000000");
+    assert.equal(analyticsBody.global.gdOneTimeDepositsWei, "2000000000000000000");
     assert.equal(analyticsBody.global.gdStreamedWei, "0");
-    assert.equal(analyticsBody.global.aiCreditsUsedWei, "1000000");
+    assert.equal(analyticsBody.global.aiCreditsUsedWei, "500000");
+    assert.equal(analyticsBody.lastRun.finalizedThroughDate, previousDate);
   } finally {
     globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+    console.warn = originalConsoleWarn;
+    console.error = originalConsoleError;
   }
 });
 
-test("scheduled analytics seeds a 30-day backfill cursor on fresh KV", { concurrency: false }, async () => {
+test("scheduled analytics seeds a 40-day backfill cursor on fresh KV", { concurrency: false }, async () => {
   const testEnv = env({
-    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api"
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d"
   });
   const now = new Date();
-  const expectedFirstDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const expectedSecondDate = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const expectedFirstDate = new Date(now.getTime() - 40 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const expectedSecondDate = new Date(now.getTime() - 39 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const expectedCursorDate = now.toISOString().slice(0, 10);
+  const dayStartUnix = Math.floor(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0)).getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
 
   const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+  const originalConsoleWarn = console.warn;
+  const originalConsoleError = console.error;
   try {
-    globalThis.fetch = (async (urlInput: string | URL | Request) => {
-      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
-      if (url.host === "base.blockscout.test") {
-        if (url.searchParams.get("module") === "block" && url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "200" });
-        }
-        if (url.searchParams.get("module") === "logs" && url.searchParams.get("action") === "getLogs") {
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-      throw new Error(`unexpected fetch url: ${url.toString()}`);
-    }) as typeof fetch;
+    // Backfill runs 40 daily aggregations; muting logs keeps this test substantially faster.
+    console.log = (() => {}) as typeof console.log;
+    console.warn = (() => {}) as typeof console.warn;
+    console.error = (() => {}) as typeof console.error;
+
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      baseBlockSeconds: 4,
+      celoVaultAddress: undefined,
+      baseChannelsAddress: testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      getStreamPeriods: () => []
+    });
 
     const event = { scheduledTime: now.getTime(), cron: "0 */6 * * *" } as unknown as ScheduledEvent;
-    const ctx = { waitUntil: () => undefined } as unknown as ExecutionContext;
+    const ctx = makeExecutionContext();
     await worker.scheduled(event, testEnv, ctx);
 
     const firstDaily = await testEnv.ANTSEED_KV.get(`analytics:daily:${expectedFirstDate}`, "json");
@@ -957,6 +942,9 @@ test("scheduled analytics seeds a 30-day backfill cursor on fresh KV", { concurr
     assert.equal(cursor, expectedCursorDate);
   } finally {
     globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+    console.warn = originalConsoleWarn;
+    console.error = originalConsoleError;
   }
 });
 
@@ -974,6 +962,8 @@ test("analytics refresh collects logs beyond the explorer 1000-result cap", { co
   const buyer = "0x0000000000000000000000000000000000000def";
   const now = new Date("2026-07-24T12:00:00.000Z");
   const timestamp = Math.floor(now.getTime() / 1000) - 60;
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
   const totalLogs = 1001;
   const expectedDepositsWei = (1_000_000_000_000_000_000n * BigInt(totalLogs)).toString();
   const celoLogs = Array.from({ length: totalLogs }, (_, index) => ({
@@ -990,48 +980,16 @@ test("analytics refresh collects logs beyond the explorer 1000-result cap", { co
 
   const originalFetch = globalThis.fetch;
   try {
-    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
-      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
-
-      if (url.host === "celo.blockscout.test") {
-        const module = url.searchParams.get("module");
-        const action = url.searchParams.get("action");
-        if (module === "block" && action === "getblocknobytime") {
-          const closest = url.searchParams.get("closest");
-          return Response.json({ status: "1", message: "OK", result: closest === "after" ? "100" : String(99 + totalLogs) });
-        }
-        if (module === "logs" && action === "getLogs") {
-          const fromBlock = Number(url.searchParams.get("fromBlock"));
-          const toBlock = Number(url.searchParams.get("toBlock"));
-          const filtered = celoLogs.filter((log) => {
-            const blockNumber = Number.parseInt(log.blockNumber, 16);
-            return blockNumber >= fromBlock && blockNumber <= toBlock;
-          });
-          return Response.json({ status: "1", message: "OK", result: filtered.slice(0, 1000) });
-        }
-      }
-
-      if (url.host === "base.blockscout.test") {
-        const module = url.searchParams.get("module");
-        const action = url.searchParams.get("action");
-        if (module === "block" && action === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "200" });
-        }
-        if (module === "logs" && action === "getLogs") {
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "superfluid.test") {
-        const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
-        if (body.variables.skip > 0) {
-          return Response.json({ data: { streams: [] } });
-        }
-        return Response.json({ data: { streams: [] } });
-      }
-
-      throw new Error(`unexpected fetch url: ${url.toString()}`);
-    }) as typeof fetch;
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      explorerFromBlock: 100,
+      explorerToBlock: 100 + totalLogs - 1,
+      celoVaultAddress: testEnv.CELO_VAULT_ADDRESS,
+      baseChannelsAddress: testEnv.ANTSEED_CHANNELS_ADDRESS!,
+      getCeloLogs: () => celoLogs,
+      getStreamPeriods: () => []
+    });
 
     await import("../src/analytics.js").then(async ({ runAnalyticsAggregation }) => {
       await runAnalyticsAggregation(testEnv, now);
@@ -1065,7 +1023,7 @@ test("POST /v1/channels/:channelId/close returns enabled:false when vault not co
       body: JSON.stringify({})
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 200);
   const body = (await res.json()) as { channelId: string; action: string; bridge: { enabled: boolean } };
@@ -1082,7 +1040,7 @@ test("POST /v1/channels/:channelId/withdraw returns enabled:false when vault not
       body: JSON.stringify({})
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 200);
   const body = (await res.json()) as { channelId: string; action: string; bridge: { enabled: boolean } };
@@ -1099,7 +1057,7 @@ test("POST /v1/channels/:channelId/close with optional sig fields passes validat
       body: JSON.stringify({ timestamp: 1234567890, signature: `0x${"b".repeat(130)}` })
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 200);
   const body = (await res.json()) as { bridge: { enabled: boolean } };
@@ -1114,7 +1072,7 @@ test("POST /v1/channels/:channelId/close rejects invalid signature format", asyn
       body: JSON.stringify({ signature: "not-a-hex-sig" })
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 400);
 });
@@ -1128,7 +1086,7 @@ test("POST /v1/accounts/:account/operator-consent returns 400 on missing body fi
       body: JSON.stringify({})
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 400);
 });
@@ -1145,7 +1103,7 @@ test("POST /v1/accounts/:account/operator-consent returns enabled:false when vau
       })
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 200);
   const body = (await res.json()) as { buyer: string; bridge: { enabled: boolean } };
@@ -1162,7 +1120,7 @@ test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", a
       body: JSON.stringify({})
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 400);
 });
@@ -1181,7 +1139,7 @@ test("POST /v1/accounts/:account/withdraw returns 400 on invalid recipient addre
       })
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 400);
 });
@@ -1201,7 +1159,7 @@ test("POST /v1/accounts/:account/withdraw returns enabled:false when vault not c
       })
     }),
     env(),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 200);
   const body = (await res.json()) as { account: string; amountUsd: string; bridge: { enabled: boolean } };
@@ -1210,7 +1168,7 @@ test("POST /v1/accounts/:account/withdraw returns enabled:false when vault not c
   assert.equal(body.bridge.enabled, false);
 });
 
-test("/v1/celo/events/record processes StreamUpdated logs into stream credits", async () => {
+test("/v1/celo/events/record processes StreamUpdated logs into stream credits", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"3".repeat(64)}`;
@@ -1255,7 +1213,7 @@ test("/v1/celo/events/record processes StreamUpdated logs into stream credits", 
         body: JSON.stringify({ txHash })
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
 
     assert.equal(res.status, 200);
@@ -1275,7 +1233,7 @@ test("/v1/celo/events/record processes StreamUpdated logs into stream credits", 
   }
 });
 
-test("/v1/celo/events/record marks zero totalFlowWei StreamUpdated as funded without Base deposit", async () => {
+test("/v1/celo/events/record marks zero totalFlowWei StreamUpdated as funded without Base deposit", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"5".repeat(64)}`;
@@ -1293,13 +1251,7 @@ test("/v1/celo/events/record marks zero totalFlowWei StreamUpdated as funded wit
       ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY: "0x" + "1".repeat(64)
     });
 
-    const streamLog = encodeVaultEventLog(
-      "StreamUpdated",
-      [account, buyer, 385_802_469_136n, 1_000_000_000_000_000_000n, 0n],
-      celoVault,
-      txHash,
-      0
-    );
+    const streamLog = encodeVaultEventLog("StreamUpdated", [account, buyer, 385_802_469_136n, 1_000_000_000_000_000_000n, 0n], celoVault, txHash, 0);
 
     let baseRpcCalls = 0;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -1326,7 +1278,7 @@ test("/v1/celo/events/record marks zero totalFlowWei StreamUpdated as funded wit
         body: JSON.stringify({ txHash })
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
 
     assert.equal(res.status, 200);
@@ -1358,7 +1310,7 @@ test("/v1/celo/events/record marks zero totalFlowWei StreamUpdated as funded wit
   }
 });
 
-test("/v1/celo/events/record skips zero-amount deposit credits", async () => {
+test("/v1/celo/events/record skips zero-amount deposit credits", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"6".repeat(64)}`;
@@ -1388,14 +1340,14 @@ test("/v1/celo/events/record skips zero-amount deposit credits", async () => {
         body: JSON.stringify({ txHash })
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
 
     assert.equal(res.status, 200);
     const body = (await res.json()) as { events: unknown[] };
     assert.equal(body.events.length, 0);
 
-    const historyRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, {} as ExecutionContext);
+    const historyRes = await worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/credit-history`), testEnv, makeExecutionContext());
     assert.equal(historyRes.status, 200);
     const historyBody = (await historyRes.json()) as { items: unknown[] };
     assert.equal(historyBody.items.length, 0);
@@ -1404,7 +1356,7 @@ test("/v1/celo/events/record skips zero-amount deposit credits", async () => {
   }
 });
 
-test("/v1/celo/events/record processes account+fromBlock range query", async () => {
+test("/v1/celo/events/record processes account+fromBlock range query", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"4".repeat(64)}`;
@@ -1435,7 +1387,7 @@ test("/v1/celo/events/record processes account+fromBlock range query", async () 
         body: JSON.stringify({ account, fromBlock: "0x1000000", toBlock: "latest" })
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
 
     assert.equal(res.status, 200);
@@ -1486,7 +1438,7 @@ test("GET /v1/accounts/:account/outstanding returns failed funding entries", asy
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/accounts/${account}/outstanding`),
     env({ ANTSEED_KV: kv as never }),
-    {} as ExecutionContext
+    makeExecutionContext()
   );
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
@@ -1501,7 +1453,7 @@ test("GET /v1/accounts/:account/outstanding returns failed funding entries", asy
   assert.equal(body.failedFundingCredits[0].fundingError, "vault reverted");
 });
 
-test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued within 24h", async () => {
+test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued within 24h", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const celoVault = "0x0000000000000000000000000000000000000def";
   const gdSuperToken = "0x0000000000000000000000000000000000000fed";
@@ -1548,7 +1500,7 @@ test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued 
         headers: { "content-type": "application/json" }
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
 
     assert.equal(res.status, 200);
@@ -1560,7 +1512,7 @@ test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued 
   }
 });
 
-test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ amount", async () => {
+test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ amount", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const celoVault = "0x0000000000000000000000000000000000000def";
   const gdSuperToken = "0x0000000000000000000000000000000000000fed";
@@ -1598,7 +1550,7 @@ test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ a
         headers: { "content-type": "application/json" }
       }),
       testEnv,
-      {} as ExecutionContext
+      makeExecutionContext()
     );
 
     assert.equal(res.status, 200);

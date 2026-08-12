@@ -24,6 +24,106 @@ function env(overrides: Partial<Env> = {}): Env {
   } as Env;
 }
 
+function toHexQuantity(value: number | bigint): string {
+  const num = typeof value === "number" ? BigInt(value) : value;
+  return `0x${num.toString(16)}`;
+}
+
+function makeRpcBlock(blockNumber: bigint, timestamp: bigint) {
+  return {
+    number: toHexQuantity(blockNumber),
+    hash: `0x${"1".repeat(64)}`,
+    parentHash: `0x${"2".repeat(64)}`,
+    nonce: "0x0000000000000000",
+    sha3Uncles: `0x${"3".repeat(64)}`,
+    logsBloom: `0x${"0".repeat(512)}`,
+    transactionsRoot: `0x${"4".repeat(64)}`,
+    stateRoot: `0x${"5".repeat(64)}`,
+    receiptsRoot: `0x${"6".repeat(64)}`,
+    miner: "0x0000000000000000000000000000000000000000",
+    difficulty: "0x0",
+    totalDifficulty: "0x0",
+    extraData: "0x",
+    size: "0x0",
+    gasLimit: "0x1c9c380",
+    gasUsed: "0x0",
+    timestamp: toHexQuantity(timestamp),
+    transactions: [],
+    uncles: [],
+    baseFeePerGas: "0x1",
+    mixHash: `0x${"7".repeat(64)}`,
+    withdrawals: []
+  };
+}
+
+function buildOfflineAnalyticsFetchMock(options: {
+  dayStartUnix: number;
+  dayEndUnix: number;
+  streamPeriods: Array<{
+    sender: { id: string };
+    flowRate: string;
+    startedAtTimestamp: string;
+    stoppedAtTimestamp: string | null;
+    stream: { userData: string };
+  }>;
+}) {
+  const latestBaseBlock = 50_000_000n;
+  const latestBaseTimestamp = BigInt(options.dayEndUnix + 7200);
+
+  return (async (urlInput: string | URL | Request, init?: RequestInit) => {
+    const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+
+    if (url.host === "chainlist.org") {
+      return Response.json([
+        { chainId: 42220, rpc: ["https://celo.rpc.test"] },
+        { chainId: 8453, rpc: ["https://base.rpc.test"] }
+      ]);
+    }
+
+    if (url.host === "celo.blockscout.test" || url.host === "base.blockscout.test") {
+      if (url.searchParams.get("action") === "getblocknobytime") {
+        const closest = url.searchParams.get("closest");
+        const block = closest === "after" ? "100" : "120";
+        return Response.json({ status: "1", message: "OK", result: block });
+      }
+    }
+
+    if (url.host === "superfluid.test") {
+      const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
+      if (body.variables.skip > 0) {
+        return Response.json({ data: { streamPeriods: [] } });
+      }
+      return Response.json({ data: { streamPeriods: options.streamPeriods } });
+    }
+
+    if (url.host === "celo.rpc.test" || url.host === "base.rpc.test") {
+      const body = JSON.parse(String(init?.body)) as {
+        id: number;
+        method: string;
+        params: unknown[];
+      };
+
+      if (body.method === "eth_getLogs") {
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: [] });
+      }
+
+      if (body.method === "eth_getBlockByNumber") {
+        const blockTag = body.params[0] as string;
+        const blockNumber = blockTag === "latest" ? latestBaseBlock : BigInt(blockTag);
+        const delta = latestBaseBlock - blockNumber;
+        const timestamp = latestBaseTimestamp - delta * 2n;
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: makeRpcBlock(blockNumber, timestamp)
+        });
+      }
+    }
+
+    throw new Error(`unexpected fetch url: ${url.toString()}`);
+  }) as typeof fetch;
+}
+
 test("resolveRunDate advances to finalizedThroughDate + 1 when still behind today", () => {
   const state = {
     updatedAt: "2026-07-24T00:00:00.000Z",
@@ -77,59 +177,30 @@ test("runAnalyticsAggregation calculates streamed G$ across a mid-day flow updat
   const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
   const updatedAtTimestamp = dayStartUnix + 6 * 60 * 60;
   const expectedStreamed = (2n * BigInt(6 * 60 * 60) + 4n * BigInt(6 * 60 * 60)).toString();
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
 
   const originalFetch = globalThis.fetch;
   try {
-    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
-      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
-
-      if (url.host === "celo.blockscout.test") {
-        if (url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "100" });
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      streamPeriods: [
+        {
+          sender: { id: "0x0000000000000000000000000000000000000abc" },
+          flowRate: "2",
+          startedAtTimestamp: String(dayStartUnix),
+          stoppedAtTimestamp: String(updatedAtTimestamp),
+          stream: { userData: "0x" }
+        },
+        {
+          sender: { id: "0x0000000000000000000000000000000000000abc" },
+          flowRate: "4",
+          startedAtTimestamp: String(updatedAtTimestamp),
+          stoppedAtTimestamp: null,
+          stream: { userData: "0x" }
         }
-        if (url.searchParams.get("action") === "getLogs") {
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "base.blockscout.test") {
-        if (url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "200" });
-        }
-        if (url.searchParams.get("action") === "getLogs") {
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "superfluid.test") {
-        const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
-        if (body.variables.skip > 0) {
-          return Response.json({ data: { streamPeriods: [] } });
-        }
-        return Response.json({
-          data: {
-            streamPeriods: [
-              {
-                sender: { id: "0x0000000000000000000000000000000000000abc" },
-                flowRate: "2",
-                startedAtTimestamp: String(dayStartUnix),
-                stoppedAtTimestamp: String(updatedAtTimestamp),
-                userData: "0x"
-              },
-              {
-                sender: { id: "0x0000000000000000000000000000000000000abc" },
-                flowRate: "4",
-                startedAtTimestamp: String(updatedAtTimestamp),
-                stoppedAtTimestamp: null,
-                userData: "0x"
-              }
-            ]
-          }
-        });
-      }
-
-      throw new Error(`unexpected fetch url: ${url.toString()}`);
-    }) as typeof fetch;
+      ]
+    });
 
     await runAnalyticsAggregation(testEnv, now);
     const analytics = await getAnalyticsWindow(testEnv, 1, now);
@@ -155,52 +226,23 @@ test("runAnalyticsAggregation calculates streamed G$ for streams active since be
   const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
   const updatedAtTimestamp = dayStartUnix - 2 * 60 * 60;
   const expectedStreamed = (3n * BigInt(12 * 60 * 60)).toString();
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
 
   const originalFetch = globalThis.fetch;
   try {
-    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
-      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
-
-      if (url.host === "celo.blockscout.test") {
-        if (url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "100" });
+    globalThis.fetch = buildOfflineAnalyticsFetchMock({
+      dayStartUnix,
+      dayEndUnix,
+      streamPeriods: [
+        {
+          sender: { id: "0x0000000000000000000000000000000000000abc" },
+          flowRate: "3",
+          startedAtTimestamp: String(updatedAtTimestamp),
+          stoppedAtTimestamp: null,
+          stream: { userData: "0x" }
         }
-        if (url.searchParams.get("action") === "getLogs") {
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "base.blockscout.test") {
-        if (url.searchParams.get("action") === "getblocknobytime") {
-          return Response.json({ status: "1", message: "OK", result: "200" });
-        }
-        if (url.searchParams.get("action") === "getLogs") {
-          return Response.json({ status: "0", message: "No records found", result: "No records found" });
-        }
-      }
-
-      if (url.host === "superfluid.test") {
-        const body = JSON.parse(String(init?.body)) as { variables: { skip: number } };
-        if (body.variables.skip > 0) {
-          return Response.json({ data: { streamPeriods: [] } });
-        }
-        return Response.json({
-          data: {
-            streamPeriods: [
-              {
-                sender: { id: "0x0000000000000000000000000000000000000abc" },
-                flowRate: "3",
-                startedAtTimestamp: String(updatedAtTimestamp),
-                stoppedAtTimestamp: null,
-                userData: "0x"
-              }
-            ]
-          }
-        });
-      }
-
-      throw new Error(`unexpected fetch url: ${url.toString()}`);
-    }) as typeof fetch;
+      ]
+    });
 
     await runAnalyticsAggregation(testEnv, now);
     const analytics = await getAnalyticsWindow(testEnv, 1, now);
