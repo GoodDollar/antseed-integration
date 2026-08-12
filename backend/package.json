@@ -25,6 +25,5 @@
     "tsx": "^4.22.4",
     "typescript": "^5.7.2",
     "wrangler": "^4.18.0"
-  },
-  "packageManager": "yarn@3.6.1+sha256.811210abb5fb5751da12ead8a9cbc0c150b07e43ac9cbedec6752d22abfd2bd6"
+  }
 }
