@@ -252,7 +252,11 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         amount = _min(available - principalRemaining[buyer], bonusRemaining[buyer]);
         if (amount == 0) return 0;
 
+        uint256 beforeBalance = usdc.balanceOf(address(this));
         _deposits().withdraw(buyer, amount);
+        uint256 received = usdc.balanceOf(address(this)) - beforeBalance;
+        if (received < amount) revert InvalidAmount();
+
         bonusRemaining[buyer] -= amount;
         totalBonusWithdrawn[buyer] += amount;
         lastAccountedBalance[buyer] -= amount;
