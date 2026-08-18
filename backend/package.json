@@ -11,7 +11,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/*.test.ts",
     "check:worker-only": "node scripts/check-worker-only.mjs",
-    "lint": "yarn run typecheck && yarn run check:worker-only"
+    "lint": "yarn run typecheck && yarn run check:worker-only",
+    "migrate:buyer-accounting": "tsx scripts/migrate-buyer-accounting.ts"
   },
   "dependencies": {
     "@antseed/node": "^0.2.96",
