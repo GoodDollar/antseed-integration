@@ -28,10 +28,10 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     mapping(bytes32 => bool) public usedDepositIds;
     mapping(address => uint256) public totalPrincipalDeposited;
     mapping(address => uint256) public totalBonusDeposited;
-    mapping(address => uint256) public principalRemaining;
-    mapping(address => uint256) public bonusRemaining;
     mapping(address => uint256) public totalPrincipalWithdrawn;
     mapping(address => uint256) public totalBonusWithdrawn;
+    mapping(address => uint256) public principalRemaining;
+    mapping(address => uint256) public bonusRemaining;
     mapping(address => uint256) public lastAccountedBalance;
     mapping(address => bool) public buyerAccountingMigrated;
 
