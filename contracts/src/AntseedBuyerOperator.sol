@@ -297,8 +297,8 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         (uint256 available, uint256 reserved, ) = _deposits().getBuyerBalance(buyer);
         uint256 currentBalance = available + reserved;
 
-        uint256 principal = totalPrincipalDeposited[buyer];
-        uint256 bonus = totalBonusDeposited[buyer];
+        uint256 principal = totalPrincipalDeposited[buyer] - totalPrincipalWithdrawn[buyer];
+        uint256 bonus = totalBonusDeposited[buyer] - totalBonusWithdrawn[buyer];
         uint256 totalTracked = principal + bonus;
 
         if (totalTracked > currentBalance) {
