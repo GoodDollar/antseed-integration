@@ -267,6 +267,9 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     function _revokeOperator(address buyer) internal {
         _requireDepositsOperator(buyer);
         _withdrawUnusedBonus(buyer);
+        (, uint256 reserved, ) = _deposits().getBuyerBalance(buyer);
+        if (bonusRemaining[buyer] != 0 && reserved > 0) revert CloseChannelsBeforeRevoke(reserved);
+
         _deposits().transferOperator(buyer, address(0));
         emit BuyerOperatorRevoked(buyer);
     }
