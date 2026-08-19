@@ -22,26 +22,28 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     IAntseedRegistry public immutable registry;
     IERC20 public immutable usdc;
 
-    address public owner;
     address public admin;
+    address public owner;
     bool private locked;
     mapping(bytes32 => bool) public usedDepositIds;
     mapping(address => uint256) public totalPrincipalDeposited;
     mapping(address => uint256) public totalBonusDeposited;
     mapping(address => uint256) public totalPrincipalWithdrawn;
+
+    bytes32 public DOMAIN_SEPARATOR;
+
     mapping(address => uint256) public totalBonusWithdrawn;
     mapping(address => uint256) public principalRemaining;
     mapping(address => uint256) public bonusRemaining;
     mapping(address => uint256) public lastAccountedBalance;
     mapping(address => bool) public buyerAccountingMigrated;
 
-    bytes32 public DOMAIN_SEPARATOR;
+    uint256[50] private __gap;
+
     bytes32 public constant WITHDRAW_TYPEHASH = keccak256("WithdrawPrincipal(address buyer,uint256 amount,address recipient,uint256 timestamp)");
     bytes32 public constant REQUEST_CLOSE_TYPEHASH = keccak256("RequestClose(bytes32 channelId,uint256 timestamp)");
     bytes32 public constant WITHDRAW_CHANNEL_TYPEHASH = keccak256("WithdrawChannel(bytes32 channelId,uint256 timestamp)");
     bytes32 public constant REVOKE_OPERATOR_TYPEHASH = keccak256("RevokeOperator(address buyer,uint256 timestamp)");
-
-    uint256[50] private __gap;
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
@@ -61,7 +63,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     error NotOwner();
     error InvalidAddress();
     error InvalidAmount();
-    error NotBuyerOrOwner();
+    error NotBuyerOrAdmin();
     error NotDepositsOperator();
     error TransferFailed();
     error ApproveFailed();
@@ -70,14 +72,15 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     error InvalidSignature();
     error ExpiredSignature();
     error AlreadyMigrated();
+    error CloseChannelsBeforeRevoke(uint256 reserved);
 
-    modifier onlyOwner() {
-        if (msg.sender != owner && msg.sender != admin) revert NotOwner();
+    modifier onlyAdmin() {
+        if (msg.sender != admin && msg.sender != owner) revert NotOwner();
         _;
     }
 
-    modifier onlyAdmin() {
-        if (msg.sender != admin) revert NotOwner();
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
         _;
     }
 
@@ -103,8 +106,9 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
 
     function initialize(address owner_) external initializer {
         if (owner_ == address(0)) revert InvalidAddress();
-        owner = owner_;
         admin = owner_;
+        owner = owner_;
+        emit AdminTransferred(address(0), owner_);
         emit OwnershipTransferred(address(0), owner_);
 
         address depositsAddress = registry.deposits();
@@ -121,7 +125,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         );
     }
 
-    function _authorizeUpgrade(address) internal override onlyAdmin {}
+    function _authorizeUpgrade(address) internal override onlyOwner {}
 
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert InvalidAddress();
@@ -135,7 +139,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         admin = newAdmin;
     }
 
-    function acceptBuyerOperator(address buyer, uint256 nonce, bytes calldata buyerSig) external nonReentrant onlyOwner {
+    function acceptBuyerOperator(address buyer, uint256 nonce, bytes calldata buyerSig) external nonReentrant onlyAdmin {
         if (buyer == address(0)) revert InvalidAddress();
         _deposits().setOperator(buyer, address(this), nonce, buyerSig);
         emit BuyerOperatorAccepted(buyer, nonce);
@@ -169,7 +173,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         lastAccountedBalance[buyer] += principal + bonus;
     }
 
-    function depositFor(address buyer, uint256 principal, uint256 bonus) external nonReentrant onlyOwner {
+    function depositFor(address buyer, uint256 principal, uint256 bonus) external nonReentrant onlyAdmin {
         if (buyer == address(0)) revert InvalidAddress();
         //revoke bonus if we are not operators
         if (_deposits().getOperator(buyer) != address(this)) bonus = 0;
@@ -181,7 +185,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit BuyerDepositFunded(buyer, principal, bonus);
     }
 
-    function depositForWithId(address buyer, uint256 principal, uint256 bonus, string calldata id) external nonReentrant onlyOwner {
+    function depositForWithId(address buyer, uint256 principal, uint256 bonus, string calldata id) external nonReentrant onlyAdmin {
         if (buyer == address(0)) revert InvalidAddress();
         //revoke bonus if we are not operators
         if (_deposits().getOperator(buyer) != address(this)) bonus = 0;
@@ -281,7 +285,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
             if (_recoverSigner(digest, buyerSig) != buyer) revert InvalidSignature();
         } else {
-            _requireBuyerOrOwner(buyer);
+            _requireBuyerOrAdmin(buyer);
         }
         _revokeOperator(buyer);
     }
@@ -322,20 +326,20 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
 
     /// @notice One-time migration helper for a single buyer funded before remaining-balance accounting existed.
     /// @dev Computes remaining principal/bonus from tracked totals and current deposit balance.
-    function migrateBuyerAccounting(address buyer) external onlyOwner {
+    function migrateBuyerAccounting(address buyer) external onlyAdmin {
         _migrateBuyerAccounting(buyer);
     }
 
     /// @notice One-time migration helper for multiple buyers funded before remaining-balance accounting existed.
     /// @dev Reverts if any buyer is invalid or already migrated.
-    function migrateBuyerAccounting(address[] calldata buyers) external onlyOwner {
+    function migrateBuyerAccounting(address[] calldata buyers) external onlyAdmin {
         uint256 len = buyers.length;
         for (uint256 i = 0; i < len; i++) {
             _migrateBuyerAccounting(buyers[i]);
         }
     }
 
-    function transferBuyerOperator(address buyer, address newOperator) external nonReentrant onlyOwner {
+    function transferBuyerOperator(address buyer, address newOperator) external nonReentrant onlyAdmin {
         if (buyer == address(0)) revert InvalidAddress();
         _withdrawUnusedBonus(buyer);
         _deposits().transferOperator(buyer, newOperator);
@@ -350,7 +354,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
             if (_recoverSigner(digest, buyerSig) != buyer) revert InvalidSignature();
         } else {
-            _requireBuyerOrOwner(buyer);
+            _requireBuyerOrAdmin(buyer);
         }
         _channels().requestClose(channelId);
         emit ChannelCloseRequested(channelId, buyer, msg.sender);
@@ -368,7 +372,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
             if (_recoverSigner(digest, buyerSig) != buyer) revert InvalidSignature();
         } else {
-            _requireBuyerOrOwner(buyer);
+            _requireBuyerOrAdmin(buyer);
         }
         _channels().withdraw(channelId);
         emit ChannelWithdrawn(channelId, buyer, msg.sender);
@@ -378,14 +382,14 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         withdrawChannel(channelId, 0, "");
     }
 
-    function sweepToken(address token, address recipient, uint256 amount) external onlyAdmin {
+    function sweepToken(address token, address recipient, uint256 amount) external onlyOwner {
         if (token == address(0) || recipient == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
         _safeTransfer(IERC20(token), recipient, amount);
         emit TokenSwept(token, recipient, amount);
     }
 
-    function approveCurrentDeposits() external onlyOwner {
+    function approveCurrentDeposits() external onlyAdmin {
         _forceApprove(usdc, address(_deposits()), type(uint256).max);
     }
 
@@ -393,9 +397,9 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         if (_deposits().getOperator(buyer) != address(this)) revert NotDepositsOperator();
     }
 
-    function _requireBuyerOrOwner(address buyer) internal view {
-        if (msg.sender == owner || msg.sender == buyer) return;
-        revert NotBuyerOrOwner();
+    function _requireBuyerOrAdmin(address buyer) internal view {
+        if (msg.sender == admin || msg.sender == owner || msg.sender == buyer) return;
+        revert NotBuyerOrAdmin();
     }
 
     function _channelBuyer(bytes32 channelId) internal view returns (address buyer) {

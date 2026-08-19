@@ -123,12 +123,13 @@ The `AntseedBuyerOperator` calls `IAntseedDeposits.deposit` on behalf of buyers.
 cast call <usdc-address-base> "balanceOf(address)(uint256)" <operator-wallet>
 ```
 
-### 5.2 Set the operator `owner` (optional)
-Owner is the day to day operator. Admin has funds and upgrade permissions.
-By default the deployer `owner` is the admin. To designate a separate hot-wallet admin:
+### 5.2 Set the operator `admin` (optional)
+
+Admin is the day to day operator. Owner has funds and upgrade permissions.
+By default the deployer owner is also the admin. To designate a separate hot-wallet admin:
 
 ```bash
-cast send <operatorProxy> "transferOwnership(address)" <admin-address> \
+cast send <operatorProxy> "transferAdmin(address)" <admin-address> \
   --rpc-url "$BASE_RPC_URL" \
   --private-key "$DEPLOYER_PRIVATE_KEY"
 ```

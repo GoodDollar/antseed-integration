@@ -341,13 +341,17 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "zero total rejected after bonus wipe with id");
     }
 
-    function testChannelActionsAllowedForOwnerAndBuyerOnly() public {
+    function testChannelActionsAllowedForAdminOwnerAndBuyerOnly() public {
         setUp();
         bytes32 channelId = keccak256("channel-1");
         channels.setChannelBuyer(channelId, buyer);
+        OperatorCaller ownerCaller = new OperatorCaller(operator);
+        operator.transferOwnership(address(ownerCaller));
 
         operator.requestClose(channelId, 0, "");
         operator.withdrawChannel(channelId, 0, "");
+        require(ownerCaller.callRequestClose(channelId), "owner can request close");
+        require(ownerCaller.callWithdrawChannel(channelId), "owner can withdraw");
 
         OperatorCaller buyerCaller = new OperatorCaller(operator);
         channels.setChannelBuyer(channelId, address(buyerCaller));
@@ -779,11 +783,11 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "double init rejected");
     }
 
-    function testOnlyAdminCanUpgrade() public {
+    function testOnlyOwnerCanUpgrade() public {
         setUp();
         AntseedBuyerOperator newImpl = new AntseedBuyerOperator(address(registry));
 
-        // admin (equals owner at init) can upgrade
+        // owner (equals admin at init) can upgrade
         operator.upgradeToAndCall(address(newImpl), "");
 
         // outsider cannot upgrade
@@ -791,13 +795,13 @@ contract AntseedBuyerOperatorTest {
         (bool ok, ) = address(outsider).call(abi.encodeWithSignature("upgrade(address,address)", address(operator), address(newImpl)));
         require(!ok, "outsider upgrade rejected");
 
-        // transfer admin away; address(this) remains owner but loses admin role
-        AdminActor newAdminActor = new AdminActor(operator);
-        operator.transferAdmin(address(newAdminActor));
+        // transfer ownership away; address(this) remains admin but loses owner role
+        AdminActor newOwnerActor = new AdminActor(operator);
+        operator.transferOwnership(address(newOwnerActor));
 
-        // owner-without-admin is now blocked by onlyAdmin
+        // admin-without-owner is now blocked by onlyOwner
         (ok, ) = address(operator).call(abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), bytes("")));
-        require(!ok, "owner-without-admin upgrade rejected");
+        require(!ok, "admin-without-owner upgrade rejected");
     }
 
     // ─── transferOwnership ───
@@ -830,10 +834,11 @@ contract AntseedBuyerOperatorTest {
         AdminActor newAdminActor = new AdminActor(operator);
         operator.transferAdmin(address(newAdminActor));
         require(operator.admin() == address(newAdminActor), "admin updated");
-        // new admin can exercise onlyAdmin — sweep a token
+        // new admin can exercise operational functions
         usdc.mint(address(operator), 1_000_000);
-        newAdminActor.callSweepToken(address(usdc), recipient, 1_000_000);
-        require(usdc.balanceOf(recipient) == 1_000_000, "new admin swept token");
+        newAdminActor.callAcceptBuyerOperator(buyer, 1);
+        newAdminActor.callDepositFor(buyer, 500_000, 100_000);
+        require(deposits.available(buyer) == 600_000, "new admin funded buyer");
     }
 
     function testTransferAdminRejectsZeroAddress() public {
@@ -842,7 +847,7 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "zero-address transferAdmin rejected");
     }
 
-    function testTransferAdminOnlyCallableByAdmin() public {
+    function testTransferAdminOnlyCallableByOwner() public {
         setUp();
         AdminActor outsider = new AdminActor(operator);
         // outsider (neither owner nor admin) cannot call transferAdmin
@@ -850,52 +855,48 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "outsider cannot transferAdmin");
     }
 
-    function testOwnerAfterAdminTransferCannotCallOnlyAdmin() public {
+    function testAdminAfterOwnershipTransferCannotCallOnlyOwner() public {
         setUp();
-        // Transfer admin away; address(this) remains owner but is no longer admin.
-        AdminActor newAdminActor = new AdminActor(operator);
-        operator.transferAdmin(address(newAdminActor));
+        // Transfer ownership away; address(this) remains admin but is no longer owner.
+        AdminActor newOwnerActor = new AdminActor(operator);
+        operator.transferOwnership(address(newOwnerActor));
 
         usdc.mint(address(operator), 1_000_000);
 
-        // address(this) can no longer call onlyAdmin functions
+        // address(this) can no longer call onlyOwner functions
         (bool ok, ) = address(operator).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), recipient, uint256(1_000_000)));
-        require(!ok, "owner-without-admin cannot sweepToken");
+        require(!ok, "admin-without-owner cannot sweepToken");
 
         (ok, ) = address(operator).call(abi.encodeWithSignature("transferAdmin(address)", address(this)));
-        require(!ok, "owner-without-admin cannot transferAdmin");
+        require(!ok, "admin-without-owner cannot transferAdmin");
     }
 
-    // ─── onlyOwner: admin can also call ───
+    // ─── onlyAdmin: owner can also call ───
 
-    function testAdminCanCallOnlyOwnerFunctions() public {
+    function testOwnerCanCallOnlyAdminFunctions() public {
         setUp();
-        AdminActor adminActor = new AdminActor(operator);
-        operator.transferAdmin(address(adminActor));
         usdc.mint(address(operator), 100_000_000);
 
-        // acceptBuyerOperator via admin
-        adminActor.callAcceptBuyerOperator(buyer, 1);
-        // depositFor via admin
-        adminActor.callDepositFor(buyer, 500_000, 100_000);
-        require(deposits.available(buyer) == 600_000, "admin funded buyer");
-        require(operator.totalPrincipalDeposited(buyer) == 500_000, "principal tracked via admin");
-        require(operator.totalBonusDeposited(buyer) == 100_000, "bonus tracked via admin");
+        operator.acceptBuyerOperator(buyer, 1, "");
+        operator.depositFor(buyer, 500_000, 100_000);
+        require(deposits.available(buyer) == 600_000, "owner funded buyer");
+        require(operator.totalPrincipalDeposited(buyer) == 500_000, "principal tracked via owner");
+        require(operator.totalBonusDeposited(buyer) == 100_000, "bonus tracked via owner");
     }
 
-    function testAdminCanUpgrade() public {
+    function testAdminCannotUpgrade() public {
         setUp();
         AntseedBuyerOperator newImpl = new AntseedBuyerOperator(address(registry));
         AdminActor adminActor = new AdminActor(operator);
         operator.transferAdmin(address(adminActor));
-        // admin (not owner) should be able to trigger upgradeToAndCall
-        adminActor.callUpgrade(address(operator), address(newImpl));
-        require(operator.admin() == address(adminActor), "admin preserved after admin-initiated upgrade");
+        // admin (not owner) cannot trigger upgradeToAndCall
+        (bool ok, ) = address(adminActor).call(abi.encodeWithSignature("callUpgrade(address,address)", address(operator), address(newImpl)));
+        require(!ok, "admin cannot upgrade");
     }
 
-    // ─── onlyOwner: outsider rejected ───
+    // ─── onlyAdmin: outsider rejected ───
 
-    function testOnlyOwnerFunctionsRejectOutsider() public {
+    function testOnlyAdminFunctionsRejectOutsider() public {
         setUp();
         AdminActor outsider = new AdminActor(operator);
 
@@ -937,9 +938,9 @@ contract AntseedBuyerOperatorTest {
 
     // ─── approveCurrentDeposits ───
 
-    function testApproveCurrentDepositsOnlyOwner() public {
+    function testApproveCurrentDepositsOnlyAdmin() public {
         setUp();
-        // owner can call
+        // owner can call admin operations too
         operator.approveCurrentDeposits();
 
         // outsider cannot
@@ -958,7 +959,7 @@ contract AntseedBuyerOperatorTest {
         require(deposits.getOperator(buyer) == newOp, "operator transferred");
     }
 
-    function testTransferBuyerOperatorOnlyOwner() public {
+    function testTransferBuyerOperatorOnlyAdmin() public {
         setUp();
         operator.acceptBuyerOperator(buyer, 1, "");
         AdminActor outsider = new AdminActor(operator);
