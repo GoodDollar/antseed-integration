@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -212,8 +213,8 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
 
         bytes32 structHash = keccak256(abi.encode(WITHDRAW_TYPEHASH, buyer, amount, recipient, timestamp));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-        address signer = _recoverSigner(digest, buyerSig);
-        if (signer != buyer) revert InvalidSignature();
+        address signer = ECDSA.recoverCalldata(digest, buyerSig);
+        if (signer == address(0) || signer != buyer) revert InvalidSignature();
 
         _requireDepositsOperator(buyer);
         _accountForUsage(buyer);
@@ -283,7 +284,8 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
             if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
             bytes32 structHash = keccak256(abi.encode(REVOKE_OPERATOR_TYPEHASH, buyer, timestamp));
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-            if (_recoverSigner(digest, buyerSig) != buyer) revert InvalidSignature();
+            address signer = ECDSA.recover(digest, buyerSig);
+            if (signer == address(0) || signer != buyer) revert InvalidSignature();
         } else {
             _requireBuyerOrAdmin(buyer);
         }
@@ -352,7 +354,8 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
             if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
             bytes32 structHash = keccak256(abi.encode(REQUEST_CLOSE_TYPEHASH, channelId, timestamp));
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-            if (_recoverSigner(digest, buyerSig) != buyer) revert InvalidSignature();
+            address signer = ECDSA.recover(digest, buyerSig);
+            if (signer == address(0) || signer != buyer) revert InvalidSignature();
         } else {
             _requireBuyerOrAdmin(buyer);
         }
@@ -370,7 +373,8 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
             if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
             bytes32 structHash = keccak256(abi.encode(WITHDRAW_CHANNEL_TYPEHASH, channelId, timestamp));
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-            if (_recoverSigner(digest, buyerSig) != buyer) revert InvalidSignature();
+            address signer = ECDSA.recover(digest, buyerSig);
+            if (signer == address(0) || signer != buyer) revert InvalidSignature();
         } else {
             _requireBuyerOrAdmin(buyer);
         }
@@ -432,21 +436,6 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     function _forceApprove(IERC20 token, address spender, uint256 amount) private {
         _safeApprove(token, spender, 0);
         _safeApprove(token, spender, amount);
-    }
-
-    function _recoverSigner(bytes32 digest, bytes memory sig) internal pure returns (address) {
-        if (sig.length != 65) return address(0);
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-        assembly {
-            r := mload(add(sig, 32))
-            s := mload(add(sig, 64))
-            v := byte(0, mload(add(sig, 96)))
-        }
-        if (v < 27) v += 27;
-        if (v != 27 && v != 28) return address(0);
-        return ecrecover(digest, v, r, s);
     }
 
     function _min(uint256 a, uint256 b) private pure returns (uint256) {

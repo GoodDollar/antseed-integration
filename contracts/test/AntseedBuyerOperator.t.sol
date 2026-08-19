@@ -847,7 +847,7 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "zero-address transferAdmin rejected");
     }
 
-    function testTransferAdminOnlyCallableByOwner() public {
+    function testTransferAdminOnlyCallableByAdminOrOwner() public {
         setUp();
         AdminActor outsider = new AdminActor(operator);
         // outsider (neither owner nor admin) cannot call transferAdmin
@@ -867,8 +867,8 @@ contract AntseedBuyerOperatorTest {
         (bool ok, ) = address(operator).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), recipient, uint256(1_000_000)));
         require(!ok, "admin-without-owner cannot sweepToken");
 
-        (ok, ) = address(operator).call(abi.encodeWithSignature("transferAdmin(address)", address(this)));
-        require(!ok, "admin-without-owner cannot transferAdmin");
+        operator.transferAdmin(address(this));
+        require(operator.admin() == address(this), "admin-without-owner can transferAdmin");
     }
 
     // ─── onlyAdmin: owner can also call ───
