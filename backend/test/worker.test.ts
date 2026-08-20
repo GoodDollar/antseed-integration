@@ -1113,6 +1113,41 @@ test("POST /v1/accounts/:account/operator-consent returns enabled:false when vau
   assert.equal(body.bridge.enabled, false);
 });
 
+test("POST /v1/accounts/:account/operator-revoke returns 400 on missing body fields", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${buyer}/operator-revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/accounts/:account/operator-revoke returns enabled:false when vault not configured", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${buyer}/operator-revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nonce: "0",
+        signature: `0x${"a".repeat(130)}`
+      })
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { buyer: string; bridge: { enabled: boolean; nonce: string } };
+  assert.equal(body.buyer, buyer);
+  assert.equal(body.bridge.enabled, false);
+  assert.equal(body.bridge.nonce, "0");
+});
+
 test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(

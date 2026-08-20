@@ -603,6 +603,25 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ buyer, bridge });
   }
 
+  const operatorRevokeMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator-revoke$/);
+  if (request.method === "POST" && operatorRevokeMatch) {
+    const buyer = decodeURIComponent(operatorRevokeMatch[1]).toLowerCase();
+    const body = await parseJson(request);
+    const parsed = OperatorConsentSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    logInfo("operator.revoke.request", {
+      buyer: redactAddress(buyer),
+      nonce: parsed.data.nonce
+    });
+    const bridge = await antseedFundingVault.revokeBuyerOperator(buyer, BigInt(parsed.data.nonce), parsed.data.signature);
+    logInfo("operator.revoke.result", {
+      buyer: redactAddress(buyer),
+      enabled: bridge.enabled,
+      txHash: redactHash(bridge.txHash)
+    });
+    return json({ buyer, bridge });
+  }
+
   const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);
   if (request.method === "POST" && withdrawMatch) {
     const account = decodeURIComponent(withdrawMatch[1]).toLowerCase();

@@ -22,6 +22,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/analytics/refresh`
 - `POST /v1/accounts/:account/stream-credits`
 - `POST /v1/accounts/:account/operator-consent`
+- `POST /v1/accounts/:account/operator-revoke`
 - `POST /v1/accounts/:account/withdraw`
 - `POST /v1/celo/events/record`
 - `POST /v1/channels/:channelId/close`
@@ -41,6 +42,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `{ "account": "0x...", "fromBlock": "0x...", "toBlock": "latest" }`
 
 `GET /v1/analytics` returns daily analytics (last 30 days by default).
+
 - query: `days` (default `30`, max `365`)
 - response: `{ days, daily, global, lastRun }`
 - `daily` — one record per UTC day, newest last; the current day is always recomputed from midnight to now on each refresh and its snapshot is overwritten

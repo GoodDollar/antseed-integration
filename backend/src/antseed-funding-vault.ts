@@ -6,6 +6,7 @@ const FUNDING_VAULT_ABI = [
   "function depositFor(address buyer, uint256 principal, uint256 bonus)",
   "function depositForWithId(address buyer, uint256 principal, uint256 bonus, string id)",
   "function acceptBuyerOperator(address buyer, uint256 nonce, bytes buyerSig)",
+  "function revokeOperator(address buyer, uint256 nonce, bytes buyerSig)",
   "function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 nonce, bytes buyerSig)",
   "function requestClose(bytes32 channelId, uint256 nonce, bytes buyerSig)",
   "function withdrawChannel(bytes32 channelId, uint256 nonce, bytes buyerSig)",
@@ -51,6 +52,21 @@ export class AntSeedFundingVaultClient {
       return { enabled: false, buyer: normalizedBuyer, nonce: nonce.toString() };
     }
     const tx = await this.contract.acceptBuyerOperator(normalizedBuyer, nonce, signature);
+    const receipt = await tx.wait();
+    return {
+      enabled: true,
+      buyer: normalizedBuyer,
+      nonce: nonce.toString(),
+      txHash: receipt?.hash
+    };
+  }
+
+  async revokeBuyerOperator(buyer: string, nonce: bigint, signature: string): Promise<{ enabled: boolean; buyer: string; nonce: string; txHash?: string }> {
+    const normalizedBuyer = buyer.toLowerCase();
+    if (!this.contract) {
+      return { enabled: false, buyer: normalizedBuyer, nonce: nonce.toString() };
+    }
+    const tx = await this.contract.revokeOperator(normalizedBuyer, nonce, signature);
     const receipt = await tx.wait();
     return {
       enabled: true,
