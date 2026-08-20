@@ -38,13 +38,14 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     mapping(address => uint256) public bonusRemaining;
     mapping(address => uint256) public lastAccountedBalance;
     mapping(address => bool) public buyerAccountingMigrated;
+    mapping(address => uint256) public usedNonces;
 
     uint256[50] private __gap;
 
-    bytes32 public constant WITHDRAW_TYPEHASH = keccak256("WithdrawPrincipal(address buyer,uint256 amount,address recipient,uint256 timestamp)");
-    bytes32 public constant REQUEST_CLOSE_TYPEHASH = keccak256("RequestClose(bytes32 channelId,uint256 timestamp)");
-    bytes32 public constant WITHDRAW_CHANNEL_TYPEHASH = keccak256("WithdrawChannel(bytes32 channelId,uint256 timestamp)");
-    bytes32 public constant REVOKE_OPERATOR_TYPEHASH = keccak256("RevokeOperator(address buyer,uint256 timestamp)");
+    bytes32 public constant WITHDRAW_TYPEHASH = keccak256("WithdrawPrincipal(address buyer,uint256 amount,address recipient,uint256 nonce)");
+    bytes32 public constant REQUEST_CLOSE_TYPEHASH = keccak256("RequestClose(bytes32 channelId,uint256 nonce)");
+    bytes32 public constant WITHDRAW_CHANNEL_TYPEHASH = keccak256("WithdrawChannel(bytes32 channelId,uint256 nonce)");
+    bytes32 public constant REVOKE_OPERATOR_TYPEHASH = keccak256("RevokeOperator(address buyer,uint256 nonce)");
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
@@ -71,7 +72,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     error DuplicateDepositId();
     error InsufficientPrincipal();
     error InvalidSignature();
-    error ExpiredSignature();
+    error InvalidNonce();
     error AlreadyMigrated();
     error CloseChannelsBeforeRevoke(uint256 reserved);
 
@@ -206,15 +207,16 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     /// @param amount The amount in USDC micro-units to withdraw.
     /// @param recipient The address to receive the withdrawn USDC.
     /// @param buyerSig The buyer's EIP-712 signature authorizing this withdrawal.
-    function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 timestamp, bytes calldata buyerSig) external nonReentrant {
+    function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 nonce, bytes calldata buyerSig) external nonReentrant {
         if (buyer == address(0) || recipient == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
-        if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
+        if (nonce != usedNonces[buyer]) revert InvalidNonce();
 
-        bytes32 structHash = keccak256(abi.encode(WITHDRAW_TYPEHASH, buyer, amount, recipient, timestamp));
+        bytes32 structHash = keccak256(abi.encode(WITHDRAW_TYPEHASH, buyer, amount, recipient, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
         address signer = ECDSA.recoverCalldata(digest, buyerSig);
         if (signer == address(0) || signer != buyer) revert InvalidSignature();
+        usedNonces[buyer] = nonce + 1;
 
         _requireDepositsOperator(buyer);
         _accountForUsage(buyer);
@@ -279,13 +281,14 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit BuyerOperatorRevoked(buyer);
     }
 
-    function revokeOperator(address buyer, uint256 timestamp, bytes memory buyerSig) public nonReentrant {
+    function revokeOperator(address buyer, uint256 nonce, bytes memory buyerSig) public nonReentrant {
         if (buyerSig.length > 0) {
-            if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
-            bytes32 structHash = keccak256(abi.encode(REVOKE_OPERATOR_TYPEHASH, buyer, timestamp));
+            if (nonce != usedNonces[buyer]) revert InvalidNonce();
+            bytes32 structHash = keccak256(abi.encode(REVOKE_OPERATOR_TYPEHASH, buyer, nonce));
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
             address signer = ECDSA.recover(digest, buyerSig);
             if (signer == address(0) || signer != buyer) revert InvalidSignature();
+            usedNonces[buyer] = nonce + 1;
         } else {
             _requireBuyerOrAdmin(buyer);
         }
@@ -348,14 +351,15 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit BuyerOperatorTransferred(buyer, newOperator);
     }
 
-    function requestClose(bytes32 channelId, uint256 timestamp, bytes memory buyerSig) public nonReentrant {
+    function requestClose(bytes32 channelId, uint256 nonce, bytes memory buyerSig) public nonReentrant {
         address buyer = _channelBuyer(channelId);
         if (buyerSig.length > 0) {
-            if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
-            bytes32 structHash = keccak256(abi.encode(REQUEST_CLOSE_TYPEHASH, channelId, timestamp));
+            if (nonce != usedNonces[buyer]) revert InvalidNonce();
+            bytes32 structHash = keccak256(abi.encode(REQUEST_CLOSE_TYPEHASH, channelId, nonce));
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
             address signer = ECDSA.recover(digest, buyerSig);
             if (signer == address(0) || signer != buyer) revert InvalidSignature();
+            usedNonces[buyer] = nonce + 1;
         } else {
             _requireBuyerOrAdmin(buyer);
         }
@@ -367,14 +371,15 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         requestClose(channelId, 0, "");
     }
 
-    function withdrawChannel(bytes32 channelId, uint256 timestamp, bytes memory buyerSig) public nonReentrant {
+    function withdrawChannel(bytes32 channelId, uint256 nonce, bytes memory buyerSig) public nonReentrant {
         address buyer = _channelBuyer(channelId);
         if (buyerSig.length > 0) {
-            if (timestamp > block.timestamp || block.timestamp - timestamp > 5 minutes) revert ExpiredSignature();
-            bytes32 structHash = keccak256(abi.encode(WITHDRAW_CHANNEL_TYPEHASH, channelId, timestamp));
+            if (nonce != usedNonces[buyer]) revert InvalidNonce();
+            bytes32 structHash = keccak256(abi.encode(WITHDRAW_CHANNEL_TYPEHASH, channelId, nonce));
             bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
             address signer = ECDSA.recover(digest, buyerSig);
             if (signer == address(0) || signer != buyer) revert InvalidSignature();
+            usedNonces[buyer] = nonce + 1;
         } else {
             _requireBuyerOrAdmin(buyer);
         }

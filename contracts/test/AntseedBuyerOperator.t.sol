@@ -191,8 +191,8 @@ contract BuyerCaller {
         operator = operator_;
     }
 
-    function callWithdrawPrincipal(uint256 amount, address recipient, uint256 timestamp, bytes calldata buyerSig) external returns (bool) {
-        try operator.withdrawPrincipal(address(this), amount, recipient, timestamp, buyerSig) {
+    function callWithdrawPrincipal(uint256 amount, address recipient, uint256 nonce, bytes calldata buyerSig) external returns (bool) {
+        try operator.withdrawPrincipal(address(this), amount, recipient, nonce, buyerSig) {
             return true;
         } catch {
             return false;
@@ -231,29 +231,29 @@ contract AntseedBuyerOperatorTest {
         operator = AntseedBuyerOperator(address(proxy));
     }
 
-    function _signWithdraw(uint256 pk, address buyerAddr, uint256 amount, address to, uint256 timestamp) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(abi.encode(operator.WITHDRAW_TYPEHASH(), buyerAddr, amount, to, timestamp));
+    function _signWithdraw(uint256 pk, address buyerAddr, uint256 amount, address to, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(operator.WITHDRAW_TYPEHASH(), buyerAddr, amount, to, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    function _signRequestClose(uint256 pk, bytes32 channelId, uint256 timestamp) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(abi.encode(operator.REQUEST_CLOSE_TYPEHASH(), channelId, timestamp));
+    function _signRequestClose(uint256 pk, bytes32 channelId, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(operator.REQUEST_CLOSE_TYPEHASH(), channelId, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    function _signWithdrawChannel(uint256 pk, bytes32 channelId, uint256 timestamp) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(abi.encode(operator.WITHDRAW_CHANNEL_TYPEHASH(), channelId, timestamp));
+    function _signWithdrawChannel(uint256 pk, bytes32 channelId, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(operator.WITHDRAW_CHANNEL_TYPEHASH(), channelId, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    function _signRevokeOperator(uint256 pk, address buyerAddr, uint256 timestamp) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(abi.encode(operator.REVOKE_OPERATOR_TYPEHASH(), buyerAddr, timestamp));
+    function _signRevokeOperator(uint256 pk, address buyerAddr, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(operator.REVOKE_OPERATOR_TYPEHASH(), buyerAddr, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
@@ -391,27 +391,26 @@ contract AntseedBuyerOperatorTest {
         require(operator.withdrawablePrincipal(buyerAddr) == 8_000_000, "full principal withdrawable");
 
         // Withdraw part of principal
-        uint256 ts1 = block.timestamp;
-        bytes memory sig1 = _signWithdraw(BUYER_PK, buyerAddr, 3_000_000, recipient, ts1);
-        operator.withdrawPrincipal(buyerAddr, 3_000_000, recipient, ts1, sig1);
+        uint256 nonce1 = operator.usedNonces(buyerAddr);
+        bytes memory sig1 = _signWithdraw(BUYER_PK, buyerAddr, 3_000_000, recipient, nonce1);
+        operator.withdrawPrincipal(buyerAddr, 3_000_000, recipient, nonce1, sig1);
         require(usdc.balanceOf(recipient) == 3_000_000, "recipient received funds");
         require(operator.totalPrincipalWithdrawn(buyerAddr) == 3_000_000, "withdrawn tracked");
         require(operator.withdrawablePrincipal(buyerAddr) == 5_000_000, "remaining withdrawable");
+        require(operator.usedNonces(buyerAddr) == nonce1 + 1, "nonce incremented after withdraw");
 
         // Withdraw rest of principal
-        vm.warp(block.timestamp + 1);
-        uint256 ts2 = block.timestamp;
-        bytes memory sig2 = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, ts2);
-        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, ts2, sig2);
+        uint256 nonce2 = operator.usedNonces(buyerAddr);
+        bytes memory sig2 = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, nonce2);
+        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, nonce2, sig2);
         require(usdc.balanceOf(recipient) == 8_000_000, "recipient received all principal");
         require(operator.withdrawablePrincipal(buyerAddr) == 0, "nothing left");
 
         // Cannot withdraw more than principal (bonus not withdrawable)
-        vm.warp(block.timestamp + 1);
-        uint256 ts3 = block.timestamp;
-        bytes memory sig3 = _signWithdraw(BUYER_PK, buyerAddr, 1, recipient, ts3);
+        uint256 nonce3 = operator.usedNonces(buyerAddr);
+        bytes memory sig3 = _signWithdraw(BUYER_PK, buyerAddr, 1, recipient, nonce3);
         bool ok;
-        try operator.withdrawPrincipal(buyerAddr, 1, recipient, ts3, sig3) {
+        try operator.withdrawPrincipal(buyerAddr, 1, recipient, nonce3, sig3) {
             ok = true;
         } catch {
             ok = false;
@@ -431,9 +430,9 @@ contract AntseedBuyerOperatorTest {
         require(deposits.available(buyerAddr) == 7_000_000, "full deposit in vault");
         require(operator.withdrawablePrincipal(buyerAddr) == 5_000_000, "only principal withdrawable");
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, ts);
-        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, ts, sig);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, nonce);
+        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, nonce, sig);
 
         // Recipient received only the principal
         require(usdc.balanceOf(recipient) == 5_000_000, "recipient got principal");
@@ -500,14 +499,15 @@ contract AntseedBuyerOperatorTest {
         operator.acceptBuyerOperator(buyerAddr, 1, "");
         operator.depositFor(buyerAddr, 4_000_000, 1_000_000);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signRevokeOperator(BUYER_PK, buyerAddr, ts);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signRevokeOperator(BUYER_PK, buyerAddr, nonce);
 
-        operator.revokeOperator(buyerAddr, ts, sig);
+        operator.revokeOperator(buyerAddr, nonce, sig);
 
         require(deposits.getOperator(buyerAddr) == address(0), "operator revoked");
         require(deposits.available(buyerAddr) == 4_000_000, "bonus reclaimed before revoke");
         require(operator.totalBonusWithdrawn(buyerAddr) == 1_000_000, "bonus withdrawal tracked");
+        require(operator.usedNonces(buyerAddr) == nonce + 1, "nonce incremented after revoke");
     }
 
     function testRevokeOperatorRejectsWrongSigner() public {
@@ -518,11 +518,11 @@ contract AntseedBuyerOperatorTest {
         operator.acceptBuyerOperator(buyerAddr, 1, "");
         operator.depositFor(buyerAddr, 4_000_000, 1_000_000);
 
-        uint256 ts = block.timestamp;
-        bytes memory badSig = _signRevokeOperator(0xDEAD, buyerAddr, ts);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory badSig = _signRevokeOperator(0xDEAD, buyerAddr, nonce);
 
         bool ok;
-        try operator.revokeOperator(buyerAddr, ts, badSig) {
+        try operator.revokeOperator(buyerAddr, nonce, badSig) {
             ok = true;
         } catch {
             ok = false;
@@ -530,7 +530,7 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "wrong signer rejected");
     }
 
-    function testRevokeOperatorRejectsExpiredTimestamp() public {
+    function testRevokeOperatorRejectsInvalidNonce() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
 
@@ -538,18 +538,16 @@ contract AntseedBuyerOperatorTest {
         operator.acceptBuyerOperator(buyerAddr, 1, "");
         operator.depositFor(buyerAddr, 4_000_000, 1_000_000);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signRevokeOperator(BUYER_PK, buyerAddr, ts);
-
-        vm.warp(ts + 6 minutes);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signRevokeOperator(BUYER_PK, buyerAddr, nonce);
 
         bool ok;
-        try operator.revokeOperator(buyerAddr, ts, sig) {
+        try operator.revokeOperator(buyerAddr, nonce + 1, sig) {
             ok = true;
         } catch {
             ok = false;
         }
-        require(!ok, "expired timestamp rejected");
+        require(!ok, "invalid nonce rejected");
     }
 
     function testMigrateBuyerAccountingComputesRemainingFromTrackedTotals() public {
@@ -649,10 +647,10 @@ contract AntseedBuyerOperatorTest {
 
         // Sign with a different private key (not the buyer)
         uint256 wrongPk = 0xDEAD;
-        uint256 ts = block.timestamp;
-        bytes memory badSig = _signWithdraw(wrongPk, buyerAddr, 1_000_000, recipient, ts);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory badSig = _signWithdraw(wrongPk, buyerAddr, 1_000_000, recipient, nonce);
         bool ok;
-        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, ts, badSig) {
+        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, nonce, badSig) {
             ok = true;
         } catch {
             ok = false;
@@ -660,7 +658,7 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "wrong signer rejected");
     }
 
-    function testWithdrawPrincipalRejectsExpiredTimestamp() public {
+    function testWithdrawPrincipalRejectsInvalidNonce() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
 
@@ -668,19 +666,16 @@ contract AntseedBuyerOperatorTest {
         operator.acceptBuyerOperator(buyerAddr, 1, "");
         operator.depositFor(buyerAddr, 10_000_000, 0);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 1_000_000, recipient, ts);
-
-        // Warp 6 minutes into the future so the timestamp is expired
-        vm.warp(ts + 6 minutes);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 1_000_000, recipient, nonce);
 
         bool ok;
-        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, ts, sig) {
+        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, nonce + 1, sig) {
             ok = true;
         } catch {
             ok = false;
         }
-        require(!ok, "expired timestamp rejected");
+        require(!ok, "invalid nonce rejected");
     }
 
     function testRequestCloseWithBuyerSig() public {
@@ -689,10 +684,11 @@ contract AntseedBuyerOperatorTest {
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signRequestClose(BUYER_PK, channelId, ts);
-        operator.requestClose(channelId, ts, sig);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signRequestClose(BUYER_PK, channelId, nonce);
+        operator.requestClose(channelId, nonce, sig);
         require(channels.requestCloseCalls() == 1, "requestClose forwarded");
+        require(operator.usedNonces(buyerAddr) == nonce + 1, "nonce incremented after requestClose");
     }
 
     function testRequestCloseRejectsWrongSigner() public {
@@ -701,10 +697,10 @@ contract AntseedBuyerOperatorTest {
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory badSig = _signRequestClose(0xDEAD, channelId, ts);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory badSig = _signRequestClose(0xDEAD, channelId, nonce);
         bool ok;
-        try operator.requestClose(channelId, ts, badSig) {
+        try operator.requestClose(channelId, nonce, badSig) {
             ok = true;
         } catch {
             ok = false;
@@ -712,22 +708,21 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "wrong signer rejected");
     }
 
-    function testRequestCloseRejectsExpiredTimestamp() public {
+    function testRequestCloseRejectsInvalidNonce() public {
         setUp();
         bytes32 channelId = keccak256("channel-sig");
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signRequestClose(BUYER_PK, channelId, ts);
-        vm.warp(ts + 6 minutes);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signRequestClose(BUYER_PK, channelId, nonce);
         bool ok;
-        try operator.requestClose(channelId, ts, sig) {
+        try operator.requestClose(channelId, nonce + 1, sig) {
             ok = true;
         } catch {
             ok = false;
         }
-        require(!ok, "expired timestamp rejected");
+        require(!ok, "invalid nonce rejected");
     }
 
     function testWithdrawChannelWithBuyerSig() public {
@@ -736,10 +731,11 @@ contract AntseedBuyerOperatorTest {
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, ts);
-        operator.withdrawChannel(channelId, ts, sig);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, nonce);
+        operator.withdrawChannel(channelId, nonce, sig);
         require(channels.withdrawCalls() == 1, "withdrawChannel forwarded");
+        require(operator.usedNonces(buyerAddr) == nonce + 1, "nonce incremented after withdrawChannel");
     }
 
     function testWithdrawChannelRejectsWrongSigner() public {
@@ -748,10 +744,10 @@ contract AntseedBuyerOperatorTest {
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory badSig = _signWithdrawChannel(0xDEAD, channelId, ts);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory badSig = _signWithdrawChannel(0xDEAD, channelId, nonce);
         bool ok;
-        try operator.withdrawChannel(channelId, ts, badSig) {
+        try operator.withdrawChannel(channelId, nonce, badSig) {
             ok = true;
         } catch {
             ok = false;
@@ -759,22 +755,21 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "wrong signer rejected");
     }
 
-    function testWithdrawChannelRejectsExpiredTimestamp() public {
+    function testWithdrawChannelRejectsInvalidNonce() public {
         setUp();
         bytes32 channelId = keccak256("channel-sig");
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, ts);
-        vm.warp(ts + 6 minutes);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, nonce);
         bool ok;
-        try operator.withdrawChannel(channelId, ts, sig) {
+        try operator.withdrawChannel(channelId, nonce + 1, sig) {
             ok = true;
         } catch {
             ok = false;
         }
-        require(!ok, "expired timestamp rejected");
+        require(!ok, "invalid nonce rejected");
     }
 
     function testCannotReinitialize() public {

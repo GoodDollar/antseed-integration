@@ -46,7 +46,7 @@ const StreamUpdateSchema = z.object({
 const WithdrawPrincipalSchema = z.object({
   amount: z.string().regex(/^\d+$/),
   recipient: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-  timestamp: z.number().int().nonnegative(),
+  nonce: z.string().regex(/^\d+$/),
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
 const OperatorConsentSchema = z.object({
@@ -68,7 +68,7 @@ const CreditHistoryQuerySchema = z.object({
     .optional()
 });
 const ChannelOpSchema = z.object({
-  timestamp: z.number().int().nonnegative().optional(),
+  nonce: z.string().regex(/^\d+$/).optional(),
   signature: z
     .string()
     .regex(/^0x[0-9a-fA-F]+$/)
@@ -618,7 +618,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       account,
       BigInt(parsed.data.amount),
       parsed.data.recipient,
-      parsed.data.timestamp,
+      BigInt(parsed.data.nonce),
       parsed.data.signature
     );
     logInfo("withdraw.result", {
@@ -636,17 +636,18 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const body = request.headers.get("content-length") !== "0" ? await parseJson(request) : {};
     const parsed = ChannelOpSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const { timestamp, signature } = parsed.data;
+    const { nonce, signature } = parsed.data;
     logInfo("channel.request", {
       action,
       channelId: redactHash(channelId),
-      hasTimestamp: timestamp !== undefined,
+      hasNonce: nonce !== undefined,
       hasSignature: Boolean(signature)
     });
+    const parsedNonce = nonce === undefined ? undefined : BigInt(nonce);
     const bridge =
       action === "close"
-        ? await antseedFundingVault.requestClose(channelId, timestamp, signature)
-        : await antseedFundingVault.withdrawFromChannel(channelId, timestamp, signature);
+        ? await antseedFundingVault.requestClose(channelId, parsedNonce, signature)
+        : await antseedFundingVault.withdrawFromChannel(channelId, parsedNonce, signature);
     logInfo("channel.result", {
       action,
       channelId: redactHash(channelId),
@@ -767,7 +768,11 @@ function nextUtcDate(date: string): string | undefined {
   return parsed.toISOString().slice(0, 10);
 }
 
-async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFundingVault: AntSeedFundingVaultClient): Promise<{ [key: string]: unknown }> {
+export async function fundCredit(
+  entry: GdCreditEntry,
+  store: KVCreditStore,
+  antseedFundingVault: AntSeedFundingVaultClient
+): Promise<{ [key: string]: unknown }> {
   const buyer = entry.buyerAddress || entry.account;
   if (entry.fundingStatus === "funded") {
     logInfo("funding.already-funded", {
@@ -800,16 +805,29 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     totalCreditUsd: entry.totalCreditUsd
   });
   try {
+    const isBonusOnly = principalUsd === 0n && bonusUsd > 0n;
+    const operatorStatus = isBonusOnly ? await antseedFundingVault.isBuyerOperator(buyer) : undefined;
+    const skipBonusOnly = isBonusOnly && operatorStatus?.enabled === true && !operatorStatus.isOperator;
     const bridge =
-      principalUsd + bonusUsd > 0n
+      principalUsd + bonusUsd > 0n && !skipBonusOnly
         ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
-        : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
+        : { enabled: antseedFundingVault.enabled, buyer, amountUsd: skipBonusOnly ? entry.totalCreditUsd : "0" };
     if (principalUsd + bonusUsd === 0n) {
       logInfo("funding.skipped.zero-amount", {
         entryId: entry.id,
         source: entry.source,
         account: redactAddress(entry.account),
         buyer: redactAddress(buyer)
+      });
+    } else if (skipBonusOnly) {
+      logInfo("funding.skipped.bonus-only", {
+        entryId: entry.id,
+        source: entry.source,
+        account: redactAddress(entry.account),
+        buyer: redactAddress(buyer),
+        bonusUsd: entry.bonusUsd,
+        operatorCheckEnabled: operatorStatus?.enabled,
+        isOperator: operatorStatus?.isOperator
       });
     } else if (!bridge.enabled) {
       logWarn("funding.bridge.disabled", {
@@ -821,7 +839,8 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     const updated = await store.markFundingResult(entry, {
       funded: true,
       txHash: bridge.txHash,
-      error: undefined
+      error: undefined,
+      credited: !skipBonusOnly
     });
     logInfo("funding.success", {
       entryId: entry.id,

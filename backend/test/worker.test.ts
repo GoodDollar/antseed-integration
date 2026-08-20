@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface } from "ethers";
-import worker from "../src/worker.js";
+import worker, { fundCredit } from "../src/worker.js";
 import { Env } from "../src/env.js";
+import { KVCreditStore } from "../src/kv-credit-store.js";
 import { encodeVaultEventLog } from "../src/celo-events.js";
+import { GdCreditEntry } from "../src/types.js";
 
 class MemoryKV {
   private data = new Map<string, string>();
@@ -1054,7 +1056,7 @@ test("POST /v1/channels/:channelId/close with optional sig fields passes validat
     new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ timestamp: 1234567890, signature: `0x${"b".repeat(130)}` })
+      body: JSON.stringify({ nonce: "0", signature: `0x${"b".repeat(130)}` })
     }),
     env(),
     makeExecutionContext()
@@ -1134,7 +1136,7 @@ test("POST /v1/accounts/:account/withdraw returns 400 on invalid recipient addre
       body: JSON.stringify({
         amount: "5000000",
         recipient: "not-an-address",
-        timestamp: 1234567890,
+        nonce: "0",
         signature: `0x${"b".repeat(130)}`
       })
     }),
@@ -1154,7 +1156,7 @@ test("POST /v1/accounts/:account/withdraw returns enabled:false when vault not c
       body: JSON.stringify({
         amount: "5000000",
         recipient,
-        timestamp: 1234567890,
+        nonce: "0",
         signature: `0x${"b".repeat(130)}`
       })
     }),
@@ -1451,6 +1453,100 @@ test("GET /v1/accounts/:account/outstanding returns failed funding entries", asy
   assert.equal(body.failedFundingCredits.length, 1);
   assert.equal(body.failedFundingCredits[0].fundingStatus, "failed");
   assert.equal(body.failedFundingCredits[0].fundingError, "vault reverted");
+});
+
+test("fundCredit skips bonus-only credits without calling Base funding when buyer revoked operator", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  const entry: GdCreditEntry = {
+    id: "stream:bonus-only:test",
+    account: account.toLowerCase(),
+    rootAccount: account.toLowerCase(),
+    source: "streamUpdate",
+    gdAmountWei: "0",
+    principalUsd: "0",
+    bonusUsd: "40",
+    totalCreditUsd: "40",
+    fundingStatus: "pending",
+    createdAt: new Date().toISOString(),
+    streamUpdateMonth: "2026-08",
+    buyerAddress: buyer.toLowerCase()
+  };
+  await kv.put(`user:${account.toLowerCase()}`, JSON.stringify({ account: account.toLowerCase(), totalOutstandingFundingUsd: "40" }));
+
+  let depositCalls = 0;
+  const vault = {
+    enabled: true,
+    async isBuyerOperator() {
+      return { enabled: true, buyer: buyer.toLowerCase(), isOperator: false };
+    },
+    async depositForBuyerWithId() {
+      depositCalls += 1;
+      throw new Error("deposit should not be called");
+    }
+  };
+
+  const result = await fundCredit(entry, store, vault as never);
+  const updatedEntry = (await kv.get("gd-credit:stream:bonus-only:test", "json")) as GdCreditEntry;
+  const profile = (await kv.get(`user:${account.toLowerCase()}`, "json")) as { totalOutstandingFundingUsd: string; totalBonusUsd: string };
+
+  assert.equal(depositCalls, 0);
+  assert.equal(updatedEntry.fundingStatus, "funded");
+  assert.equal(updatedEntry.fundingTxHash, undefined);
+  assert.equal(profile.totalOutstandingFundingUsd, "0");
+  assert.equal(profile.totalBonusUsd, "0");
+  assert.deepEqual(result.bridge, { enabled: true, buyer: buyer.toLowerCase(), amountUsd: "40" });
+});
+
+test("fundCredit deposits bonus-only credits when buyer still uses operator", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  const entry: GdCreditEntry = {
+    id: "stream:bonus-only:operator:test",
+    account: account.toLowerCase(),
+    rootAccount: account.toLowerCase(),
+    source: "streamUpdate",
+    gdAmountWei: "0",
+    principalUsd: "0",
+    bonusUsd: "40",
+    totalCreditUsd: "40",
+    fundingStatus: "pending",
+    createdAt: new Date().toISOString(),
+    streamUpdateMonth: "2026-08",
+    buyerAddress: buyer.toLowerCase()
+  };
+  await kv.put(`user:${account.toLowerCase()}`, JSON.stringify({ account: account.toLowerCase(), totalOutstandingFundingUsd: "40" }));
+
+  let depositCalls = 0;
+  const vault = {
+    enabled: true,
+    async isBuyerOperator() {
+      return { enabled: true, buyer: buyer.toLowerCase(), isOperator: true };
+    },
+    async depositForBuyerWithId(_buyer: string, principalUsd: bigint, bonusUsd: bigint, id: string) {
+      depositCalls += 1;
+      assert.equal(_buyer, buyer.toLowerCase());
+      assert.equal(principalUsd, 0n);
+      assert.equal(bonusUsd, 40n);
+      assert.equal(id, entry.id);
+      return { enabled: true, buyer: _buyer, amountUsd: "40", txHash: "0xfunded" };
+    }
+  };
+
+  const result = await fundCredit(entry, store, vault as never);
+  const updatedEntry = (await kv.get("gd-credit:stream:bonus-only:operator:test", "json")) as GdCreditEntry;
+  const profile = (await kv.get(`user:${account.toLowerCase()}`, "json")) as { totalOutstandingFundingUsd: string; totalBonusUsd: string };
+
+  assert.equal(depositCalls, 1);
+  assert.equal(updatedEntry.fundingStatus, "funded");
+  assert.equal(updatedEntry.fundingTxHash, "0xfunded");
+  assert.equal(profile.totalOutstandingFundingUsd, "0");
+  assert.equal(profile.totalBonusUsd, "40");
+  assert.deepEqual(result.bridge, { enabled: true, buyer: buyer.toLowerCase(), amountUsd: "40", txHash: "0xfunded" });
 });
 
 test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued within 24h", { concurrency: false }, async () => {

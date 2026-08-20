@@ -115,7 +115,10 @@ export class KVCreditStore {
     return entry;
   }
 
-  async markFundingResult(entry: GdCreditEntry, result: { funded: boolean; id?: string; txHash?: string; error?: string }): Promise<GdCreditEntry> {
+  async markFundingResult(
+    entry: GdCreditEntry,
+    result: { funded: boolean; id?: string; txHash?: string; error?: string; credited?: boolean }
+  ): Promise<GdCreditEntry> {
     if (entry.fundingStatus === "funded" || entry.fundingStatus === "failed") {
       logWarn("kv.funding.already-terminal", {
         entryId: entry.id,
@@ -132,6 +135,7 @@ export class KVCreditStore {
 
     if (result.funded) {
       const now = new Date().toISOString();
+      const credited = result.credited !== false;
       await this.updateUser(entry.account, entry.rootAccount, (current) => {
         const outstanding = BigInt(current.totalOutstandingFundingUsd);
         const creditAmount = BigInt(entry.totalCreditUsd);
@@ -139,8 +143,8 @@ export class KVCreditStore {
           ...current,
           updatedAt: now,
           lastStreamCreditAt: entry.source.startsWith("stream") ? now : current.lastStreamCreditAt,
-          totalPrincipalUsd: (BigInt(current.totalPrincipalUsd) + BigInt(entry.principalUsd)).toString(),
-          totalBonusUsd: (BigInt(current.totalBonusUsd) + BigInt(entry.bonusUsd)).toString(),
+          totalPrincipalUsd: (BigInt(current.totalPrincipalUsd) + (credited ? BigInt(entry.principalUsd) : 0n)).toString(),
+          totalBonusUsd: (BigInt(current.totalBonusUsd) + (credited ? BigInt(entry.bonusUsd) : 0n)).toString(),
           totalOutstandingFundingUsd: (outstanding > creditAmount ? outstanding - creditAmount : 0n).toString()
         };
       });

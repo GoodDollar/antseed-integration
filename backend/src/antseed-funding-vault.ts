@@ -6,11 +6,14 @@ const FUNDING_VAULT_ABI = [
   "function depositFor(address buyer, uint256 principal, uint256 bonus)",
   "function depositForWithId(address buyer, uint256 principal, uint256 bonus, string id)",
   "function acceptBuyerOperator(address buyer, uint256 nonce, bytes buyerSig)",
-  "function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 timestamp, bytes buyerSig)",
-  "function requestClose(bytes32 channelId, uint256 timestamp, bytes buyerSig)",
-  "function withdrawChannel(bytes32 channelId, uint256 timestamp, bytes buyerSig)",
+  "function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 nonce, bytes buyerSig)",
+  "function requestClose(bytes32 channelId, uint256 nonce, bytes buyerSig)",
+  "function withdrawChannel(bytes32 channelId, uint256 nonce, bytes buyerSig)",
+  "function registry() view returns (address)",
   "function usedDepositIds(bytes32 id) view returns (bool)"
 ] as const;
+const REGISTRY_ABI = ["function deposits() view returns (address)"] as const;
+const DEPOSITS_ABI = ["function getOperator(address buyer) view returns (address)"] as const;
 
 export type AntSeedFundingResult = {
   enabled: boolean;
@@ -29,11 +32,7 @@ export class AntSeedFundingVaultClient {
   }
 
   constructor(private readonly cfg: RuntimeConfig) {
-    this.enabled = Boolean(
-      cfg.ANTSEED_FUNDING_RPC_URL &&
-      cfg.ANTSEED_FUNDING_VAULT_ADDRESS &&
-      cfg.ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY
-    );
+    this.enabled = Boolean(cfg.ANTSEED_FUNDING_RPC_URL && cfg.ANTSEED_FUNDING_VAULT_ADDRESS && cfg.ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY);
     if (this.enabled) {
       const provider = new ethers.JsonRpcProvider(cfg.ANTSEED_FUNDING_RPC_URL);
       const signer = new ethers.Wallet(cfg.ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY!, provider);
@@ -46,11 +45,7 @@ export class AntSeedFundingVaultClient {
     });
   }
 
-  async acceptBuyerOperator(
-    buyer: string,
-    nonce: bigint,
-    signature: string
-  ): Promise<{ enabled: boolean; buyer: string; nonce: string; txHash?: string }> {
+  async acceptBuyerOperator(buyer: string, nonce: bigint, signature: string): Promise<{ enabled: boolean; buyer: string; nonce: string; txHash?: string }> {
     const normalizedBuyer = buyer.toLowerCase();
     if (!this.contract) {
       return { enabled: false, buyer: normalizedBuyer, nonce: nonce.toString() };
@@ -141,23 +136,46 @@ export class AntSeedFundingVaultClient {
     }
   }
 
-  async withdrawPrincipalForBuyer(buyer: string, amountUsd: bigint, recipient: string, timestamp: number, signature: string): Promise<{ enabled: boolean; txHash?: string }> {
+  async isBuyerOperator(buyer: string): Promise<{ enabled: boolean; buyer: string; isOperator: boolean }> {
+    const normalizedBuyer = buyer.toLowerCase();
+    if (!this.contract) return { enabled: false, buyer: normalizedBuyer, isOperator: false };
+
+    const operatorAddress = await this.contract.getAddress();
+    const registryAddress = await this.contract.registry();
+    const registry = new ethers.Contract(registryAddress, REGISTRY_ABI, this.contract.runner);
+    const depositsAddress = await registry.deposits();
+    const deposits = new ethers.Contract(depositsAddress, DEPOSITS_ABI, this.contract.runner);
+    const currentOperator = await deposits.getOperator(normalizedBuyer);
+    return {
+      enabled: true,
+      buyer: normalizedBuyer,
+      isOperator: String(currentOperator).toLowerCase() === String(operatorAddress).toLowerCase()
+    };
+  }
+
+  async withdrawPrincipalForBuyer(
+    buyer: string,
+    amountUsd: bigint,
+    recipient: string,
+    nonce: bigint,
+    signature: string
+  ): Promise<{ enabled: boolean; txHash?: string }> {
     if (!this.contract) return { enabled: false };
-    const tx = await this.contract.withdrawPrincipal(buyer, amountUsd, recipient, timestamp, signature);
+    const tx = await this.contract.withdrawPrincipal(buyer, amountUsd, recipient, nonce, signature);
     const receipt = await tx.wait();
     return { enabled: true, txHash: receipt?.hash };
   }
 
-  async requestClose(channelId: string, timestamp?: number, buyerSig?: string): Promise<{ enabled: boolean; txHash?: string }> {
+  async requestClose(channelId: string, nonce?: bigint, buyerSig?: string): Promise<{ enabled: boolean; txHash?: string }> {
     if (!this.contract) return { enabled: false };
-    const tx = await this.contract.requestClose(channelId, timestamp ?? 0, buyerSig ?? "0x");
+    const tx = await this.contract.requestClose(channelId, nonce ?? 0n, buyerSig ?? "0x");
     const receipt = await tx.wait();
     return { enabled: true, txHash: receipt?.hash };
   }
 
-  async withdrawFromChannel(channelId: string, timestamp?: number, buyerSig?: string): Promise<{ enabled: boolean; txHash?: string }> {
+  async withdrawFromChannel(channelId: string, nonce?: bigint, buyerSig?: string): Promise<{ enabled: boolean; txHash?: string }> {
     if (!this.contract) return { enabled: false };
-    const tx = await this.contract.withdrawChannel(channelId, timestamp ?? 0, buyerSig ?? "0x");
+    const tx = await this.contract.withdrawChannel(channelId, nonce ?? 0n, buyerSig ?? "0x");
     const receipt = await tx.wait();
     return { enabled: true, txHash: receipt?.hash };
   }
