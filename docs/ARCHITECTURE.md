@@ -80,6 +80,11 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - body: `amount` (USDC micro-units), `recipient`, `nonce`, buyer EIP-712 `signature`
 - calls `AntseedBuyerOperator.withdrawPrincipal(buyer, amount, recipient, nonce, buyerSig)`
 
+**Operator revoke** (`POST /v1/accounts/:account/operator-revoke`):
+
+- body: `nonce`, buyer EIP-712 `signature`
+- calls `AntseedBuyerOperator.revokeOperator(buyer, nonce, buyerSig)`
+
 **Channel close** (`POST /v1/channels/:channelId/close`):
 
 - optional buyer EIP-712 `RequestClose` (`nonce`, `signature`) or operator-as-owner when unsigned
