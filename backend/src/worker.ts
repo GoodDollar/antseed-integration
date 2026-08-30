@@ -175,6 +175,8 @@ export default {
         continue;
       }
       const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
+      const isValidForBonus = !!rootAccount && (await antseedFundingVault.isBuyerOperator(stream.buyerAddress || "")).isOperator;
+
       const depositId = createStreamFundingId(stream.account, new Date(createdAt));
       const entry = await store.recordGdCredit({
         id: depositId,
@@ -183,7 +185,7 @@ export default {
         source: "streamCron",
         gdAmountWei: BigInt(gdAmountWei),
         flowRate: BigInt(stream.flowRateWeiPerSecond),
-        isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+        isVerified: isValidForBonus, // if root acccount was found it is whitelisted & operator set
         gdPrice,
         maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
         regularBonusBps: cfg.REGULAR_BONUS_BPS,
@@ -404,6 +406,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const gdPrice = await fetchCurrentGdPrice(cfg);
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
+      const isValidForBonus = !!rootAccount && (await antseedFundingVault.isBuyerOperator(stream.buyerAddress || "")).isOperator;
+
       if (event.kind === "deposit") {
         if (event.gdAmountWei === 0n) {
           logInfo("celo.events.record.deposit.skipped.zero-amount", {
@@ -422,7 +426,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           gdAmountWei: event.gdAmountWei,
           txHash: event.txHash,
           logIndex: event.logIndex,
-          isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+          isVerified: isValidForBonus, // if root acccount was found it is whitelisted & operator set
           gdPrice,
           maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
           regularBonusBps: cfg.REGULAR_BONUS_BPS,
@@ -498,7 +502,9 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const account = decodeURIComponent(streamCreditsMatch[1]).toLowerCase();
     const profile = await store.getUser(account);
     const rootAccount = await fetchGoodIdRoot(account, cfg);
-    const isVerified = !!rootAccount;
+    const isValidForBonus = !!rootAccount && (await antseedFundingVault.isBuyerOperator(stream.buyerAddress || "")).isOperator;
+
+    const isVerified = isValidForBonus;
     const streams = await fetchSuperfluidStreamsForAccount(account, cfg);
     logInfo("stream.credits.start", {
       account: redactAddress(account),
@@ -824,29 +830,16 @@ export async function fundCredit(
     totalCreditUsd: entry.totalCreditUsd
   });
   try {
-    const isBonusOnly = principalUsd === 0n && bonusUsd > 0n;
-    const operatorStatus = isBonusOnly ? await antseedFundingVault.isBuyerOperator(buyer) : undefined;
-    const skipBonusOnly = isBonusOnly && operatorStatus?.enabled === true && !operatorStatus.isOperator;
-    const bridge =
-      principalUsd + bonusUsd > 0n && !skipBonusOnly
-        ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
-        : { enabled: antseedFundingVault.enabled, buyer, amountUsd: skipBonusOnly ? entry.totalCreditUsd : "0" };
-    if (principalUsd + bonusUsd === 0n) {
+    const shouldCredit = principalUsd + bonusUsd > 0n;
+    const bridge = shouldCredit
+      ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
+      : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
+    if (!shouldCredit) {
       logInfo("funding.skipped.zero-amount", {
         entryId: entry.id,
         source: entry.source,
         account: redactAddress(entry.account),
         buyer: redactAddress(buyer)
-      });
-    } else if (skipBonusOnly) {
-      logInfo("funding.skipped.bonus-only", {
-        entryId: entry.id,
-        source: entry.source,
-        account: redactAddress(entry.account),
-        buyer: redactAddress(buyer),
-        bonusUsd: entry.bonusUsd,
-        operatorCheckEnabled: operatorStatus?.enabled,
-        isOperator: operatorStatus?.isOperator
       });
     } else if (!bridge.enabled) {
       logWarn("funding.bridge.disabled", {
@@ -859,7 +852,7 @@ export async function fundCredit(
       funded: true,
       txHash: bridge.txHash,
       error: undefined,
-      credited: !skipBonusOnly
+      credited: shouldCredit
     });
     logInfo("funding.success", {
       entryId: entry.id,
