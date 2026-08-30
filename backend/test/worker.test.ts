@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Interface } from "ethers";
+import { Interface, Wallet } from "ethers";
 import worker, { fundCredit } from "../src/worker.js";
+import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
 import { Env } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
 import { encodeVaultEventLog } from "../src/celo-events.js";
@@ -1490,49 +1491,86 @@ test("GET /v1/accounts/:account/outstanding returns failed funding entries", asy
   assert.equal(body.failedFundingCredits[0].fundingError, "vault reverted");
 });
 
-test("fundCredit skips bonus-only credits without calling Base funding when buyer revoked operator", async () => {
+test("/v1/celo/events/record sets stream bonus to 0 when buyer revoked operator", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const buyer = "0x0000000000000000000000000000000000000aaa";
-  const kv = new MemoryKV();
-  const store = new KVCreditStore(kv as never);
-  const entry: GdCreditEntry = {
-    id: "stream:bonus-only:test",
-    account: account.toLowerCase(),
-    rootAccount: account.toLowerCase(),
-    source: "streamUpdate",
-    gdAmountWei: "0",
-    principalUsd: "0",
-    bonusUsd: "40",
-    totalCreditUsd: "40",
-    fundingStatus: "pending",
-    createdAt: new Date().toISOString(),
-    streamUpdateMonth: "2026-08",
-    buyerAddress: buyer.toLowerCase()
-  };
-  await kv.put(`user:${account.toLowerCase()}`, JSON.stringify({ account: account.toLowerCase(), totalOutstandingFundingUsd: "40" }));
+  const txHash = `0x${"7".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const goodIdAddr = "0x0000000000000000000000000000000000001234";
+  const originalFetch = globalThis.fetch;
+  const originalIsBuyerOperator = AntSeedFundingVaultClient.prototype.isBuyerOperator;
+  const originalDepositForBuyerWithId = AntSeedFundingVaultClient.prototype.depositForBuyerWithId;
 
   let depositCalls = 0;
-  const vault = {
-    enabled: true,
-    async isBuyerOperator() {
-      return { enabled: true, buyer: buyer.toLowerCase(), isOperator: false };
-    },
-    async depositForBuyerWithId() {
+
+  try {
+    const testEnv = env({
+      CELO_RPC_URL: "https://celo.rpc.local",
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GOODID_ADDRESS: goodIdAddr,
+      ANTSEED_FUNDING_RPC_URL: "https://base.rpc.local",
+      ANTSEED_FUNDING_VAULT_ADDRESS: "0x0000000000000000000000000000000000000b01",
+      ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY: Wallet.createRandom().privateKey
+    });
+
+    const streamLog = encodeVaultEventLog(
+      "StreamUpdated",
+      [account, buyer, 385_802_469_136n, 1_000_000_000_000_000_000n, 2_000_000_000_000_000_000n],
+      celoVault,
+      txHash,
+      0
+    );
+
+    AntSeedFundingVaultClient.prototype.isBuyerOperator = async function (operatorBuyer: string) {
+      return { enabled: true, buyer: operatorBuyer.toLowerCase(), isOperator: false };
+    };
+
+    AntSeedFundingVaultClient.prototype.depositForBuyerWithId = async function (operatorBuyer: string, principalUsd: bigint, bonusUsd: bigint) {
       depositCalls += 1;
-      throw new Error("deposit should not be called");
-    }
-  };
+      assert.equal(operatorBuyer, buyer.toLowerCase());
+      assert.equal(principalUsd, 200n);
+      assert.equal(bonusUsd, 0n);
+      return { enabled: true, buyer: operatorBuyer, amountUsd: "200", txHash: "0xfunded" };
+    };
 
-  const result = await fundCredit(entry, store, vault as never);
-  const updatedEntry = (await kv.get("gd-credit:stream:bonus-only:test", "json")) as GdCreditEntry;
-  const profile = (await kv.get(`user:${account.toLowerCase()}`, "json")) as { totalOutstandingFundingUsd: string; totalBonusUsd: string };
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "eth_call") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: "0x000000000000000000000000abababababababababababababababababababab"
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [streamLog] } });
+    }) as typeof fetch;
 
-  assert.equal(depositCalls, 0);
-  assert.equal(updatedEntry.fundingStatus, "funded");
-  assert.equal(updatedEntry.fundingTxHash, undefined);
-  assert.equal(profile.totalOutstandingFundingUsd, "0");
-  assert.equal(profile.totalBonusUsd, "0");
-  assert.deepEqual(result.bridge, { enabled: true, buyer: buyer.toLowerCase(), amountUsd: "40" });
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      makeExecutionContext()
+    );
+
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      events: Array<{ source: string; fundingStatus: string; principalUsd: string; bonusUsd: string; buyerAddress?: string }>;
+    };
+    assert.equal(body.events.length, 1);
+    assert.equal(body.events[0].source, "streamUpdate");
+    assert.equal(body.events[0].fundingStatus, "funded");
+    assert.equal(body.events[0].principalUsd, "200");
+    assert.equal(body.events[0].bonusUsd, "0");
+    assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
+    assert.equal(depositCalls, 1);
+  } finally {
+    AntSeedFundingVaultClient.prototype.isBuyerOperator = originalIsBuyerOperator;
+    AntSeedFundingVaultClient.prototype.depositForBuyerWithId = originalDepositForBuyerWithId;
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("fundCredit deposits bonus-only credits when buyer still uses operator", async () => {

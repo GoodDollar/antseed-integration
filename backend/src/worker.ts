@@ -175,7 +175,9 @@ export default {
         continue;
       }
       const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
-      const isValidForBonus = !!rootAccount && (await antseedFundingVault.isBuyerOperator(stream.buyerAddress || "")).isOperator;
+      const buyerForOperatorCheck = stream.buyerAddress || stream.account;
+      const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+      const isValidForBonus = !!rootAccount && hasOperatorConsent;
 
       const depositId = createStreamFundingId(stream.account, new Date(createdAt));
       const entry = await store.recordGdCredit({
@@ -406,7 +408,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const gdPrice = await fetchCurrentGdPrice(cfg);
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
-      const isValidForBonus = !!rootAccount && (await antseedFundingVault.isBuyerOperator(stream.buyerAddress || "")).isOperator;
 
       if (event.kind === "deposit") {
         if (event.gdAmountWei === 0n) {
@@ -417,6 +418,9 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           });
           continue;
         }
+        const buyerForOperatorCheck = event.buyer || event.account;
+        const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+        const isValidForBonus = !!rootAccount && hasOperatorConsent;
         const depositId = `${event.txHash}:${event.logIndex}`;
         const entry = await store.recordGdCredit({
           id: depositId,
@@ -444,6 +448,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         recorded.push(res);
       } else {
         const depositId = `${event.txHash}:${event.logIndex}`;
+        const buyerForOperatorCheck = event.buyer || event.account;
+        const hasOperatorConsent =
+          antseedFundingVault.enabled && event.totalFlowWei > 0n ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+        const isValidForBonus = !!rootAccount && hasOperatorConsent;
         const entry = await store.recordGdCredit({
           id: depositId,
           account: event.account,
@@ -453,7 +461,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           flowRate: event.flowRateWeiPerSecond,
           txHash: event.txHash,
           logIndex: event.logIndex,
-          isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+          isVerified: isValidForBonus,
           gdPrice,
           maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
           regularBonusBps: cfg.REGULAR_BONUS_BPS,
@@ -502,15 +510,12 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const account = decodeURIComponent(streamCreditsMatch[1]).toLowerCase();
     const profile = await store.getUser(account);
     const rootAccount = await fetchGoodIdRoot(account, cfg);
-    const isValidForBonus = !!rootAccount && (await antseedFundingVault.isBuyerOperator(stream.buyerAddress || "")).isOperator;
-
-    const isVerified = isValidForBonus;
     const streams = await fetchSuperfluidStreamsForAccount(account, cfg);
+
     logInfo("stream.credits.start", {
       account: redactAddress(account),
       rootAccount: redactAddress(rootAccount),
-      streamCount: streams.length,
-      isVerified
+      streamCount: streams.length
     });
     if (streams.length === 0) {
       logInfo("stream.credits.empty", {
@@ -540,6 +545,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const recorded = [];
     let skippedMinAmount = 0;
     for (const stream of streams) {
+      const buyerForOperatorCheck = stream.buyerAddress || account;
+      const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+      const isValidForBonus = !!rootAccount && hasOperatorConsent;
+      const isVerified = isValidForBonus;
       const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
       if (gdAmountWei <= cfg.MIN_STREAM_BONUS_WEI) {
         skippedMinAmount += 1;
@@ -569,7 +578,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         entryId: entry.id,
         account: redactAddress(entry.account),
         rootAccount: redactAddress(entry.rootAccount),
-        buyer: redactAddress(entry.buyerAddress)
+        buyer: redactAddress(entry.buyerAddress),
+        isValidForBonus
       });
       const res = await fundCredit(entry, store, antseedFundingVault);
       recorded.push(res);
