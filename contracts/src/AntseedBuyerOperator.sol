@@ -344,6 +344,9 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         }
     }
 
+    /// @notice Transfers the operator role for a buyer to a new operator address. without enforcing any bonus withdrawal or channel closure. This function is intended for administrative use only.
+    /// @param buyer The address of the buyer whose operator role is being transferred.
+    /// @param newOperator The address of the new operator to be assigned to the buyer.
     function transferBuyerOperator(address buyer, address newOperator) external nonReentrant onlyAdmin {
         if (buyer == address(0)) revert InvalidAddress();
         _withdrawUnusedBonus(buyer);
