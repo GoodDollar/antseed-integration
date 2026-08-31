@@ -105,7 +105,6 @@ const CHAINLIST_RPCS_URL = "https://chainlist.org/rpcs.json";
 const LOG_BATCH_BLOCKS = 5000n;
 const LOG_BATCH_WORKERS = 5;
 const LOG_BATCH_DELAY_MS = 500;
-// KV reads have no provider rate limit to respect, so this pool can run wider than LOG_BATCH_WORKERS.
 const ANALYTICS_KV_READ_WORKERS = 20;
 const BASE_BLOCKS_PER_SECOND = 0.5;
 const TIMESTAMP_SEARCH_WINDOW_SECONDS = 6 * 60 * 60;
