@@ -105,6 +105,8 @@ const CHAINLIST_RPCS_URL = "https://chainlist.org/rpcs.json";
 const LOG_BATCH_BLOCKS = 5000n;
 const LOG_BATCH_WORKERS = 5;
 const LOG_BATCH_DELAY_MS = 500;
+// KV reads have no provider rate limit to respect, so this pool can run wider than LOG_BATCH_WORKERS.
+const ANALYTICS_KV_READ_WORKERS = 20;
 const BASE_BLOCKS_PER_SECOND = 0.5;
 const TIMESTAMP_SEARCH_WINDOW_SECONDS = 6 * 60 * 60;
 const CELO_FALLBACK_RPCS = ["https://forno.celo.org", "https://rpc.ankr.com/celo"];
@@ -199,16 +201,23 @@ export async function getAnalyticsWindow(env: Env, days = 30, now = new Date()):
   const store = new KVAnalyticsStore(env.ANTSEED_KV);
   const currentDate = dayFromDate(now);
 
-  const daily: AnalyticsDailyRecord[] = [];
-  for (let i = normalizedDays - 1; i >= 0; i -= 1) {
-    const date = dayFromDate(new Date(now.getTime() - i * 24 * 60 * 60 * 1000));
-    daily.push(await store.getDaily(date));
-  }
+  // Oldest to newest, so the last entry is always today's (i = 0) record.
+  const dates = Array.from({ length: normalizedDays }, (_, index) => {
+    const daysAgo = normalizedDays - 1 - index;
+    return dayFromDate(new Date(now.getTime() - daysAgo * 24 * 60 * 60 * 1000));
+  });
 
-  const persistedGlobal = await store.getGlobal();
-  const today = await store.getDaily(currentDate);
+  // Fetch every day plus the two independent reads concurrently instead of one round-trip at a time.
+  const [daily, persistedGlobal, state] = await Promise.all([
+    fetchDailyRecordsConcurrently(store, dates),
+    store.getGlobal(),
+    store.getState()
+  ]);
+
+  // The last fetched day is currentDate's record, so no need to re-read it from KV.
+  const today = daily[daily.length - 1];
   const global = addDailyToGlobal(persistedGlobal, today, now.toISOString());
-  const state = (await store.getState()) ?? { updatedAt: now.toISOString() };
+  const resolvedState = state ?? { updatedAt: now.toISOString() };
 
   return {
     days: normalizedDays,
@@ -216,10 +225,29 @@ export async function getAnalyticsWindow(env: Env, days = 30, now = new Date()):
     global,
     lastRun: {
       currentDate,
-      finalizedThroughDate: state.finalizedThroughDate,
-      updatedAt: state.updatedAt
+      finalizedThroughDate: resolvedState.finalizedThroughDate,
+      updatedAt: resolvedState.updatedAt
     }
   };
+}
+
+/** Reads each date's daily record from KV using a bounded-concurrency worker pool. */
+async function fetchDailyRecordsConcurrently(store: KVAnalyticsStore, dates: string[]): Promise<AnalyticsDailyRecord[]> {
+  const results: AnalyticsDailyRecord[] = new Array(dates.length);
+  let nextIndex = 0;
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= dates.length) return;
+      results[index] = await store.getDaily(dates[index]);
+    }
+  };
+
+  const workerCount = Math.min(ANALYTICS_KV_READ_WORKERS, dates.length);
+  await Promise.all(new Array(workerCount).fill(null).map(() => worker()));
+  return results;
 }
 
 export class KVAnalyticsStore {
