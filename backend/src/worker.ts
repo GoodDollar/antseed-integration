@@ -46,7 +46,7 @@ const StreamUpdateSchema = z.object({
 const WithdrawPrincipalSchema = z.object({
   amount: z.string().regex(/^\d+$/),
   recipient: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-  timestamp: z.number().int().nonnegative(),
+  nonce: z.string().regex(/^\d+$/),
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
 const OperatorConsentSchema = z.object({
@@ -68,7 +68,7 @@ const CreditHistoryQuerySchema = z.object({
     .optional()
 });
 const ChannelOpSchema = z.object({
-  timestamp: z.number().int().nonnegative().optional(),
+  nonce: z.string().regex(/^\d+$/).optional(),
   signature: z
     .string()
     .regex(/^0x[0-9a-fA-F]+$/)
@@ -175,6 +175,10 @@ export default {
         continue;
       }
       const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
+      const buyerForOperatorCheck = stream.buyerAddress || stream.account;
+      const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+      const isValidForBonus = !!rootAccount && hasOperatorConsent;
+
       const depositId = createStreamFundingId(stream.account, new Date(createdAt));
       const entry = await store.recordGdCredit({
         id: depositId,
@@ -183,7 +187,7 @@ export default {
         source: "streamCron",
         gdAmountWei: BigInt(gdAmountWei),
         flowRate: BigInt(stream.flowRateWeiPerSecond),
-        isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+        isVerified: isValidForBonus, // if root acccount was found it is whitelisted & operator set
         gdPrice,
         maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
         regularBonusBps: cfg.REGULAR_BONUS_BPS,
@@ -404,6 +408,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const gdPrice = await fetchCurrentGdPrice(cfg);
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
+
       if (event.kind === "deposit") {
         if (event.gdAmountWei === 0n) {
           logInfo("celo.events.record.deposit.skipped.zero-amount", {
@@ -413,6 +418,9 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           });
           continue;
         }
+        const buyerForOperatorCheck = event.buyer || event.account;
+        const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+        const isValidForBonus = !!rootAccount && hasOperatorConsent;
         const depositId = `${event.txHash}:${event.logIndex}`;
         const entry = await store.recordGdCredit({
           id: depositId,
@@ -422,7 +430,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           gdAmountWei: event.gdAmountWei,
           txHash: event.txHash,
           logIndex: event.logIndex,
-          isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+          isVerified: isValidForBonus, // if root acccount was found it is whitelisted & operator set
           gdPrice,
           maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
           regularBonusBps: cfg.REGULAR_BONUS_BPS,
@@ -440,6 +448,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         recorded.push(res);
       } else {
         const depositId = `${event.txHash}:${event.logIndex}`;
+        const buyerForOperatorCheck = event.buyer || event.account;
+        const hasOperatorConsent =
+          antseedFundingVault.enabled && event.totalFlowWei > 0n ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+        const isValidForBonus = !!rootAccount && hasOperatorConsent;
         const entry = await store.recordGdCredit({
           id: depositId,
           account: event.account,
@@ -449,7 +461,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           flowRate: event.flowRateWeiPerSecond,
           txHash: event.txHash,
           logIndex: event.logIndex,
-          isVerified: !!rootAccount, // if root acccount was found it is whitelisted
+          isVerified: isValidForBonus,
           gdPrice,
           maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
           regularBonusBps: cfg.REGULAR_BONUS_BPS,
@@ -498,13 +510,12 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const account = decodeURIComponent(streamCreditsMatch[1]).toLowerCase();
     const profile = await store.getUser(account);
     const rootAccount = await fetchGoodIdRoot(account, cfg);
-    const isVerified = !!rootAccount;
     const streams = await fetchSuperfluidStreamsForAccount(account, cfg);
+
     logInfo("stream.credits.start", {
       account: redactAddress(account),
       rootAccount: redactAddress(rootAccount),
-      streamCount: streams.length,
-      isVerified
+      streamCount: streams.length
     });
     if (streams.length === 0) {
       logInfo("stream.credits.empty", {
@@ -534,6 +545,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const recorded = [];
     let skippedMinAmount = 0;
     for (const stream of streams) {
+      const buyerForOperatorCheck = stream.buyerAddress || account;
+      const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+      const isValidForBonus = !!rootAccount && hasOperatorConsent;
+      const isVerified = isValidForBonus;
       const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
       if (gdAmountWei <= cfg.MIN_STREAM_BONUS_WEI) {
         skippedMinAmount += 1;
@@ -563,7 +578,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         entryId: entry.id,
         account: redactAddress(entry.account),
         rootAccount: redactAddress(entry.rootAccount),
-        buyer: redactAddress(entry.buyerAddress)
+        buyer: redactAddress(entry.buyerAddress),
+        isValidForBonus
       });
       const res = await fundCredit(entry, store, antseedFundingVault);
       recorded.push(res);
@@ -603,6 +619,25 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     return json({ buyer, bridge });
   }
 
+  const operatorRevokeMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator-revoke$/);
+  if (request.method === "POST" && operatorRevokeMatch) {
+    const buyer = decodeURIComponent(operatorRevokeMatch[1]).toLowerCase();
+    const body = await parseJson(request);
+    const parsed = OperatorConsentSchema.safeParse(body);
+    if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    logInfo("operator.revoke.request", {
+      buyer: redactAddress(buyer),
+      nonce: parsed.data.nonce
+    });
+    const bridge = await antseedFundingVault.revokeBuyerOperator(buyer, BigInt(parsed.data.nonce), parsed.data.signature);
+    logInfo("operator.revoke.result", {
+      buyer: redactAddress(buyer),
+      enabled: bridge.enabled,
+      txHash: redactHash(bridge.txHash)
+    });
+    return json({ buyer, bridge });
+  }
+
   const withdrawMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/withdraw$/);
   if (request.method === "POST" && withdrawMatch) {
     const account = decodeURIComponent(withdrawMatch[1]).toLowerCase();
@@ -618,7 +653,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       account,
       BigInt(parsed.data.amount),
       parsed.data.recipient,
-      parsed.data.timestamp,
+      BigInt(parsed.data.nonce),
       parsed.data.signature
     );
     logInfo("withdraw.result", {
@@ -636,17 +671,18 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const body = request.headers.get("content-length") !== "0" ? await parseJson(request) : {};
     const parsed = ChannelOpSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
-    const { timestamp, signature } = parsed.data;
+    const { nonce, signature } = parsed.data;
     logInfo("channel.request", {
       action,
       channelId: redactHash(channelId),
-      hasTimestamp: timestamp !== undefined,
+      hasNonce: nonce !== undefined,
       hasSignature: Boolean(signature)
     });
+    const parsedNonce = nonce === undefined ? undefined : BigInt(nonce);
     const bridge =
       action === "close"
-        ? await antseedFundingVault.requestClose(channelId, timestamp, signature)
-        : await antseedFundingVault.withdrawFromChannel(channelId, timestamp, signature);
+        ? await antseedFundingVault.requestClose(channelId, parsedNonce, signature)
+        : await antseedFundingVault.withdrawFromChannel(channelId, parsedNonce, signature);
     logInfo("channel.result", {
       action,
       channelId: redactHash(channelId),
@@ -767,7 +803,11 @@ function nextUtcDate(date: string): string | undefined {
   return parsed.toISOString().slice(0, 10);
 }
 
-async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFundingVault: AntSeedFundingVaultClient): Promise<{ [key: string]: unknown }> {
+export async function fundCredit(
+  entry: GdCreditEntry,
+  store: KVCreditStore,
+  antseedFundingVault: AntSeedFundingVaultClient
+): Promise<{ [key: string]: unknown }> {
   const buyer = entry.buyerAddress || entry.account;
   if (entry.fundingStatus === "funded") {
     logInfo("funding.already-funded", {
@@ -800,11 +840,11 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     totalCreditUsd: entry.totalCreditUsd
   });
   try {
-    const bridge =
-      principalUsd + bonusUsd > 0n
-        ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
-        : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
-    if (principalUsd + bonusUsd === 0n) {
+    const shouldCredit = principalUsd + bonusUsd > 0n;
+    const bridge = shouldCredit
+      ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
+      : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
+    if (!shouldCredit) {
       logInfo("funding.skipped.zero-amount", {
         entryId: entry.id,
         source: entry.source,
@@ -821,7 +861,8 @@ async function fundCredit(entry: GdCreditEntry, store: KVCreditStore, antseedFun
     const updated = await store.markFundingResult(entry, {
       funded: true,
       txHash: bridge.txHash,
-      error: undefined
+      error: undefined,
+      credited: shouldCredit
     });
     logInfo("funding.success", {
       entryId: entry.id,

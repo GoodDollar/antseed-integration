@@ -14,7 +14,7 @@ A UUPS-upgradeable contract deployed on Base. It acts as the on-chain operator f
 - `depositFor(buyer, principal, bonus)` — pulls USDC from contract balance, calls `deposits.deposit(buyer, principal + bonus)`
 - `depositForWithId(buyer, principal, bonus, id)` — same but idempotent via `usedDepositIds[keccak256(id)]`; duplicate IDs are silently skipped
 - tracks `totalPrincipalDeposited[buyer]` and `totalBonusDeposited[buyer]` separately; `withdrawablePrincipal(buyer) = totalPrincipalDeposited - totalWithdrawn`
-- `withdrawPrincipal(buyer, amount, recipient, timestamp, buyerSig)` — buyer EIP-712 signed principal-only withdrawal; 5-minute timestamp window; bonus is not withdrawable by buyer
+- `withdrawPrincipal(buyer, amount, recipient, nonce, buyerSig)` — buyer EIP-712 signed principal-only withdrawal using the per-address `usedNonces[buyer]` counter; bonus is not withdrawable by buyer
 - `withdrawDepositedFor(buyer, amount, recipient)` — owner-only full withdrawal from deposits
 - `requestClose(channelId)` / `withdrawChannel(channelId)` — callable by owner or the channel's buyer
 - `sweepToken(token, recipient, amount)` — owner-only token rescue
@@ -44,44 +44,59 @@ The backend reads `buyer` directly from on-chain events (log topics) for deposit
 The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ credit ingestion, accounting, and AntSeed deposit funding. It does **not** proxy AI requests.
 
 **Event ingestion** (`POST /v1/celo/events/record`):
+
 - fetches a Celo transaction receipt by `txHash` (or a log range by `account + fromBlock`)
 - parses `GdDeposited` and `StreamUpdated` events from `CeloGdAntSeedVault`
 - resolves `getWhitelistedRoot(account)` to determine GoodID verification and root-account aggregation
 - records a `GdCreditEntry` in KV and calls `fundCredit` immediately
 
 **Stream credit issuance** (`POST /v1/accounts/:account/stream-credits`):
+
 - reads active Superfluid streams for the account from the subgraph
 - computes elapsed seconds since last credit (24-hour cooldown enforced)
 - records a `GdCreditEntry` per stream and calls `fundCredit`
 
 **Cron (every minute)**:
+
 - fetches all active incoming streams from the Superfluid subgraph
 - issues stream credits for each streamer and funds them
 
 **Profile** (`GET /v1/accounts/:account/profile`):
+
 - returns the user's `UserCreditProfile` only
 
 **Credit history** (`GET /v1/accounts/:account/credit-history`):
+
 - returns paginated `GdCreditEntry` records newest-first
 - query params: `limit` (default 20, max 100), `offset` (default 0), optional `source`, `fundingStatus`, `from` / `to` (ISO `createdAt` range, inclusive)
 - response: `{ account, items, total, limit, offset, hasMore }`
 
 **Outstanding funding** (`GET /v1/accounts/:account/outstanding`):
+
 - returns `totalOutstandingFundingUsd` and all `GdCreditEntry` records with `fundingStatus = "pending"` or `"failed"`
 
 **Principal withdraw** (`POST /v1/accounts/:account/withdraw`):
-- body: `amount` (USDC micro-units), `recipient`, `timestamp`, buyer EIP-712 `signature`
-- calls `AntseedBuyerOperator.withdrawPrincipal(buyer, amount, recipient, timestamp, buyerSig)`
+
+- body: `amount` (USDC micro-units), `recipient`, `nonce`, buyer EIP-712 `signature`
+- calls `AntseedBuyerOperator.withdrawPrincipal(buyer, amount, recipient, nonce, buyerSig)`
+
+**Operator revoke** (`POST /v1/accounts/:account/operator-revoke`):
+
+- body: `nonce`, buyer EIP-712 `signature`
+- calls `AntseedBuyerOperator.revokeOperator(buyer, nonce, buyerSig)`
 
 **Channel close** (`POST /v1/channels/:channelId/close`):
-- optional buyer EIP-712 `RequestClose` (`timestamp`, `signature`) or operator-as-owner when unsigned
+
+- optional buyer EIP-712 `RequestClose` (`nonce`, `signature`) or operator-as-owner when unsigned
 - calls `AntseedBuyerOperator.requestClose(channelId, …)`
 
 **Channel withdraw** (`POST /v1/channels/:channelId/withdraw`):
-- optional buyer EIP-712 `WithdrawChannel` (`timestamp`, `signature`) or operator-as-owner when unsigned
+
+- optional buyer EIP-712 `WithdrawChannel` (`nonce`, `signature`) or operator-as-owner when unsigned
 - calls `AntseedBuyerOperator.withdrawChannel(channelId, …)`
 
 **Funding path** (`fundCredit`):
+
 - calls `AntSeedFundingVaultClient.depositForBuyerWithId(buyer, principal, bonus, id)` — uses the `buyer` from the credit entry, or falls back to `account`
 - on success: marks entry `funded`, decrements `totalOutstandingFundingUsd`
 - on failure: marks entry `failed`, preserves `fundingError`
@@ -108,7 +123,6 @@ Future payment mechanisms (sponsorships, org budgets, subscriptions, multi-buyer
 - no GoodDollar L2 block processing
 - no wallet UI
 - no model hosting logic
-
 
 ## Cloudflare KV persistence
 

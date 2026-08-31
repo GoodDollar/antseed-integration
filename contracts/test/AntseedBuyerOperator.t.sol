@@ -9,7 +9,9 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 
 interface Vm {
     function sign(uint256 privateKey, bytes32 digest) external pure returns (uint8 v, bytes32 r, bytes32 s);
+
     function addr(uint256 privateKey) external pure returns (address);
+
     function warp(uint256 newTimestamp) external;
 }
 
@@ -47,6 +49,7 @@ contract MockDeposits is IAntseedDeposits {
     IERC20 public immutable token;
     mapping(address => address) public operators;
     mapping(address => uint256) public available;
+    mapping(address => uint256) public reserved;
 
     constructor(IERC20 token_) {
         token = token_;
@@ -69,6 +72,22 @@ contract MockDeposits is IAntseedDeposits {
         require(available[buyer] >= amount, "INSUFFICIENT");
         available[buyer] -= amount;
         require(token.transfer(msg.sender, amount), "TRANSFER");
+    }
+
+    function getBuyerBalance(address buyer) external view override returns (uint256, uint256, uint256) {
+        return (available[buyer], reserved[buyer], 0);
+    }
+
+    function consume(address buyer, uint256 amount) external {
+        require(available[buyer] >= amount, "INSUFFICIENT");
+        available[buyer] -= amount;
+        require(token.transfer(address(0xD00D), amount), "TRANSFER");
+    }
+
+    function reserve(address buyer, uint256 amount) external {
+        require(available[buyer] >= amount, "INSUFFICIENT");
+        available[buyer] -= amount;
+        reserved[buyer] += amount;
     }
 
     function transferOperator(address buyer, address newOperator) external override {
@@ -101,7 +120,9 @@ contract MockChannels is IAntseedChannels {
         _channels[channelId].buyer = buyer;
     }
 
-    function channels(bytes32 channelId)
+    function channels(
+        bytes32 channelId
+    )
         external
         view
         returns (
@@ -170,8 +191,16 @@ contract BuyerCaller {
         operator = operator_;
     }
 
-    function callWithdrawPrincipal(uint256 amount, address recipient, uint256 timestamp, bytes calldata buyerSig) external returns (bool) {
-        try operator.withdrawPrincipal(address(this), amount, recipient, timestamp, buyerSig) {
+    function callWithdrawPrincipal(uint256 amount, address recipient, uint256 nonce, bytes calldata buyerSig) external returns (bool) {
+        try operator.withdrawPrincipal(address(this), amount, recipient, nonce, buyerSig) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function callRevokeOperator(address buyer) external returns (bool) {
+        try operator.revokeOperator(buyer) {
             return true;
         } catch {
             return false;
@@ -198,43 +227,33 @@ contract AntseedBuyerOperatorTest {
         channels = new MockChannels();
         registry = new MockRegistry(address(deposits), address(channels));
         AntseedBuyerOperator impl = new AntseedBuyerOperator(address(registry));
-        ERC1967Proxy proxy = new ERC1967Proxy(
-            address(impl),
-            abi.encodeCall(AntseedBuyerOperator.initialize, (address(this)))
-        );
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), abi.encodeCall(AntseedBuyerOperator.initialize, (address(this))));
         operator = AntseedBuyerOperator(address(proxy));
     }
 
-    function _signWithdraw(uint256 pk, address buyerAddr, uint256 amount, address to, uint256 timestamp) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(abi.encode(
-            operator.WITHDRAW_TYPEHASH(),
-            buyerAddr,
-            amount,
-            to,
-            timestamp
-        ));
+    function _signWithdraw(uint256 pk, address buyerAddr, uint256 amount, address to, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(operator.WITHDRAW_TYPEHASH(), buyerAddr, amount, to, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    function _signRequestClose(uint256 pk, bytes32 channelId, uint256 timestamp) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(abi.encode(
-            operator.REQUEST_CLOSE_TYPEHASH(),
-            channelId,
-            timestamp
-        ));
+    function _signRequestClose(uint256 pk, bytes32 channelId, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(operator.REQUEST_CLOSE_TYPEHASH(), channelId, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
     }
 
-    function _signWithdrawChannel(uint256 pk, bytes32 channelId, uint256 timestamp) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(abi.encode(
-            operator.WITHDRAW_CHANNEL_TYPEHASH(),
-            channelId,
-            timestamp
-        ));
+    function _signWithdrawChannel(uint256 pk, bytes32 channelId, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(operator.WITHDRAW_CHANNEL_TYPEHASH(), channelId, nonce));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _signRevokeOperator(uint256 pk, address buyerAddr, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(operator.REVOKE_OPERATOR_TYPEHASH(), buyerAddr, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", operator.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
@@ -272,26 +291,67 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "duplicate id rejected");
     }
 
-    function testDepositRevertsIfOperatorNotSet() public {
+    function testDepositForWithoutOperatorZeroesBonus() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
 
+        operator.depositFor(buyer, 900_000, 100_000);
+
+        require(deposits.available(buyer) == 900_000, "only principal funded");
+        require(operator.totalPrincipalDeposited(buyer) == 900_000, "principal tracked");
+        require(operator.totalBonusDeposited(buyer) == 0, "bonus forced to zero");
+    }
+
+    function testDepositForWithIdWithoutOperatorZeroesBonusAndKeepsIdempotency() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        operator.depositForWithId(buyer, 800_000, 200_000, "tx:no-operator");
+
+        require(deposits.available(buyer) == 800_000, "only principal funded");
+        require(operator.totalPrincipalDeposited(buyer) == 800_000, "principal tracked");
+        require(operator.totalBonusDeposited(buyer) == 0, "bonus forced to zero");
+
         bool ok;
-        try operator.depositFor(buyer, 900_000, 100_000) {
+        try operator.depositForWithId(buyer, 800_000, 200_000, "tx:no-operator") {
             ok = true;
         } catch {
             ok = false;
         }
-        require(!ok, "must reject without operator");
+        require(!ok, "duplicate id rejected");
     }
 
-    function testChannelActionsAllowedForOwnerAndBuyerOnly() public {
+    function testDepositWithoutOperatorRejectsZeroTotalAfterBonusWipe() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        bool ok;
+        try operator.depositFor(buyer, 0, 100_000) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "zero total rejected after bonus wipe");
+
+        try operator.depositForWithId(buyer, 0, 100_000, "tx:zero-total") {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "zero total rejected after bonus wipe with id");
+    }
+
+    function testChannelActionsAllowedForAdminOwnerAndBuyerOnly() public {
         setUp();
         bytes32 channelId = keccak256("channel-1");
         channels.setChannelBuyer(channelId, buyer);
+        OperatorCaller ownerCaller = new OperatorCaller(operator);
+        operator.transferOwnership(address(ownerCaller));
 
         operator.requestClose(channelId, 0, "");
         operator.withdrawChannel(channelId, 0, "");
+        require(ownerCaller.callRequestClose(channelId), "owner can request close");
+        require(ownerCaller.callWithdrawChannel(channelId), "owner can withdraw");
 
         OperatorCaller buyerCaller = new OperatorCaller(operator);
         channels.setChannelBuyer(channelId, address(buyerCaller));
@@ -331,27 +391,26 @@ contract AntseedBuyerOperatorTest {
         require(operator.withdrawablePrincipal(buyerAddr) == 8_000_000, "full principal withdrawable");
 
         // Withdraw part of principal
-        uint256 ts1 = block.timestamp;
-        bytes memory sig1 = _signWithdraw(BUYER_PK, buyerAddr, 3_000_000, recipient, ts1);
-        operator.withdrawPrincipal(buyerAddr, 3_000_000, recipient, ts1, sig1);
+        uint256 nonce1 = operator.usedNonces(buyerAddr);
+        bytes memory sig1 = _signWithdraw(BUYER_PK, buyerAddr, 3_000_000, recipient, nonce1);
+        operator.withdrawPrincipal(buyerAddr, 3_000_000, recipient, nonce1, sig1);
         require(usdc.balanceOf(recipient) == 3_000_000, "recipient received funds");
-        require(operator.totalWithdrawn(buyerAddr) == 3_000_000, "withdrawn tracked");
+        require(operator.totalPrincipalWithdrawn(buyerAddr) == 3_000_000, "withdrawn tracked");
         require(operator.withdrawablePrincipal(buyerAddr) == 5_000_000, "remaining withdrawable");
+        require(operator.usedNonces(buyerAddr) == nonce1 + 1, "nonce incremented after withdraw");
 
         // Withdraw rest of principal
-        vm.warp(block.timestamp + 1);
-        uint256 ts2 = block.timestamp;
-        bytes memory sig2 = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, ts2);
-        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, ts2, sig2);
+        uint256 nonce2 = operator.usedNonces(buyerAddr);
+        bytes memory sig2 = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, nonce2);
+        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, nonce2, sig2);
         require(usdc.balanceOf(recipient) == 8_000_000, "recipient received all principal");
         require(operator.withdrawablePrincipal(buyerAddr) == 0, "nothing left");
 
         // Cannot withdraw more than principal (bonus not withdrawable)
-        vm.warp(block.timestamp + 1);
-        uint256 ts3 = block.timestamp;
-        bytes memory sig3 = _signWithdraw(BUYER_PK, buyerAddr, 1, recipient, ts3);
+        uint256 nonce3 = operator.usedNonces(buyerAddr);
+        bytes memory sig3 = _signWithdraw(BUYER_PK, buyerAddr, 1, recipient, nonce3);
         bool ok;
-        try operator.withdrawPrincipal(buyerAddr, 1, recipient, ts3, sig3) {
+        try operator.withdrawPrincipal(buyerAddr, 1, recipient, nonce3, sig3) {
             ok = true;
         } catch {
             ok = false;
@@ -371,15 +430,211 @@ contract AntseedBuyerOperatorTest {
         require(deposits.available(buyerAddr) == 7_000_000, "full deposit in vault");
         require(operator.withdrawablePrincipal(buyerAddr) == 5_000_000, "only principal withdrawable");
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, ts);
-        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, ts, sig);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, nonce);
+        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, nonce, sig);
 
         // Recipient received only the principal
         require(usdc.balanceOf(recipient) == 5_000_000, "recipient got principal");
         // Bonus stays in the deposit vault
         require(deposits.available(buyerAddr) == 2_000_000, "bonus remains in vault");
         require(operator.withdrawablePrincipal(buyerAddr) == 0, "nothing left to withdraw");
+    }
+
+    function testUsageConsumesPrincipalBeforeBonusAcrossNewDeposits() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        operator.acceptBuyerOperator(buyer, 1, "");
+
+        operator.depositFor(buyer, 10_000_000, 2_000_000);
+        deposits.consume(buyer, 3_000_000);
+        require(operator.withdrawablePrincipal(buyer) == 7_000_000, "view accounts for pending usage");
+
+        deposits.consume(buyer, 9_000_000);
+
+        operator.depositForWithId(buyer, 5_000_000, 1_000_000, "tx:after-usage");
+
+        require(operator.principalRemaining(buyer) == 5_000_000, "new principal remains");
+        require(operator.bonusRemaining(buyer) == 1_000_000, "new bonus remains");
+        require(operator.withdrawablePrincipal(buyer) == 5_000_000, "new principal withdrawable");
+    }
+
+    function testUsageConsumesPrincipalBeforeBonusAcrossNewDepositsWhenFullyConsumedAtOnce() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        operator.acceptBuyerOperator(buyer, 1, "");
+
+        operator.depositFor(buyer, 10_000_000, 2_000_000);
+        deposits.consume(buyer, 12_000_000);
+
+        operator.depositForWithId(buyer, 5_000_000, 1_000_000, "tx:after-usage");
+
+        require(operator.principalRemaining(buyer) == 5_000_000, "new principal remains");
+        require(operator.bonusRemaining(buyer) == 1_000_000, "new bonus remains");
+        require(operator.withdrawablePrincipal(buyer) == 5_000_000, "new principal withdrawable");
+    }
+
+    function testRevokeOperatorWithdrawsUnusedAvailableBonus() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        BuyerCaller buyerCaller = new BuyerCaller(operator);
+        operator.acceptBuyerOperator(address(buyerCaller), 1, "");
+        operator.depositFor(address(buyerCaller), 5_000_000, 2_000_000);
+
+        require(buyerCaller.callRevokeOperator(address(buyerCaller)), "buyer can revoke");
+
+        require(deposits.getOperator(address(buyerCaller)) == address(0), "operator revoked");
+        require(deposits.available(address(buyerCaller)) == 5_000_000, "only principal left");
+        require(usdc.balanceOf(address(operator)) == 95_000_000, "bonus returned to operator");
+        require(operator.bonusRemaining(address(buyerCaller)) == 0, "bonus remaining cleared");
+        require(operator.totalBonusWithdrawn(address(buyerCaller)) == 2_000_000, "bonus withdrawal tracked");
+    }
+
+    function testRevokeOperatorWithBuyerSig() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 4_000_000, 1_000_000);
+
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signRevokeOperator(BUYER_PK, buyerAddr, nonce);
+
+        operator.revokeOperator(buyerAddr, nonce, sig);
+
+        require(deposits.getOperator(buyerAddr) == address(0), "operator revoked");
+        require(deposits.available(buyerAddr) == 4_000_000, "bonus reclaimed before revoke");
+        require(operator.totalBonusWithdrawn(buyerAddr) == 1_000_000, "bonus withdrawal tracked");
+        require(operator.usedNonces(buyerAddr) == nonce + 1, "nonce incremented after revoke");
+    }
+
+    function testRevokeOperatorRejectsWrongSigner() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 4_000_000, 1_000_000);
+
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory badSig = _signRevokeOperator(0xDEAD, buyerAddr, nonce);
+
+        bool ok;
+        try operator.revokeOperator(buyerAddr, nonce, badSig) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "wrong signer rejected");
+    }
+
+    function testRevokeOperatorRejectsInvalidNonce() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 4_000_000, 1_000_000);
+
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signRevokeOperator(BUYER_PK, buyerAddr, nonce);
+
+        bool ok;
+        try operator.revokeOperator(buyerAddr, nonce + 1, sig) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "invalid nonce rejected");
+    }
+
+    function testMigrateBuyerAccountingComputesRemainingFromTrackedTotals() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        operator.acceptBuyerOperator(buyer, 1, "");
+        operator.depositFor(buyer, 10_000_000, 2_000_000);
+        deposits.consume(buyer, 3_000_000);
+
+        operator.migrateBuyerAccounting(buyer);
+
+        require(operator.principalRemaining(buyer) == 7_000_000, "principal recomputed");
+        require(operator.bonusRemaining(buyer) == 2_000_000, "bonus recomputed");
+        require(operator.lastAccountedBalance(buyer) == 9_000_000, "accounted balance set");
+        require(operator.buyerAccountingMigrated(buyer), "migration flagged");
+
+        bool ok;
+        try operator.migrateBuyerAccounting(buyer) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "double migration rejected");
+    }
+
+    function testMigrateBuyerAccountingBatch() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyer2 = address(0xB0C);
+
+        operator.acceptBuyerOperator(buyer, 1, "");
+        operator.acceptBuyerOperator(buyer2, 1, "");
+
+        operator.depositFor(buyer, 10_000_000, 2_000_000);
+        operator.depositFor(buyer2, 6_000_000, 1_000_000);
+
+        deposits.consume(buyer, 3_000_000);
+        deposits.consume(buyer2, 1_500_000);
+
+        address[] memory buyers = new address[](2);
+        buyers[0] = buyer;
+        buyers[1] = buyer2;
+        operator.migrateBuyerAccounting(buyers);
+
+        require(operator.principalRemaining(buyer) == 7_000_000, "buyer1 principal recomputed");
+        require(operator.bonusRemaining(buyer) == 2_000_000, "buyer1 bonus recomputed");
+        require(operator.lastAccountedBalance(buyer) == 9_000_000, "buyer1 accounted balance set");
+
+        require(operator.principalRemaining(buyer2) == 4_500_000, "buyer2 principal recomputed");
+        require(operator.bonusRemaining(buyer2) == 1_000_000, "buyer2 bonus recomputed");
+        require(operator.lastAccountedBalance(buyer2) == 5_500_000, "buyer2 accounted balance set");
+
+        require(operator.buyerAccountingMigrated(buyer), "buyer1 migration flagged");
+        require(operator.buyerAccountingMigrated(buyer2), "buyer2 migration flagged");
+    }
+
+    function testTransferBuyerOperatorWithdrawsOnlyAvailableBonus() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        operator.acceptBuyerOperator(buyer, 1, "");
+        operator.depositFor(buyer, 5_000_000, 2_000_000);
+        deposits.reserve(buyer, 2_000_000);
+
+        address newOp = address(0xC0DE);
+        operator.transferBuyerOperator(buyer, newOp);
+
+        require(deposits.getOperator(buyer) == newOp, "operator transferred");
+        require(deposits.available(buyer) == 5_000_000, "available principal preserved");
+        require(deposits.reserved(buyer) == 2_000_000, "reserved funds untouched");
+        require(operator.totalBonusWithdrawn(buyer) == 0, "reserved bonus not withdrawn");
+    }
+
+    function testTransferBuyerOperatorAfterNonOperatorFundingKeepsPrincipalIntact() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        operator.depositFor(buyer, 3_000_000, 1_000_000);
+
+        address newOp = address(0xA11CE);
+        operator.transferBuyerOperator(buyer, newOp);
+
+        require(deposits.getOperator(buyer) == newOp, "operator transferred");
+        require(deposits.available(buyer) == 3_000_000, "principal untouched");
+        require(operator.totalBonusDeposited(buyer) == 0, "bonus never credited");
+        require(operator.totalBonusWithdrawn(buyer) == 0, "no bonus withdrawal");
     }
 
     function testWithdrawPrincipalRejectsWrongSigner() public {
@@ -392,10 +647,10 @@ contract AntseedBuyerOperatorTest {
 
         // Sign with a different private key (not the buyer)
         uint256 wrongPk = 0xDEAD;
-        uint256 ts = block.timestamp;
-        bytes memory badSig = _signWithdraw(wrongPk, buyerAddr, 1_000_000, recipient, ts);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory badSig = _signWithdraw(wrongPk, buyerAddr, 1_000_000, recipient, nonce);
         bool ok;
-        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, ts, badSig) {
+        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, nonce, badSig) {
             ok = true;
         } catch {
             ok = false;
@@ -403,7 +658,7 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "wrong signer rejected");
     }
 
-    function testWithdrawPrincipalRejectsExpiredTimestamp() public {
+    function testWithdrawPrincipalRejectsInvalidNonce() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
 
@@ -411,19 +666,16 @@ contract AntseedBuyerOperatorTest {
         operator.acceptBuyerOperator(buyerAddr, 1, "");
         operator.depositFor(buyerAddr, 10_000_000, 0);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 1_000_000, recipient, ts);
-
-        // Warp 6 minutes into the future so the timestamp is expired
-        vm.warp(ts + 6 minutes);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 1_000_000, recipient, nonce);
 
         bool ok;
-        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, ts, sig) {
+        try operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, nonce + 1, sig) {
             ok = true;
         } catch {
             ok = false;
         }
-        require(!ok, "expired timestamp rejected");
+        require(!ok, "invalid nonce rejected");
     }
 
     function testRequestCloseWithBuyerSig() public {
@@ -432,10 +684,11 @@ contract AntseedBuyerOperatorTest {
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signRequestClose(BUYER_PK, channelId, ts);
-        operator.requestClose(channelId, ts, sig);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signRequestClose(BUYER_PK, channelId, nonce);
+        operator.requestClose(channelId, nonce, sig);
         require(channels.requestCloseCalls() == 1, "requestClose forwarded");
+        require(operator.usedNonces(buyerAddr) == nonce + 1, "nonce incremented after requestClose");
     }
 
     function testRequestCloseRejectsWrongSigner() public {
@@ -444,25 +697,32 @@ contract AntseedBuyerOperatorTest {
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory badSig = _signRequestClose(0xDEAD, channelId, ts);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory badSig = _signRequestClose(0xDEAD, channelId, nonce);
         bool ok;
-        try operator.requestClose(channelId, ts, badSig) { ok = true; } catch { ok = false; }
+        try operator.requestClose(channelId, nonce, badSig) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
         require(!ok, "wrong signer rejected");
     }
 
-    function testRequestCloseRejectsExpiredTimestamp() public {
+    function testRequestCloseRejectsInvalidNonce() public {
         setUp();
         bytes32 channelId = keccak256("channel-sig");
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signRequestClose(BUYER_PK, channelId, ts);
-        vm.warp(ts + 6 minutes);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signRequestClose(BUYER_PK, channelId, nonce);
         bool ok;
-        try operator.requestClose(channelId, ts, sig) { ok = true; } catch { ok = false; }
-        require(!ok, "expired timestamp rejected");
+        try operator.requestClose(channelId, nonce + 1, sig) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "invalid nonce rejected");
     }
 
     function testWithdrawChannelWithBuyerSig() public {
@@ -471,10 +731,11 @@ contract AntseedBuyerOperatorTest {
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, ts);
-        operator.withdrawChannel(channelId, ts, sig);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, nonce);
+        operator.withdrawChannel(channelId, nonce, sig);
         require(channels.withdrawCalls() == 1, "withdrawChannel forwarded");
+        require(operator.usedNonces(buyerAddr) == nonce + 1, "nonce incremented after withdrawChannel");
     }
 
     function testWithdrawChannelRejectsWrongSigner() public {
@@ -483,58 +744,59 @@ contract AntseedBuyerOperatorTest {
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory badSig = _signWithdrawChannel(0xDEAD, channelId, ts);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory badSig = _signWithdrawChannel(0xDEAD, channelId, nonce);
         bool ok;
-        try operator.withdrawChannel(channelId, ts, badSig) { ok = true; } catch { ok = false; }
+        try operator.withdrawChannel(channelId, nonce, badSig) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
         require(!ok, "wrong signer rejected");
     }
 
-    function testWithdrawChannelRejectsExpiredTimestamp() public {
+    function testWithdrawChannelRejectsInvalidNonce() public {
         setUp();
         bytes32 channelId = keccak256("channel-sig");
         address buyerAddr = vm.addr(BUYER_PK);
         channels.setChannelBuyer(channelId, buyerAddr);
 
-        uint256 ts = block.timestamp;
-        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, ts);
-        vm.warp(ts + 6 minutes);
+        uint256 nonce = operator.usedNonces(buyerAddr);
+        bytes memory sig = _signWithdrawChannel(BUYER_PK, channelId, nonce);
         bool ok;
-        try operator.withdrawChannel(channelId, ts, sig) { ok = true; } catch { ok = false; }
-        require(!ok, "expired timestamp rejected");
+        try operator.withdrawChannel(channelId, nonce + 1, sig) {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "invalid nonce rejected");
     }
 
     function testCannotReinitialize() public {
         setUp();
-        (bool ok,) = address(operator).call(
-            abi.encodeCall(AntseedBuyerOperator.initialize, (address(this)))
-        );
+        (bool ok, ) = address(operator).call(abi.encodeCall(AntseedBuyerOperator.initialize, (address(this))));
         require(!ok, "double init rejected");
     }
 
-    function testOnlyAdminCanUpgrade() public {
+    function testOnlyOwnerCanUpgrade() public {
         setUp();
         AntseedBuyerOperator newImpl = new AntseedBuyerOperator(address(registry));
 
-        // admin (equals owner at init) can upgrade
+        // owner (equals admin at init) can upgrade
         operator.upgradeToAndCall(address(newImpl), "");
 
         // outsider cannot upgrade
         OperatorUpgradeHelper outsider = new OperatorUpgradeHelper();
-        (bool ok,) = address(outsider).call(
-            abi.encodeWithSignature("upgrade(address,address)", address(operator), address(newImpl))
-        );
+        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("upgrade(address,address)", address(operator), address(newImpl)));
         require(!ok, "outsider upgrade rejected");
 
-        // transfer admin away; address(this) remains owner but loses admin role
-        AdminActor newAdminActor = new AdminActor(operator);
-        operator.transferAdmin(address(newAdminActor));
+        // transfer ownership away; address(this) remains admin but loses owner role
+        AdminActor newOwnerActor = new AdminActor(operator);
+        operator.transferOwnership(address(newOwnerActor));
 
-        // owner-without-admin is now blocked by onlyAdmin
-        (ok,) = address(operator).call(
-            abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), bytes(""))
-        );
-        require(!ok, "owner-without-admin upgrade rejected");
+        // admin-without-owner is now blocked by onlyOwner
+        (ok, ) = address(operator).call(abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), bytes("")));
+        require(!ok, "admin-without-owner upgrade rejected");
     }
 
     // ─── transferOwnership ───
@@ -548,9 +810,7 @@ contract AntseedBuyerOperatorTest {
 
     function testTransferOwnershipRejectsZeroAddress() public {
         setUp();
-        (bool ok,) = address(operator).call(
-            abi.encodeWithSignature("transferOwnership(address)", address(0))
-        );
+        (bool ok, ) = address(operator).call(abi.encodeWithSignature("transferOwnership(address)", address(0)));
         require(!ok, "zero-address transferOwnership rejected");
     }
 
@@ -558,9 +818,7 @@ contract AntseedBuyerOperatorTest {
         setUp();
         AdminActor outsider = new AdminActor(operator);
         // outsider is neither owner nor admin
-        (bool ok,) = address(outsider).call(
-            abi.encodeWithSignature("callTransferOwnership(address)", address(outsider))
-        );
+        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("callTransferOwnership(address)", address(outsider)));
         require(!ok, "outsider cannot transferOwnership");
     }
 
@@ -571,104 +829,82 @@ contract AntseedBuyerOperatorTest {
         AdminActor newAdminActor = new AdminActor(operator);
         operator.transferAdmin(address(newAdminActor));
         require(operator.admin() == address(newAdminActor), "admin updated");
-        // new admin can exercise onlyAdmin — sweep a token
+        // new admin can exercise operational functions
         usdc.mint(address(operator), 1_000_000);
-        newAdminActor.callSweepToken(address(usdc), recipient, 1_000_000);
-        require(usdc.balanceOf(recipient) == 1_000_000, "new admin swept token");
+        newAdminActor.callAcceptBuyerOperator(buyer, 1);
+        newAdminActor.callDepositFor(buyer, 500_000, 100_000);
+        require(deposits.available(buyer) == 600_000, "new admin funded buyer");
     }
 
     function testTransferAdminRejectsZeroAddress() public {
         setUp();
-        (bool ok,) = address(operator).call(
-            abi.encodeWithSignature("transferAdmin(address)", address(0))
-        );
+        (bool ok, ) = address(operator).call(abi.encodeWithSignature("transferAdmin(address)", address(0)));
         require(!ok, "zero-address transferAdmin rejected");
     }
 
-    function testTransferAdminOnlyCallableByAdmin() public {
+    function testTransferAdminOnlyCallableByAdminOrOwner() public {
         setUp();
         AdminActor outsider = new AdminActor(operator);
         // outsider (neither owner nor admin) cannot call transferAdmin
-        (bool ok,) = address(outsider).call(
-            abi.encodeWithSignature("callTransferAdmin(address)", address(outsider))
-        );
+        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("callTransferAdmin(address)", address(outsider)));
         require(!ok, "outsider cannot transferAdmin");
     }
 
-    function testOwnerAfterAdminTransferCannotCallOnlyAdmin() public {
+    function testAdminAfterOwnershipTransferCannotCallOnlyOwner() public {
         setUp();
-        // Transfer admin away; address(this) remains owner but is no longer admin.
-        AdminActor newAdminActor = new AdminActor(operator);
-        operator.transferAdmin(address(newAdminActor));
+        // Transfer ownership away; address(this) remains admin but is no longer owner.
+        AdminActor newOwnerActor = new AdminActor(operator);
+        operator.transferOwnership(address(newOwnerActor));
 
         usdc.mint(address(operator), 1_000_000);
 
-        // address(this) can no longer call onlyAdmin functions
-        (bool ok,) = address(operator).call(
-            abi.encodeWithSignature(
-                "sweepToken(address,address,uint256)",
-                address(usdc), recipient, uint256(1_000_000)
-            )
-        );
-        require(!ok, "owner-without-admin cannot sweepToken");
+        // address(this) can no longer call onlyOwner functions
+        (bool ok, ) = address(operator).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), recipient, uint256(1_000_000)));
+        require(!ok, "admin-without-owner cannot sweepToken");
 
-        (ok,) = address(operator).call(
-            abi.encodeWithSignature("transferAdmin(address)", address(this))
-        );
-        require(!ok, "owner-without-admin cannot transferAdmin");
+        operator.transferAdmin(address(this));
+        require(operator.admin() == address(this), "admin-without-owner can transferAdmin");
     }
 
-    // ─── onlyOwner: admin can also call ───
+    // ─── onlyAdmin: owner can also call ───
 
-    function testAdminCanCallOnlyOwnerFunctions() public {
+    function testOwnerCanCallOnlyAdminFunctions() public {
         setUp();
-        AdminActor adminActor = new AdminActor(operator);
-        operator.transferAdmin(address(adminActor));
         usdc.mint(address(operator), 100_000_000);
 
-        // acceptBuyerOperator via admin
-        adminActor.callAcceptBuyerOperator(buyer, 1);
-        // depositFor via admin
-        adminActor.callDepositFor(buyer, 500_000, 100_000);
-        require(deposits.available(buyer) == 600_000, "admin funded buyer");
-        require(operator.totalPrincipalDeposited(buyer) == 500_000, "principal tracked via admin");
-        require(operator.totalBonusDeposited(buyer) == 100_000, "bonus tracked via admin");
+        operator.acceptBuyerOperator(buyer, 1, "");
+        operator.depositFor(buyer, 500_000, 100_000);
+        require(deposits.available(buyer) == 600_000, "owner funded buyer");
+        require(operator.totalPrincipalDeposited(buyer) == 500_000, "principal tracked via owner");
+        require(operator.totalBonusDeposited(buyer) == 100_000, "bonus tracked via owner");
     }
 
-    function testAdminCanUpgrade() public {
+    function testAdminCannotUpgrade() public {
         setUp();
         AntseedBuyerOperator newImpl = new AntseedBuyerOperator(address(registry));
         AdminActor adminActor = new AdminActor(operator);
         operator.transferAdmin(address(adminActor));
-        // admin (not owner) should be able to trigger upgradeToAndCall
-        adminActor.callUpgrade(address(operator), address(newImpl));
-        require(operator.admin() == address(adminActor), "admin preserved after admin-initiated upgrade");
+        // admin (not owner) cannot trigger upgradeToAndCall
+        (bool ok, ) = address(adminActor).call(abi.encodeWithSignature("callUpgrade(address,address)", address(operator), address(newImpl)));
+        require(!ok, "admin cannot upgrade");
     }
 
-    // ─── onlyOwner: outsider rejected ───
+    // ─── onlyAdmin: outsider rejected ───
 
-    function testOnlyOwnerFunctionsRejectOutsider() public {
+    function testOnlyAdminFunctionsRejectOutsider() public {
         setUp();
         AdminActor outsider = new AdminActor(operator);
 
-        (bool ok,) = address(outsider).call(
-            abi.encodeWithSignature("callAcceptBuyerOperator(address,uint256)", buyer, uint256(1))
-        );
+        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("callAcceptBuyerOperator(address,uint256)", buyer, uint256(1)));
         require(!ok, "outsider cannot acceptBuyerOperator");
 
-        (ok,) = address(outsider).call(
-            abi.encodeWithSignature("callDepositFor(address,uint256,uint256)", buyer, uint256(1), uint256(0))
-        );
+        (ok, ) = address(outsider).call(abi.encodeWithSignature("callDepositFor(address,uint256,uint256)", buyer, uint256(1), uint256(0)));
         require(!ok, "outsider cannot depositFor");
 
-        (ok,) = address(outsider).call(
-            abi.encodeWithSignature("callApproveCurrentDeposits()")
-        );
+        (ok, ) = address(outsider).call(abi.encodeWithSignature("callApproveCurrentDeposits()"));
         require(!ok, "outsider cannot approveCurrentDeposits");
 
-        (ok,) = address(outsider).call(
-            abi.encodeWithSignature("callTransferBuyerOperator(address,address)", buyer, address(outsider))
-        );
+        (ok, ) = address(outsider).call(abi.encodeWithSignature("callTransferBuyerOperator(address,address)", buyer, address(outsider)));
         require(!ok, "outsider cannot transferBuyerOperator");
     }
 
@@ -685,34 +921,26 @@ contract AntseedBuyerOperatorTest {
         setUp();
         usdc.mint(address(operator), 1_000_000);
 
-        (bool ok,) = address(operator).call(
-            abi.encodeWithSignature("sweepToken(address,address,uint256)", address(0), recipient, uint256(1))
-        );
+        (bool ok, ) = address(operator).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(0), recipient, uint256(1)));
         require(!ok, "zero token address rejected");
 
-        (ok,) = address(operator).call(
-            abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), address(0), uint256(1))
-        );
+        (ok, ) = address(operator).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), address(0), uint256(1)));
         require(!ok, "zero recipient rejected");
 
-        (ok,) = address(operator).call(
-            abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), recipient, uint256(0))
-        );
+        (ok, ) = address(operator).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(usdc), recipient, uint256(0)));
         require(!ok, "zero amount rejected");
     }
 
     // ─── approveCurrentDeposits ───
 
-    function testApproveCurrentDepositsOnlyOwner() public {
+    function testApproveCurrentDepositsOnlyAdmin() public {
         setUp();
-        // owner can call
+        // owner can call admin operations too
         operator.approveCurrentDeposits();
 
         // outsider cannot
         AdminActor outsider = new AdminActor(operator);
-        (bool ok,) = address(outsider).call(
-            abi.encodeWithSignature("callApproveCurrentDeposits()")
-        );
+        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("callApproveCurrentDeposits()"));
         require(!ok, "outsider cannot approveCurrentDeposits");
     }
 
@@ -726,13 +954,11 @@ contract AntseedBuyerOperatorTest {
         require(deposits.getOperator(buyer) == newOp, "operator transferred");
     }
 
-    function testTransferBuyerOperatorOnlyOwner() public {
+    function testTransferBuyerOperatorOnlyAdmin() public {
         setUp();
         operator.acceptBuyerOperator(buyer, 1, "");
         AdminActor outsider = new AdminActor(operator);
-        (bool ok,) = address(outsider).call(
-            abi.encodeWithSignature("callTransferBuyerOperator(address,address)", buyer, address(outsider))
-        );
+        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("callTransferBuyerOperator(address,address)", buyer, address(outsider)));
         require(!ok, "outsider cannot transferBuyerOperator");
     }
 }
@@ -742,23 +968,38 @@ contract AntseedBuyerOperatorTest {
 contract AdminActor {
     AntseedBuyerOperator public operator;
 
-    constructor(AntseedBuyerOperator op) { operator = op; }
+    constructor(AntseedBuyerOperator op) {
+        operator = op;
+    }
 
-    function callTransferOwnership(address to) external { operator.transferOwnership(to); }
-    function callTransferAdmin(address to) external { operator.transferAdmin(to); }
+    function callTransferOwnership(address to) external {
+        operator.transferOwnership(to);
+    }
+
+    function callTransferAdmin(address to) external {
+        operator.transferAdmin(to);
+    }
+
     function callAcceptBuyerOperator(address buyer_, uint256 nonce) external {
         operator.acceptBuyerOperator(buyer_, nonce, "");
     }
+
     function callDepositFor(address buyer_, uint256 principal, uint256 bonus) external {
         operator.depositFor(buyer_, principal, bonus);
     }
+
     function callSweepToken(address token_, address recipient_, uint256 amount) external {
         operator.sweepToken(token_, recipient_, amount);
     }
-    function callApproveCurrentDeposits() external { operator.approveCurrentDeposits(); }
+
+    function callApproveCurrentDeposits() external {
+        operator.approveCurrentDeposits();
+    }
+
     function callTransferBuyerOperator(address buyer_, address newOp) external {
         operator.transferBuyerOperator(buyer_, newOp);
     }
+
     function callUpgrade(address proxy, address newImpl) external {
         AntseedBuyerOperator(proxy).upgradeToAndCall(newImpl, "");
     }

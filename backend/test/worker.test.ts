@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Interface } from "ethers";
-import worker from "../src/worker.js";
+import { Interface, Wallet } from "ethers";
+import worker, { fundCredit } from "../src/worker.js";
+import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
 import { Env } from "../src/env.js";
+import { KVCreditStore } from "../src/kv-credit-store.js";
 import { encodeVaultEventLog } from "../src/celo-events.js";
+import { GdCreditEntry } from "../src/types.js";
 
 class MemoryKV {
   private data = new Map<string, string>();
@@ -1054,7 +1057,7 @@ test("POST /v1/channels/:channelId/close with optional sig fields passes validat
     new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ timestamp: 1234567890, signature: `0x${"b".repeat(130)}` })
+      body: JSON.stringify({ nonce: "0", signature: `0x${"b".repeat(130)}` })
     }),
     env(),
     makeExecutionContext()
@@ -1111,6 +1114,41 @@ test("POST /v1/accounts/:account/operator-consent returns enabled:false when vau
   assert.equal(body.bridge.enabled, false);
 });
 
+test("POST /v1/accounts/:account/operator-revoke returns 400 on missing body fields", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${buyer}/operator-revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/accounts/:account/operator-revoke returns enabled:false when vault not configured", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${buyer}/operator-revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nonce: "0",
+        signature: `0x${"a".repeat(130)}`
+      })
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { buyer: string; bridge: { enabled: boolean; nonce: string } };
+  assert.equal(body.buyer, buyer);
+  assert.equal(body.bridge.enabled, false);
+  assert.equal(body.bridge.nonce, "0");
+});
+
 test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(
@@ -1134,7 +1172,7 @@ test("POST /v1/accounts/:account/withdraw returns 400 on invalid recipient addre
       body: JSON.stringify({
         amount: "5000000",
         recipient: "not-an-address",
-        timestamp: 1234567890,
+        nonce: "0",
         signature: `0x${"b".repeat(130)}`
       })
     }),
@@ -1154,7 +1192,7 @@ test("POST /v1/accounts/:account/withdraw returns enabled:false when vault not c
       body: JSON.stringify({
         amount: "5000000",
         recipient,
-        timestamp: 1234567890,
+        nonce: "0",
         signature: `0x${"b".repeat(130)}`
       })
     }),
@@ -1451,6 +1489,137 @@ test("GET /v1/accounts/:account/outstanding returns failed funding entries", asy
   assert.equal(body.failedFundingCredits.length, 1);
   assert.equal(body.failedFundingCredits[0].fundingStatus, "failed");
   assert.equal(body.failedFundingCredits[0].fundingError, "vault reverted");
+});
+
+test("/v1/celo/events/record sets stream bonus to 0 when buyer revoked operator", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const txHash = `0x${"7".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const goodIdAddr = "0x0000000000000000000000000000000000001234";
+  const originalFetch = globalThis.fetch;
+  const originalIsBuyerOperator = AntSeedFundingVaultClient.prototype.isBuyerOperator;
+  const originalDepositForBuyerWithId = AntSeedFundingVaultClient.prototype.depositForBuyerWithId;
+
+  let depositCalls = 0;
+
+  try {
+    const testEnv = env({
+      CELO_RPC_URL: "https://celo.rpc.local",
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GOODID_ADDRESS: goodIdAddr,
+      ANTSEED_FUNDING_RPC_URL: "https://base.rpc.local",
+      ANTSEED_FUNDING_VAULT_ADDRESS: "0x0000000000000000000000000000000000000b01",
+      ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY: Wallet.createRandom().privateKey
+    });
+
+    const streamLog = encodeVaultEventLog(
+      "StreamUpdated",
+      [account, buyer, 385_802_469_136n, 1_000_000_000_000_000_000n, 2_000_000_000_000_000_000n],
+      celoVault,
+      txHash,
+      0
+    );
+
+    AntSeedFundingVaultClient.prototype.isBuyerOperator = async function (operatorBuyer: string) {
+      return { enabled: true, buyer: operatorBuyer.toLowerCase(), isOperator: false };
+    };
+
+    AntSeedFundingVaultClient.prototype.depositForBuyerWithId = async function (operatorBuyer: string, principalUsd: bigint, bonusUsd: bigint) {
+      depositCalls += 1;
+      assert.equal(operatorBuyer, buyer.toLowerCase());
+      assert.equal(principalUsd, 200n);
+      assert.equal(bonusUsd, 0n);
+      return { enabled: true, buyer: operatorBuyer, amountUsd: "200", txHash: "0xfunded" };
+    };
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "eth_call") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: "0x000000000000000000000000abababababababababababababababababababab"
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [streamLog] } });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      makeExecutionContext()
+    );
+
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      events: Array<{ source: string; fundingStatus: string; principalUsd: string; bonusUsd: string; buyerAddress?: string }>;
+    };
+    assert.equal(body.events.length, 1);
+    assert.equal(body.events[0].source, "streamUpdate");
+    assert.equal(body.events[0].fundingStatus, "funded");
+    assert.equal(body.events[0].principalUsd, "200");
+    assert.equal(body.events[0].bonusUsd, "0");
+    assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
+    assert.equal(depositCalls, 1);
+  } finally {
+    AntSeedFundingVaultClient.prototype.isBuyerOperator = originalIsBuyerOperator;
+    AntSeedFundingVaultClient.prototype.depositForBuyerWithId = originalDepositForBuyerWithId;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("fundCredit deposits bonus-only credits when buyer still uses operator", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  const entry: GdCreditEntry = {
+    id: "stream:bonus-only:operator:test",
+    account: account.toLowerCase(),
+    rootAccount: account.toLowerCase(),
+    source: "streamUpdate",
+    gdAmountWei: "0",
+    principalUsd: "0",
+    bonusUsd: "40",
+    totalCreditUsd: "40",
+    fundingStatus: "pending",
+    createdAt: new Date().toISOString(),
+    streamUpdateMonth: "2026-08",
+    buyerAddress: buyer.toLowerCase()
+  };
+  await kv.put(`user:${account.toLowerCase()}`, JSON.stringify({ account: account.toLowerCase(), totalOutstandingFundingUsd: "40" }));
+
+  let depositCalls = 0;
+  const vault = {
+    enabled: true,
+    async isBuyerOperator() {
+      return { enabled: true, buyer: buyer.toLowerCase(), isOperator: true };
+    },
+    async depositForBuyerWithId(_buyer: string, principalUsd: bigint, bonusUsd: bigint, id: string) {
+      depositCalls += 1;
+      assert.equal(_buyer, buyer.toLowerCase());
+      assert.equal(principalUsd, 0n);
+      assert.equal(bonusUsd, 40n);
+      assert.equal(id, entry.id);
+      return { enabled: true, buyer: _buyer, amountUsd: "40", txHash: "0xfunded" };
+    }
+  };
+
+  const result = await fundCredit(entry, store, vault as never);
+  const updatedEntry = (await kv.get("gd-credit:stream:bonus-only:operator:test", "json")) as GdCreditEntry;
+  const profile = (await kv.get(`user:${account.toLowerCase()}`, "json")) as { totalOutstandingFundingUsd: string; totalBonusUsd: string };
+
+  assert.equal(depositCalls, 1);
+  assert.equal(updatedEntry.fundingStatus, "funded");
+  assert.equal(updatedEntry.fundingTxHash, "0xfunded");
+  assert.equal(profile.totalOutstandingFundingUsd, "0");
+  assert.equal(profile.totalBonusUsd, "40");
+  assert.deepEqual(result.bridge, { enabled: true, buyer: buyer.toLowerCase(), amountUsd: "40", txHash: "0xfunded" });
 });
 
 test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued within 24h", { concurrency: false }, async () => {
