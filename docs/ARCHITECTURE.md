@@ -82,7 +82,12 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 
 **Operator revoke** (`POST /v1/accounts/:account/operator-revoke`):
 
-- body: `nonce`, buyer EIP-712 `signature`
+- body: optional `nonce` + buyer EIP-712 `signature`; with both omitted the Worker sends an unsigned
+  revoke, which the contract allows because the Worker's operator wallet is the vault admin
+- the buyer signature (when supplied) is verified in the Worker before broadcasting, so a wrong signer
+  or stale nonce returns `400` instead of an opaque `InvalidSignature()` gas-estimation revert
+- EIP-712 domain: `{ name: "AntseedBuyerOperator", version: "1", chainId, verifyingContract: <vault> }`,
+  type `RevokeOperator(address buyer,uint256 nonce)`, `nonce` = `usedNonces(buyer)`
 - calls `AntseedBuyerOperator.revokeOperator(buyer, nonce, buyerSig)`
 
 **Channel close** (`POST /v1/channels/:channelId/close`):

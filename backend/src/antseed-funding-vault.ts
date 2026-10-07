@@ -11,10 +11,20 @@ const FUNDING_VAULT_ABI = [
   "function requestClose(bytes32 channelId, uint256 nonce, bytes buyerSig)",
   "function withdrawChannel(bytes32 channelId, uint256 nonce, bytes buyerSig)",
   "function registry() view returns (address)",
+  "function usedNonces(address buyer) view returns (uint256)",
   "function usedDepositIds(bytes32 id) view returns (bool)"
 ] as const;
 const REGISTRY_ABI = ["function deposits() view returns (address)"] as const;
 const DEPOSITS_ABI = ["function getOperator(address buyer) view returns (address)"] as const;
+
+const BUYER_OPERATOR_EIP712_NAME = "AntseedBuyerOperator";
+const BUYER_OPERATOR_EIP712_VERSION = "1";
+const REVOKE_OPERATOR_TYPES: Record<string, ethers.TypedDataField[]> = {
+  RevokeOperator: [
+    { name: "buyer", type: "address" },
+    { name: "nonce", type: "uint256" }
+  ]
+};
 
 export type AntSeedFundingResult = {
   enabled: boolean;
@@ -61,11 +71,45 @@ export class AntSeedFundingVaultClient {
     };
   }
 
+  /// Verifies a buyer's `RevokeOperator` signature locally so a bad signature fails with a
+  /// readable error instead of an opaque `InvalidSignature()` gas-estimation revert on-chain.
+  private async assertRevokeSignature(buyer: string, nonce: bigint, signature: string): Promise<void> {
+    const contract = this.contract!;
+    const chainId = (await contract.runner!.provider!.getNetwork()).chainId;
+    const domain = {
+      name: BUYER_OPERATOR_EIP712_NAME,
+      version: BUYER_OPERATOR_EIP712_VERSION,
+      chainId,
+      verifyingContract: await contract.getAddress()
+    };
+
+    let signer: string;
+    try {
+      signer = ethers.verifyTypedData(domain, REVOKE_OPERATOR_TYPES, { buyer, nonce }, signature);
+    } catch (error) {
+      throw new Error(`revoke signature is malformed: ${errorMessage(error)}`);
+    }
+
+    if (signer.toLowerCase() !== buyer) {
+      throw new Error(
+        `revoke signature does not match buyer: recovered ${signer.toLowerCase()} for buyer ${buyer}. ` +
+          `Sign EIP-712 domain {name: "${BUYER_OPERATOR_EIP712_NAME}", version: "${BUYER_OPERATOR_EIP712_VERSION}", chainId: ${chainId}, verifyingContract: "${domain.verifyingContract}"} ` +
+          `with type RevokeOperator(address buyer,uint256 nonce) using the buyer's own key.`
+      );
+    }
+
+    const expectedNonce: bigint = await contract.usedNonces(buyer);
+    if (expectedNonce !== nonce) {
+      throw new Error(`revoke nonce mismatch: expected ${expectedNonce.toString()}, got ${nonce.toString()}`);
+    }
+  }
+
   async revokeBuyerOperator(buyer: string, nonce: bigint, signature: string): Promise<{ enabled: boolean; buyer: string; nonce: string; txHash?: string }> {
     const normalizedBuyer = buyer.toLowerCase();
     if (!this.contract) {
       return { enabled: false, buyer: normalizedBuyer, nonce: nonce.toString() };
     }
+    if (signature !== "0x") await this.assertRevokeSignature(normalizedBuyer, nonce, signature);
     const tx = await this.contract.revokeOperator(normalizedBuyer, nonce, signature);
     const receipt = await tx.wait();
     return {

@@ -53,6 +53,10 @@ const OperatorConsentSchema = z.object({
   nonce: z.string().regex(/^\d+$/),
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
+const OperatorRevokeSchema = z.object({
+  nonce: z.string().regex(/^\d+$/).optional(),
+  signature: z.string().regex(/^0x[0-9a-fA-F]*$/).optional()
+});
 const CreditHistoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
   offset: z.coerce.number().int().min(0).default(0),
@@ -623,13 +627,26 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   if (request.method === "POST" && operatorRevokeMatch) {
     const buyer = decodeURIComponent(operatorRevokeMatch[1]).toLowerCase();
     const body = await parseJson(request);
-    const parsed = OperatorConsentSchema.safeParse(body);
+    const parsed = OperatorRevokeSchema.safeParse(body);
     if (!parsed.success) return json({ error: parsed.error.flatten() }, 400);
+    const signature = parsed.data.signature && parsed.data.signature !== "0x" ? parsed.data.signature : "0x";
+    const nonce = BigInt(parsed.data.nonce ?? "0");
     logInfo("operator.revoke.request", {
       buyer: redactAddress(buyer),
-      nonce: parsed.data.nonce
+      nonce: nonce.toString(),
+      signed: signature !== "0x"
     });
-    const bridge = await antseedFundingVault.revokeBuyerOperator(buyer, BigInt(parsed.data.nonce), parsed.data.signature);
+    let bridge;
+    try {
+      bridge = await antseedFundingVault.revokeBuyerOperator(buyer, nonce, signature);
+    } catch (error) {
+      const message = errorMessage(error);
+      if (message.startsWith("revoke signature") || message.startsWith("revoke nonce")) {
+        logWarn("operator.revoke.rejected", { buyer: redactAddress(buyer), error: message });
+        return json({ error: message }, 400);
+      }
+      throw error;
+    }
     logInfo("operator.revoke.result", {
       buyer: redactAddress(buyer),
       enabled: bridge.enabled,
