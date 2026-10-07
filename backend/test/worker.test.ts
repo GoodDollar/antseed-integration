@@ -1653,6 +1653,7 @@ test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued 
               {
                 sender: { id: account },
                 currentFlowRate: "1000000000000000",
+                createdAtTimestamp: "1735000000",
                 updatedAtTimestamp: "1735000000",
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
@@ -1703,6 +1704,7 @@ test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ a
               {
                 sender: { id: account },
                 currentFlowRate: "1",
+                createdAtTimestamp: "1735000000",
                 updatedAtTimestamp: "1735000000",
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
@@ -1738,7 +1740,7 @@ test("streamElapsedSeconds measures from the last credit when one exists", () =>
   assert.equal(elapsed, 24 * 60 * 60);
 });
 
-test("streamElapsedSeconds falls back to the stream's last update on the first credit", () => {
+test("streamElapsedSeconds falls back to the stream's creation on the first credit", () => {
   const now = new Date("2026-07-03T00:00:00.000Z");
   const elapsed = streamElapsedSeconds(now, undefined, "2026-07-02T00:00:00.000Z");
   assert.equal(elapsed, 24 * 60 * 60);
@@ -1748,8 +1750,28 @@ test("streamElapsedSeconds falls back to the stream's last update on the first c
 // all of it, so the full window is credited rather than capped.
 test("streamElapsedSeconds credits the whole window for a long gap", () => {
   const now = new Date("2026-09-11T06:00:00.000Z");
-  const elapsed = streamElapsedSeconds(now, "2026-01-01T00:00:00.000Z", "2026-07-02T00:00:00.000Z");
+  const elapsed = streamElapsedSeconds(now, "2026-01-01T00:00:00.000Z", "2025-06-01T00:00:00.000Z");
   assert.equal(elapsed, Math.floor((Date.parse("2026-09-11T06:00:00.000Z") - Date.parse("2026-01-01T00:00:00.000Z")) / 1000));
+});
+
+// Regression, from account 0x2ceade86...0627: stream a-0.0 ran 07-02 -> 07-06, then nothing flowed
+// for 53 days, then a new revision a-1.0 opened on 08-28. `lastStreamCreditAt` survives the close,
+// so without the creation floor the dormant gap gets credited at the new stream's rate.
+test("streamElapsedSeconds does not credit the gap before a re-opened stream", () => {
+  const now = new Date("2026-08-29T06:00:00.000Z");
+  const lastCreditOnClosedStream = "2026-07-02T18:24:14.244Z";
+  const reopenedAt = "2026-08-28T15:18:07.000Z";
+
+  const elapsed = streamElapsedSeconds(now, lastCreditOnClosedStream, reopenedAt);
+  assert.equal(elapsed, Math.floor((now.getTime() - Date.parse(reopenedAt)) / 1000));
+
+  const flowRateWeiPerSecond = 3433641975308641n; // 8900 G$/month
+  const credited = flowRateWeiPerSecond * BigInt(elapsed);
+  assert.ok(credited < 200n * 10n ** 18n, `expected under 200 G$, got ${credited}`);
+
+  // Without the floor the baseline would have been the pre-close credit, 57 days earlier.
+  const unflooredElapsed = Math.floor((now.getTime() - Date.parse(lastCreditOnClosedStream)) / 1000);
+  assert.ok(flowRateWeiPerSecond * BigInt(unflooredElapsed) > 16_000n * 10n ** 18n);
 });
 
 // Regression: a 1970 baseline made elapsedSeconds the whole Unix epoch, so a 9000 G$/month stream
@@ -1800,6 +1822,7 @@ test("POST /v1/accounts/:account/stream-credits does not credit the epoch on a z
               {
                 sender: { id: account },
                 currentFlowRate: "3472222222222222", // 9000 G$/month, the real account's rate
+                createdAtTimestamp: "0",
                 updatedAtTimestamp: "0",
                 flowUpdatedEvents: [{ userData: "0x" }]
               }

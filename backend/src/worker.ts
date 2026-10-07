@@ -80,6 +80,7 @@ const SuperfluidStreamsResponseSchema = z.object({
       z.object({
         sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
         currentFlowRate: z.string().regex(/^\d+$/),
+        createdAtTimestamp: z.string().regex(/^\d+$/),
         updatedAtTimestamp: z.string().regex(/^\d+$/),
         flowUpdatedEvents: z.array(
           z.object({
@@ -100,6 +101,8 @@ type SuperfluidIncomingStream = {
   account: string;
   flowRateWeiPerSecond: string;
   lastUpdateAt: string;
+  /** Start of this stream revision; a close/re-open produces a new revision with a later value. */
+  createdAt: string;
   /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
   buyerAddress?: string;
 };
@@ -163,7 +166,7 @@ export default {
     for (const stream of streams) {
       const profile = await store.getUser(stream.account);
       const now = new Date();
-      const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.lastUpdateAt);
+      const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.createdAt);
       const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
       if (elapsedSeconds < 60 * 60 * 24) {
         skippedCooldown += 1;
@@ -525,7 +528,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
     const gdPrice = await fetchCurrentGdPrice(cfg);
     const now = new Date();
-    const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, streams[0].lastUpdateAt);
+    const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, streams[0].createdAt);
 
     if (elapsedSeconds < 60 * 60 * 24) {
       // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
@@ -783,10 +786,17 @@ function createStreamFundingId(account: string, date: Date): string {
  * is inventing a window out of a baseline we never had. When neither timestamp is usable the
  * answer is 0, not "since the epoch".
  */
-export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | undefined, streamLastUpdateAt: string): number {
-  const baselineMs = Date.parse(lastStreamCreditAt || streamLastUpdateAt);
-  if (!Number.isFinite(baselineMs) || baselineMs <= 0) {
-    logWarn("stream.credits.unusable-baseline", { lastStreamCreditAt, streamLastUpdateAt });
+export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | undefined, streamCreatedAt: string): number {
+  const lastCreditMs = lastStreamCreditAt ? Date.parse(lastStreamCreditAt) : 0;
+  const createdMs = Date.parse(streamCreatedAt);
+  // The later of the two wins. `lastStreamCreditAt` alone is not enough: it survives a stream being
+  // closed, so a user who closes a stream and opens a new one months later would be credited for
+  // the whole dormant gap. `createdAt` is the start of the current revision, and the stream cannot
+  // have flowed before it. `createdAt` alone is not enough either -- it would re-credit everything
+  // since the stream began on every run.
+  const baselineMs = Math.max(Number.isFinite(lastCreditMs) ? lastCreditMs : 0, Number.isFinite(createdMs) ? createdMs : 0);
+  if (baselineMs <= 0) {
+    logWarn("stream.credits.unusable-baseline", { lastStreamCreditAt, streamCreatedAt });
     return 0;
   }
   return Math.max(0, Math.floor((now.getTime() - baselineMs) / 1000));
@@ -981,6 +991,7 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
               ) {
                 sender { id }
                 currentFlowRate
+                createdAtTimestamp
                 updatedAtTimestamp
                 flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
                   userData
@@ -1009,12 +1020,19 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
         // first stream credit, so a 1970 value makes that credit window decades wide.
         const hasUsableUpdatedAt = Number.isFinite(updatedAtSeconds) && updatedAtSeconds > 0;
         const lastUpdateAt = hasUsableUpdatedAt ? new Date(updatedAtSeconds * 1000).toISOString() : new Date().toISOString();
+        // Superfluid does not reuse a Stream entity across a close/re-open: the revision index in
+        // the id is bumped and a new entity is created. `createdAtTimestamp` is therefore the start
+        // of *this* revision, and the floor for anything it can be credited for.
+        const createdAtSeconds = Number(stream.createdAtTimestamp);
+        const hasUsableCreatedAt = Number.isFinite(createdAtSeconds) && createdAtSeconds > 0;
+        const createdAt = hasUsableCreatedAt ? new Date(createdAtSeconds * 1000).toISOString() : new Date().toISOString();
         const rawUserData = stream.flowUpdatedEvents[0]?.userData;
         const buyerAddress = decodeBuyerFromUserData(rawUserData);
         return {
           account: stream.sender.id.toLowerCase(),
           flowRateWeiPerSecond,
           lastUpdateAt,
+          createdAt,
           buyerAddress
         };
       });

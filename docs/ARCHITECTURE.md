@@ -123,7 +123,6 @@ Future payment mechanisms (sponsorships, org budgets, subscriptions, multi-buyer
 - total credit = `principalUsd + effectiveBonusUsd`
 - `totalOutstandingFundingUsd` tracks credit not yet funded to `AntseedBuyerOperator`; incremented when an entry is recorded and decremented when `fundingStatus` leaves `"pending"`, whether it lands on `"funded"` or `"failed"`
 - the profile's lifetime totals (`totalGdDepositedWei`, `totalGDStreamedWei`, `totalPrincipalUsd`, `totalBonusUsd`) only move when an entry is actually funded — a recorded-but-unfunded entry must never contribute, or the G$ counters drift above the credit granted. `streamFlowRateWeiPerSecond` is the exception: it is current state, not an accrual, so it is written at record time
-- `scripts/repair-credit-totals.ts` rebuilds those totals from a profile's credit entries, for profiles corrupted before this rule was enforced
 
 ## Non-goals
 
