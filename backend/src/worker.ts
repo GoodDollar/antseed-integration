@@ -3,7 +3,7 @@ import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
 import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdPrice, fetchGoodIdRoot, decodeBuyerFromUserData } from "./celo-events.js";
 import { Env, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
-import { GdCreditEntry } from "./types.js";
+import { GdCreditEntry, UserCreditProfile } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 import { getAnalyticsWindow, runAnalyticsAggregation, KVAnalyticsStore } from "./analytics.js";
 
@@ -181,11 +181,15 @@ export default {
       const account = stream.account.toLowerCase();
       flowRateByAccount.set(account, (flowRateByAccount.get(account) ?? 0n) + BigInt(stream.flowRateWeiPerSecond));
     }
+    // One profile read per account, reused by the crediting pass below.
+    const profileByAccount = new Map<string, UserCreditProfile>();
     for (const [account, flowRate] of flowRateByAccount) {
-      const before = await store.getUser(account);
-      if (before.streamFlowRateWeiPerSecond === flowRate.toString()) continue;
-      await store.recordStreamFlowRate(account, flowRate);
-      syncedFlowRates += 1;
+      const profile = await store.getUser(account);
+      if (await store.recordStreamFlowRate(profile, flowRate)) {
+        syncedFlowRates += 1;
+        profile.streamFlowRateWeiPerSecond = flowRate.toString();
+      }
+      profileByAccount.set(account, profile);
     }
 
     for (const stream of streams) {
@@ -194,7 +198,8 @@ export default {
         skippedInactive += 1;
         continue;
       }
-      const profile = await store.getUser(stream.account);
+      const profile = profileByAccount.get(stream.account.toLowerCase());
+      if (!profile) continue;
       const now = new Date();
       const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.createdAt);
       const gdAmountWei = flowRateWeiPerSecond * BigInt(elapsedSeconds);

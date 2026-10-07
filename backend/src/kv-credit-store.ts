@@ -124,24 +124,24 @@ export class KVCreditStore {
    * otherwise write the 0 is pushed in by `POST /v1/celo/events/record` and may never arrive.
    *
    * Deliberately leaves `lastStreamCreditAt` and every total alone -- this corrects current state,
-   * it does not settle anything. No-ops when the rate already matches, to avoid pointless writes.
+   * it does not settle anything. Takes the profile the caller already read rather than re-reading it,
+   * and returns whether a write was needed, so the rate is not compared twice.
    */
-  async recordStreamFlowRate(account: string, flowRate: bigint): Promise<void> {
-    const normalized = normalizeAccount(account);
-    const profile = await this.getUser(normalized);
+  async recordStreamFlowRate(profile: UserCreditProfile, flowRate: bigint): Promise<boolean> {
     const next = flowRate.toString();
-    if (profile.streamFlowRateWeiPerSecond === next) return;
+    if (profile.streamFlowRateWeiPerSecond === next) return false;
     const now = new Date().toISOString();
-    await this.updateUser(normalized, profile.rootAccount, (current) => ({
+    await this.updateUser(profile.account, profile.rootAccount, (current) => ({
       ...current,
       updatedAt: now,
       streamFlowRateWeiPerSecond: next
     }));
     logInfo("kv.stream.flow-rate-synced", {
-      account: redactAddress(normalized),
+      account: redactAddress(profile.account),
       previousFlowRateWeiPerSecond: profile.streamFlowRateWeiPerSecond,
       flowRateWeiPerSecond: next
     });
+    return true;
   }
 
   async markFundingResult(
