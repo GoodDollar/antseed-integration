@@ -96,7 +96,10 @@ export class KVCreditStore {
       rootAccount: rootAccount,
       createdAt: current.createdAt ?? now,
       updatedAt: now,
-      streamFlowRateWeiPerSecond: input.flowRate ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
+      // `!== undefined`, not a truthiness check: a terminated stream reports `flowRate = 0`, and
+      // treating that as "no value given" kept the closed stream's old rate on the profile forever.
+      // Recording the 0 is what makes the next stream start re-baseline instead of billing the gap.
+      streamFlowRateWeiPerSecond: input.flowRate !== undefined ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
       totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd)
     }));
 

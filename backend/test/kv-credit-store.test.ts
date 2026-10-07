@@ -487,3 +487,41 @@ test("getGdCreditHistory paginates filters and sorts newest first", async () => 
   assert.equal(ranged.total, 1);
   assert.equal(ranged.items[0].id, "b-mid");
 });
+
+// A terminated stream reports flowRate 0. The old truthiness check discarded it, leaving the closed
+// stream's rate on the profile, which is what let a later stream start bill the dormant gap.
+test("recordGdCredit records a zero flow rate on stream termination", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+
+  const opened = await store.recordGdCredit({
+    id: "stream:open",
+    account: "0xABC",
+    rootAccount: "0xROOT",
+    source: "streamUpdate",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    flowRate: 385_802_469_136n,
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapUsd: 100_000_000n
+  });
+  await store.markFundingResult(opened, { funded: true, txHash: "0xopen" });
+  assert.equal((await store.getUser("0xABC")).streamFlowRateWeiPerSecond, "385802469136");
+
+  const closed = await store.recordGdCredit({
+    id: "stream:close",
+    account: "0xABC",
+    rootAccount: "0xROOT",
+    source: "streamUpdate",
+    gdAmountWei: 500_000_000_000_000_000n,
+    flowRate: 0n,
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapUsd: 100_000_000n
+  });
+  await store.markFundingResult(closed, { funded: true, txHash: "0xclose" });
+
+  const after = await store.getUser("0xABC");
+  assert.equal(after.streamFlowRateWeiPerSecond, "0", "a closed stream must not keep its old rate");
+  // Which makes the next stream's owed window worth nothing, re-baselining instead of billing it.
+  assert.equal(BigInt(after.streamFlowRateWeiPerSecond) * 5_000_000n, 0n);
+});

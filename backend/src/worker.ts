@@ -408,6 +408,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     });
     const recorded = [];
     const gdPrice = await fetchCurrentGdPrice(cfg);
+    /** Per-request cache: one receipt can carry several stream events for the same account. */
+    const streamCreatedAtByAccount = new Map<string, string | undefined>();
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
 
@@ -450,6 +452,27 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         recorded.push(res);
       } else {
         const depositId = `${event.txHash}:${event.logIndex}`;
+        // The event's `totalFlowWei` is `previousFlowRate * (now - last on-chain flow change)` -- a
+        // baseline the backend does not track. It overlaps whatever the scheduled run will credit
+        // from `lastStreamCreditAt`, so crediting it double-counts the overlap. Credit the window
+        // the backend actually owes instead, at the rate that applied across it: the previously
+        // recorded rate, since `event.flowRateWeiPerSecond` is the new one only taking effect now.
+        //
+        // The window is also floored at the current stream revision's creation, so a stream opening
+        // after an earlier one closed cannot bill the dormant gap between them. That floor is read
+        // from the subgraph rather than inferred: the cron only ever sees active streams, so it can
+        // never record `flowRate = 0` on a close, and the termination event that would is pushed in
+        // by `POST /v1/celo/events/record` and may never arrive. A terminated stream is absent from
+        // the query (it filters on `currentFlowRate > 0`) and the floor simply does not apply --
+        // correct, because at termination the owed window is real.
+        const profile = await store.getUser(event.account);
+        if (!streamCreatedAtByAccount.has(event.account)) {
+          const accountStreams = await fetchSuperfluidStreamsForAccount(event.account, cfg);
+          streamCreatedAtByAccount.set(event.account, accountStreams[0]?.createdAt);
+        }
+        const streamCreatedAt = streamCreatedAtByAccount.get(event.account);
+        const elapsedSeconds = streamElapsedSeconds(new Date(), profile.lastStreamCreditAt, streamCreatedAt);
+        const gdAmountWei = BigInt(profile.streamFlowRateWeiPerSecond) * BigInt(elapsedSeconds);
         const buyerForOperatorCheck = event.buyer || event.account;
         const hasOperatorConsent =
           antseedFundingVault.enabled && event.totalFlowWei > 0n ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
@@ -459,7 +482,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           account: event.account,
           rootAccount,
           source: "streamUpdate",
-          gdAmountWei: event.totalFlowWei,
+          gdAmountWei,
           flowRate: event.flowRateWeiPerSecond,
           txHash: event.txHash,
           logIndex: event.logIndex,
@@ -475,7 +498,12 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           entryId: entry.id,
           account: redactAddress(entry.account),
           rootAccount: redactAddress(entry.rootAccount),
-          buyer: redactAddress(entry.buyerAddress)
+          buyer: redactAddress(entry.buyerAddress),
+          elapsedSeconds,
+          streamCreatedAt,
+          previousFlowRateWeiPerSecond: profile.streamFlowRateWeiPerSecond,
+          creditedGdAmountWei: gdAmountWei.toString(),
+          reportedTotalFlowWei: event.totalFlowWei.toString()
         });
         const res = await fundCredit(entry, store, antseedFundingVault);
         recorded.push(res);
@@ -786,9 +814,9 @@ function createStreamFundingId(account: string, date: Date): string {
  * is inventing a window out of a baseline we never had. When neither timestamp is usable the
  * answer is 0, not "since the epoch".
  */
-export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | undefined, streamCreatedAt: string): number {
+export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | undefined, streamCreatedAt?: string): number {
   const lastCreditMs = lastStreamCreditAt ? Date.parse(lastStreamCreditAt) : 0;
-  const createdMs = Date.parse(streamCreatedAt);
+  const createdMs = streamCreatedAt ? Date.parse(streamCreatedAt) : 0;
   // The later of the two wins. `lastStreamCreditAt` alone is not enough: it survives a stream being
   // closed, so a user who closes a stream and opens a new one months later would be credited for
   // the whole dormant gap. `createdAt` is the start of the current revision, and the stream cannot

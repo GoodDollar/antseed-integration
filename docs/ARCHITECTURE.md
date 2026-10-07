@@ -49,6 +49,21 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - parses `GdDeposited` and `StreamUpdated` events from `CeloGdAntSeedVault`
 - resolves `getWhitelistedRoot(account)` to determine GoodID verification and root-account aggregation
 - records a `GdCreditEntry` in KV and calls `fundCredit` immediately
+- for `StreamUpdated`, the credited amount is **not** the event's `totalFlowWei`. That figure is
+  `previousFlowRate * (now − last on-chain flow change)`, a baseline the backend does not track, so it
+  overlaps the window the scheduled run credits from `lastStreamCreditAt` and would be counted twice.
+  The amount is instead the window the backend owes — `streamFlowRateWeiPerSecond * elapsedSeconds`
+  measured from `lastStreamCreditAt`, at the previously recorded rate, since `event.flowRate` is the
+  new rate only taking effect now. Every stream credit therefore shares one baseline and one formula
+- the window is floored at the current stream revision's `createdAtTimestamp`, read from the subgraph
+  for the event's account, so a stream opening after an earlier one closed cannot bill the dormant gap
+  between them. A terminated stream is absent from that query (it filters on `currentFlowRate > 0`) and
+  the floor then does not apply, which is correct — at termination the owed window is real. The lookup
+  is cached per request, since one receipt can carry several stream events for the same account
+- termination also records `streamFlowRateWeiPerSecond = 0` (an explicit `!== undefined` check, because
+  `0` is falsy). That keeps the profile honest about a closed stream, but it is **not** what protects
+  the gap: the cron only ever sees active streams so it can never write the 0, and the termination
+  event that would is pushed in by this endpoint and may never arrive. The subgraph floor is the guard
 
 **Stream credit issuance** (`POST /v1/accounts/:account/stream-credits`):
 
