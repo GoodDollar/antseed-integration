@@ -118,6 +118,32 @@ export class KVCreditStore {
     return entry;
   }
 
+  /**
+   * Sync a profile's recorded flow rate to what the subgraph reports, including 0 for a stream that
+   * has closed. The subgraph is the source of truth here: the termination event that would
+   * otherwise write the 0 is pushed in by `POST /v1/celo/events/record` and may never arrive.
+   *
+   * Deliberately leaves `lastStreamCreditAt` and every total alone -- this corrects current state,
+   * it does not settle anything. No-ops when the rate already matches, to avoid pointless writes.
+   */
+  async recordStreamFlowRate(account: string, flowRate: bigint): Promise<void> {
+    const normalized = normalizeAccount(account);
+    const profile = await this.getUser(normalized);
+    const next = flowRate.toString();
+    if (profile.streamFlowRateWeiPerSecond === next) return;
+    const now = new Date().toISOString();
+    await this.updateUser(normalized, profile.rootAccount, (current) => ({
+      ...current,
+      updatedAt: now,
+      streamFlowRateWeiPerSecond: next
+    }));
+    logInfo("kv.stream.flow-rate-synced", {
+      account: redactAddress(normalized),
+      previousFlowRateWeiPerSecond: profile.streamFlowRateWeiPerSecond,
+      flowRateWeiPerSecond: next
+    });
+  }
+
   async markFundingResult(
     entry: GdCreditEntry,
     result: { funded: boolean; id?: string; txHash?: string; error?: string; credited?: boolean }

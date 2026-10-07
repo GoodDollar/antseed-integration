@@ -156,18 +156,48 @@ export default {
     });
 
     const gdPrice = await fetchCurrentGdPrice(cfg);
+    // Includes closed streams: a terminated stream reports `currentFlowRate = 0`, and seeing that is
+    // the only way the backend learns it stopped. The termination event that would otherwise say so
+    // is pushed in by `POST /v1/celo/events/record` and may never arrive.
     const streams = await fetchSuperfluidIncomingStreams(cfg);
+
+    let skippedInactive = 0;
+    let syncedFlowRates = 0;
     let skippedCooldown = 0;
     let skippedMinAmount = 0;
     let processed = 0;
     let funded = 0;
     let failed = 0;
     const createdAt = new Date().toISOString();
+
+    // Sync every account's recorded rate from the subgraph before crediting. Doing it here rather
+    // than inside `recordGdCredit` means it happens on every run, not only when a credit clears the
+    // cooldown and the minimum -- at a 4000 G$ minimum those can be a fortnight apart. Summed per
+    // account, because one account can hold several revisions (a closed stream and its replacement)
+    // and a closed row must not clobber the rate of the live one. All-closed sums to 0, which is
+    // how the profile stops advertising a stream that no longer exists.
+    const flowRateByAccount = new Map<string, bigint>();
     for (const stream of streams) {
+      const account = stream.account.toLowerCase();
+      flowRateByAccount.set(account, (flowRateByAccount.get(account) ?? 0n) + BigInt(stream.flowRateWeiPerSecond));
+    }
+    for (const [account, flowRate] of flowRateByAccount) {
+      const before = await store.getUser(account);
+      if (before.streamFlowRateWeiPerSecond === flowRate.toString()) continue;
+      await store.recordStreamFlowRate(account, flowRate);
+      syncedFlowRates += 1;
+    }
+
+    for (const stream of streams) {
+      const flowRateWeiPerSecond = BigInt(stream.flowRateWeiPerSecond);
+      if (flowRateWeiPerSecond === 0n) {
+        skippedInactive += 1;
+        continue;
+      }
       const profile = await store.getUser(stream.account);
       const now = new Date();
       const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.createdAt);
-      const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
+      const gdAmountWei = flowRateWeiPerSecond * BigInt(elapsedSeconds);
       if (elapsedSeconds < 60 * 60 * 24) {
         skippedCooldown += 1;
         continue;
@@ -219,6 +249,8 @@ export default {
       processed,
       skippedCooldown,
       skippedMinAmount,
+      skippedInactive,
+      syncedFlowRates,
       funded,
       failed,
       elapsedMs: Date.now() - startedAt
@@ -952,15 +984,24 @@ export async function fundCredit(
   }
 }
 
+/**
+ * Every stream to the vault, closed ones included. The scheduled run needs the closed rows: a
+ * terminated stream reports `currentFlowRate = 0`, which is how the backend learns it stopped.
+ */
 async function fetchSuperfluidIncomingStreams(cfg: ReturnType<typeof configFromEnv>): Promise<SuperfluidIncomingStream[]> {
-  return fetchSuperfluidStreams(cfg);
+  return fetchSuperfluidStreams(cfg, undefined, true);
 }
 
+/** Active streams for one account; callers here use it to answer "is this account streaming now". */
 async function fetchSuperfluidStreamsForAccount(account: string, cfg: ReturnType<typeof configFromEnv>): Promise<SuperfluidIncomingStream[]> {
   return fetchSuperfluidStreams(cfg, account);
 }
 
-async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, senderFilter?: string): Promise<SuperfluidIncomingStream[]> {
+async function fetchSuperfluidStreams(
+  cfg: ReturnType<typeof configFromEnv>,
+  senderFilter?: string,
+  includeClosed = false
+): Promise<SuperfluidIncomingStream[]> {
   if (!cfg.CELO_VAULT_ADDRESS || !cfg.CELO_GD_SUPERTOKEN_ADDRESS) {
     logWarn("superfluid.streams.skipped", {
       reason: "missing_config",
@@ -988,9 +1029,10 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
 
   try {
     while (true) {
-      const whereClause = senderFilter
-        ? `{ receiver: $receiver, token: $token, currentFlowRate_gt: "0", sender: $sender }`
-        : `{ receiver: $receiver, token: $token, currentFlowRate_gt: "0" }`;
+      const filters = ["receiver: $receiver", "token: $token"];
+      if (!includeClosed) filters.push(`currentFlowRate_gt: "0"`);
+      if (senderFilter) filters.push("sender: $sender");
+      const whereClause = `{ ${filters.join(", ")} }`;
       const queryParams = senderFilter
         ? `$receiver: String!, $token: String!, $first: Int!, $skip: Int!, $sender: String!`
         : `$receiver: String!, $token: String!, $first: Int!, $skip: Int!`;

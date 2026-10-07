@@ -2091,3 +2091,123 @@ test("/v1/celo/events/record floors the window at stream creation even with a st
     globalThis.fetch = originalFetch;
   }
 });
+
+// The subgraph is the source of truth for whether a stream still exists. A closed stream reports
+// currentFlowRate 0, and the cron must write that through — the termination event that would
+// otherwise do it is pushed in by POST /v1/celo/events/record and may never arrive.
+test("scheduled run zeroes the recorded flow rate once a stream closes", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const staleRate = 3_433_641_975_308_641n;
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    await kv.put(
+      `user:${account}`,
+      JSON.stringify({
+        account,
+        rootAccount: account,
+        createdAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString(),
+        updatedAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString(),
+        totalGdDepositedWei: "0",
+        totalBonusUsd: "0",
+        streamFlowRateWeiPerSecond: staleRate.toString(),
+        totalPrincipalUsd: "0",
+        totalGDStreamedWei: "0",
+        totalOutstandingFundingUsd: "0",
+        lastStreamCreditAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString()
+      })
+    );
+
+    const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
+    const createdAtSeconds = Math.floor(Date.now() / 1000) - 90 * 24 * 60 * 60;
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) {
+        // Two revisions for one account, both closed — the shape the live subgraph returns.
+        return Response.json({
+          data: {
+            streams: [0, 1].map((revision) => ({
+              sender: { id: account },
+              currentFlowRate: "0",
+              createdAtTimestamp: (createdAtSeconds + revision * 1000).toString(),
+              updatedAtTimestamp: (createdAtSeconds + revision * 2000).toString(),
+              flowUpdatedEvents: [{ userData: "0x" }]
+            }))
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv, makeExecutionContext());
+
+    const profile = await new KVCreditStore(kv as never).getUser(account);
+    assert.equal(profile.streamFlowRateWeiPerSecond, "0", "a closed stream must not keep advertising its rate");
+    // Current state only — the clock and the totals are settlement, and must not move here.
+    assert.equal(profile.totalGDStreamedWei, "0");
+    assert.equal(profile.totalPrincipalUsd, "0");
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});
+
+// One account can hold a closed revision and a live one at the same time. Summing per account is
+// what stops the closed row from clobbering the live rate, whatever order the subgraph returns them.
+test("scheduled run keeps the live rate when an account also has a closed revision", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const liveRate = 3_433_641_975_308_641n;
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) {
+        return Response.json({
+          data: {
+            streams: [
+              // Live revision first, closed one after it — the clobbering order.
+              {
+                sender: { id: account },
+                currentFlowRate: liveRate.toString(),
+                createdAtTimestamp: (nowSeconds - 3600).toString(),
+                updatedAtTimestamp: (nowSeconds - 3600).toString(),
+                flowUpdatedEvents: [{ userData: "0x" }]
+              },
+              {
+                sender: { id: account },
+                currentFlowRate: "0",
+                createdAtTimestamp: (nowSeconds - 90 * 24 * 3600).toString(),
+                updatedAtTimestamp: (nowSeconds - 60 * 24 * 3600).toString(),
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv, makeExecutionContext());
+
+    const profile = await new KVCreditStore(kv as never).getUser(account);
+    assert.equal(profile.streamFlowRateWeiPerSecond, liveRate.toString());
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});

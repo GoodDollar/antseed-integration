@@ -61,9 +61,8 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
   the floor then does not apply, which is correct — at termination the owed window is real. The lookup
   is cached per request, since one receipt can carry several stream events for the same account
 - termination also records `streamFlowRateWeiPerSecond = 0` (an explicit `!== undefined` check, because
-  `0` is falsy). That keeps the profile honest about a closed stream, but it is **not** what protects
-  the gap: the cron only ever sees active streams so it can never write the 0, and the termination
-  event that would is pushed in by this endpoint and may never arrive. The subgraph floor is the guard
+  `0` is falsy), but it is **not** what protects the gap — the subgraph floor above is. This endpoint is
+  push-based and the event may never arrive, which is why the scheduled run re-syncs the rate itself
 
 **Stream credit issuance** (`POST /v1/accounts/:account/stream-credits`):
 
@@ -82,8 +81,15 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 
 **Cron** (`0 */6 * * *` — every 6 hours, per `wrangler.toml`):
 
-- fetches all active incoming streams from the Superfluid subgraph
-- issues stream credits for each streamer and funds them
+- fetches **all** incoming streams from the Superfluid subgraph, closed ones included — a terminated
+  stream reports `currentFlowRate = 0`, and seeing that row is how the backend learns it stopped
+- syncs `streamFlowRateWeiPerSecond` for every account from that result before crediting, so the rate
+  is refreshed on every run rather than only when a credit clears the cooldown and the 4000 G$ minimum
+  (which can be a fortnight apart). The rate is **summed per account**: one account can hold a closed
+  revision alongside its replacement, and a closed row must not clobber the live one. All-closed sums
+  to 0, which is how a profile stops advertising a stream that no longer exists. This writes current
+  state only — `lastStreamCreditAt` and the lifetime totals are settlement and are left untouched
+- then issues stream credits for each account with a non-zero rate and funds them
 
 **Profile** (`GET /v1/accounts/:account/profile`):
 
