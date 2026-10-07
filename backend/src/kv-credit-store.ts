@@ -89,14 +89,14 @@ export class KVCreditStore {
     if (effectiveBonusUsd > 0n) {
       await this.addMonthlyBonusUsed(rootAccount, month, effectiveBonusUsd);
     }
+    // The G$ and USD totals are credited in `markFundingResult`, once funding actually lands. Only
+    // the outstanding balance moves here, because the entry is at this point owed but not yet paid.
     await this.updateUser(account, rootAccount, (current) => ({
       ...current,
       rootAccount: rootAccount,
       createdAt: current.createdAt ?? now,
       updatedAt: now,
       streamFlowRateWeiPerSecond: input.flowRate ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
-      totalGdDepositedWei: addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei),
-      totalGDStreamedWei: input.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
       totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd)
     }));
 
@@ -133,22 +133,27 @@ export class KVCreditStore {
     entry.fundingError = result.error;
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
 
-    if (result.funded) {
-      const now = new Date().toISOString();
-      const credited = result.credited !== false;
-      await this.updateUser(entry.account, entry.rootAccount, (current) => {
-        const outstanding = BigInt(current.totalOutstandingFundingUsd);
-        const creditAmount = BigInt(entry.totalCreditUsd);
-        return {
-          ...current,
-          updatedAt: now,
-          lastStreamCreditAt: entry.source.startsWith("stream") ? now : current.lastStreamCreditAt,
-          totalPrincipalUsd: (BigInt(current.totalPrincipalUsd) + (credited ? BigInt(entry.principalUsd) : 0n)).toString(),
-          totalBonusUsd: (BigInt(current.totalBonusUsd) + (credited ? BigInt(entry.bonusUsd) : 0n)).toString(),
-          totalOutstandingFundingUsd: (outstanding > creditAmount ? outstanding - creditAmount : 0n).toString()
-        };
-      });
-    }
+    // `funded` and `failed` are both terminal -- funding is never retried for an entry -- so either
+    // way the entry stops being outstanding. Only a funded entry adds to the lifetime totals; a
+    // failed one must leave them untouched, or the G$ counters drift above the credit actually
+    // granted (what produced a 6.2M G$ "deposited" profile against a $4 balance).
+    const now = new Date().toISOString();
+    const credited = result.funded && result.credited !== false;
+    await this.updateUser(entry.account, entry.rootAccount, (current) => {
+      const outstanding = BigInt(current.totalOutstandingFundingUsd);
+      const creditAmount = BigInt(entry.totalCreditUsd);
+      return {
+        ...current,
+        updatedAt: now,
+        lastStreamCreditAt: result.funded && entry.source.startsWith("stream") ? now : current.lastStreamCreditAt,
+        totalGdDepositedWei: credited ? addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei) : current.totalGdDepositedWei,
+        totalGDStreamedWei:
+          credited && entry.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
+        totalPrincipalUsd: (BigInt(current.totalPrincipalUsd) + (credited ? BigInt(entry.principalUsd) : 0n)).toString(),
+        totalBonusUsd: (BigInt(current.totalBonusUsd) + (credited ? BigInt(entry.bonusUsd) : 0n)).toString(),
+        totalOutstandingFundingUsd: (outstanding > creditAmount ? outstanding - creditAmount : 0n).toString()
+      };
+    });
     logInfo("kv.funding.result", {
       entryId: entry.id,
       account: redactAddress(entry.account),

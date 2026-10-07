@@ -163,8 +163,7 @@ export default {
     for (const stream of streams) {
       const profile = await store.getUser(stream.account);
       const now = new Date();
-      const lastCreditMs = Date.parse(profile.lastStreamCreditAt || stream.lastUpdateAt);
-      const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));
+      const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.lastUpdateAt);
       const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
       if (elapsedSeconds < 60 * 60 * 24) {
         skippedCooldown += 1;
@@ -526,8 +525,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
     const gdPrice = await fetchCurrentGdPrice(cfg);
     const now = new Date();
-    const lastCreditMs = Date.parse(profile.lastStreamCreditAt || streams[0].lastUpdateAt);
-    const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));
+    const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, streams[0].lastUpdateAt);
 
     if (elapsedSeconds < 60 * 60 * 24) {
       // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
@@ -776,6 +774,24 @@ function createStreamFundingId(account: string, date: Date): string {
   return `stream:${day}:${account.toLowerCase()}`;
 }
 
+/**
+ * Seconds of stream to credit on this run, measured from the account's last stream credit or --
+ * on the first credit -- from the stream's last on-chain update.
+ *
+ * The window is deliberately not capped: a long gap means the stream really did flow for that
+ * whole time (a stalled cron, a backfill), and the credit should reflect it. What must not happen
+ * is inventing a window out of a baseline we never had. When neither timestamp is usable the
+ * answer is 0, not "since the epoch".
+ */
+export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | undefined, streamLastUpdateAt: string): number {
+  const baselineMs = Date.parse(lastStreamCreditAt || streamLastUpdateAt);
+  if (!Number.isFinite(baselineMs) || baselineMs <= 0) {
+    logWarn("stream.credits.unusable-baseline", { lastStreamCreditAt, streamLastUpdateAt });
+    return 0;
+  }
+  return Math.max(0, Math.floor((now.getTime() - baselineMs) / 1000));
+}
+
 async function readAnalyticsRefreshTimestamp(kv: Pick<KVNamespace, "get">): Promise<number | undefined> {
   const raw = await kv.get(ANALYTICS_REFRESH_LAST_RUN_KEY);
   if (!raw) return undefined;
@@ -989,7 +1005,10 @@ async function fetchSuperfluidStreams(cfg: ReturnType<typeof configFromEnv>, sen
       const batch = parsed.data.data.streams.map((stream) => {
         const flowRateWeiPerSecond = stream.currentFlowRate;
         const updatedAtSeconds = Number(stream.updatedAtTimestamp);
-        const lastUpdateAt = Number.isFinite(updatedAtSeconds) ? new Date(updatedAtSeconds * 1000).toISOString() : new Date().toISOString();
+        // A zero `updatedAtTimestamp` must not become 1970: this is the baseline for an account's
+        // first stream credit, so a 1970 value makes that credit window decades wide.
+        const hasUsableUpdatedAt = Number.isFinite(updatedAtSeconds) && updatedAtSeconds > 0;
+        const lastUpdateAt = hasUsableUpdatedAt ? new Date(updatedAtSeconds * 1000).toISOString() : new Date().toISOString();
         const rawUserData = stream.flowUpdatedEvents[0]?.userData;
         const buyerAddress = decodeBuyerFromUserData(rawUserData);
         return {

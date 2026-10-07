@@ -38,9 +38,15 @@ test("recordGdCredit persists entry and updates user profile", async () => {
   assert.equal(entry.totalCreditUsd, "11000000");
   assert.equal(entry.fundingStatus, "pending");
 
+  // Lifetime G$ only moves once funding lands; until then the credit is merely outstanding.
+  const pending = await store.getUser("0xABC");
+  assert.equal(pending.totalGdDepositedWei, "0");
+  assert.equal(pending.totalOutstandingFundingUsd, "11000000");
+
+  await store.markFundingResult(entry, { funded: true, txHash: "0xfunded" });
   const user = await store.getUser("0xABC");
   assert.equal(user.totalGdDepositedWei, "10000000000000000000");
-  assert.equal(user.totalOutstandingFundingUsd, "11000000");
+  assert.equal(user.totalOutstandingFundingUsd, "0");
 });
 
 test("recordGdCredit is idempotent on duplicate id", async () => {
@@ -90,6 +96,11 @@ test("recordGdCredit gives streaming bonus (20%) for stream sources", async () =
   assert.equal(entry.bonusUsd, "200000"); // 20% streaming bonus
   assert.equal(entry.totalCreditUsd, "1200000");
 
+  const pending = await store.getUser("0xABC");
+  assert.equal(pending.totalGDStreamedWei, "0");
+  assert.equal(pending.streamFlowRateWeiPerSecond, "385802469136"); // current rate, not an accrual
+
+  await store.markFundingResult(entry, { funded: true, txHash: "0xfunded" });
   const user = await store.getUser("0xABC");
   assert.equal(user.totalGDStreamedWei, "1000000000000000000");
   assert.equal(user.streamFlowRateWeiPerSecond, "385802469136");
@@ -113,6 +124,7 @@ test("recordGdCredit gives streaming bonus (20%) for streamUpdate source", async
   assert.equal(entry.bonusUsd, "1000000"); // 20% streaming bonus
   assert.equal(entry.totalCreditUsd, "6000000");
 
+  await store.markFundingResult(entry, { funded: true, txHash: "0xfunded" });
   const user = await store.getUser("0xABC");
   assert.equal(user.totalGDStreamedWei, "5000000000000000000");
   assert.equal(user.streamFlowRateWeiPerSecond, "1929012345679");
@@ -204,7 +216,7 @@ test("markFundingResult updates entry status and user profile on success", async
   assert.equal(user.totalOutstandingFundingUsd, "0");
 });
 
-test("markFundingResult records failure without updating user totals", async () => {
+test("markFundingResult records failure without crediting totals and clears outstanding", async () => {
   const store = new KVCreditStore(new MemoryKV() as never);
   const entry = await store.recordGdCredit({
     id: "deposit:fail1",
@@ -223,7 +235,8 @@ test("markFundingResult records failure without updating user totals", async () 
 
   const user = await store.getUser("0xABC");
   assert.equal(user.totalPrincipalUsd, "0"); // not updated on failure
-  assert.equal(user.totalOutstandingFundingUsd, "1100000"); // still outstanding
+  assert.equal(user.totalGdDepositedWei, "0"); // a failed credit must not inflate deposited G$
+  assert.equal(user.totalOutstandingFundingUsd, "0"); // terminal, never retried, so no longer owed
 });
 
 test("markFundingResult is idempotent for already-funded entries", async () => {
@@ -246,7 +259,7 @@ test("markFundingResult is idempotent for already-funded entries", async () => {
 
 test("recordGdCredit tracks credits under both wallet and root account", async () => {
   const store = new KVCreditStore(new MemoryKV() as never);
-  await store.recordGdCredit({
+  const entry = await store.recordGdCredit({
     id: "deposit:root1",
     account: "0xWALLET",
     rootAccount: "0xROOT",
@@ -256,6 +269,7 @@ test("recordGdCredit tracks credits under both wallet and root account", async (
     isVerified: true,
     maxBonusCapUsd: 100_000_000n
   });
+  await store.markFundingResult(entry, { funded: true, txHash: "0xfunded" });
 
   const walletCredits = await store.getGdCredits("0xWALLET");
   const rootCredits = await store.getGdCredits("0xROOT");

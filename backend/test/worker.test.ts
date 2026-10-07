@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface, Wallet } from "ethers";
-import worker, { fundCredit } from "../src/worker.js";
+import worker, { fundCredit, streamElapsedSeconds } from "../src/worker.js";
 import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
 import { Env } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
@@ -1727,6 +1727,105 @@ test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ a
     assert.ok(body.elapsedSeconds > 0);
     assert.equal(body.streams.length, 1);
     assert.ok(body.streams[0].message.includes("below minimum"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("streamElapsedSeconds measures from the last credit when one exists", () => {
+  const now = new Date("2026-09-11T06:00:00.000Z");
+  const elapsed = streamElapsedSeconds(now, "2026-09-10T06:00:00.000Z", "2026-07-02T00:00:00.000Z");
+  assert.equal(elapsed, 24 * 60 * 60);
+});
+
+test("streamElapsedSeconds falls back to the stream's last update on the first credit", () => {
+  const now = new Date("2026-07-03T00:00:00.000Z");
+  const elapsed = streamElapsedSeconds(now, undefined, "2026-07-02T00:00:00.000Z");
+  assert.equal(elapsed, 24 * 60 * 60);
+});
+
+// A long gap is legitimate -- a stalled cron or a backfill -- and the stream really did flow for
+// all of it, so the full window is credited rather than capped.
+test("streamElapsedSeconds credits the whole window for a long gap", () => {
+  const now = new Date("2026-09-11T06:00:00.000Z");
+  const elapsed = streamElapsedSeconds(now, "2026-01-01T00:00:00.000Z", "2026-07-02T00:00:00.000Z");
+  assert.equal(elapsed, Math.floor((Date.parse("2026-09-11T06:00:00.000Z") - Date.parse("2026-01-01T00:00:00.000Z")) / 1000));
+});
+
+// Regression: a 1970 baseline made elapsedSeconds the whole Unix epoch, so a 9000 G$/month stream
+// was credited 6.19M G$ (~$730) in a single entry.
+test("streamElapsedSeconds rejects an epoch-zero baseline instead of crediting 56 years", () => {
+  const now = new Date("2026-07-02T18:22:51.590Z");
+  const elapsed = streamElapsedSeconds(now, undefined, "1970-01-01T00:00:00.000Z");
+  assert.equal(elapsed, 0);
+
+  const flowRateWeiPerSecond = (9000n * 10n ** 18n) / 2592000n;
+  assert.equal(flowRateWeiPerSecond * BigInt(elapsed), 0n);
+  // What the old code produced for this exact account:
+  assert.equal(flowRateWeiPerSecond * BigInt(Math.floor(now.getTime() / 1000)), 6191029760416666270440762n);
+});
+
+test("streamElapsedSeconds rejects an unparseable baseline", () => {
+  const now = new Date("2026-09-11T06:00:00.000Z");
+  assert.equal(streamElapsedSeconds(now, undefined, "not-a-date"), 0);
+});
+
+test("streamElapsedSeconds never returns a negative window", () => {
+  const now = new Date("2026-07-02T00:00:00.000Z");
+  assert.equal(streamElapsedSeconds(now, "2026-09-11T06:00:00.000Z", "2026-07-02T00:00:00.000Z"), 0);
+});
+
+// Regression: the subgraph returning `updatedAtTimestamp: "0"` used to become a 1970 baseline,
+// which credited the whole Unix epoch of stream in one entry.
+test("POST /v1/accounts/:account/stream-credits does not credit the epoch on a zero subgraph timestamp", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const originalFetch = globalThis.fetch;
+
+  try {
+    const kv = new MemoryKV();
+    const testEnv = env({
+      ANTSEED_KV: kv as never,
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken
+    });
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.query) {
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "3472222222222222", // 9000 G$/month, the real account's rate
+                updatedAtTimestamp: "0",
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x0000000000000000000000000000000000000000000000000000000000000000" });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, {
+        method: "POST",
+        headers: { "content-type": "application/json" }
+      }),
+      testEnv,
+      makeExecutionContext()
+    );
+
+    assert.equal(res.status, 200);
+    const store = new KVCreditStore(kv as never);
+    const credits = await store.getGdCredits(account);
+    assert.equal(credits.length, 0, "a zero subgraph timestamp must not produce a credit entry");
+    const profile = await store.getUser(account);
+    assert.equal(profile.totalGdDepositedWei, "0");
+    assert.equal(profile.totalGDStreamedWei, "0");
   } finally {
     globalThis.fetch = originalFetch;
   }

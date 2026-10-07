@@ -53,7 +53,12 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 **Stream credit issuance** (`POST /v1/accounts/:account/stream-credits`):
 
 - reads active Superfluid streams for the account from the subgraph
-- computes elapsed seconds since last credit (24-hour cooldown enforced)
+- computes elapsed seconds since last credit (24-hour cooldown enforced), measured from
+  `lastStreamCreditAt` or — on an account's first credit — the stream's `updatedAtTimestamp`
+- a non-positive or unparseable baseline yields 0 rather than a window measured from the epoch: a
+  stream credit is `flowRate * elapsedSeconds`, so a bad upstream timestamp would otherwise become
+  decades of credit in a single entry. The window itself is **not** capped — a long gap (stalled
+  cron, backfill) means the stream really did flow that whole time and the credit should reflect it
 - records a `GdCreditEntry` per stream and calls `fundCredit`
 
 **Cron (every minute)**:
@@ -98,8 +103,9 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 **Funding path** (`fundCredit`):
 
 - calls `AntSeedFundingVaultClient.depositForBuyerWithId(buyer, principal, bonus, id)` — uses the `buyer` from the credit entry, or falls back to `account`
-- on success: marks entry `funded`, decrements `totalOutstandingFundingUsd`
-- on failure: marks entry `failed`, preserves `fundingError`
+- on success: marks entry `funded`, credits the profile's lifetime totals, decrements `totalOutstandingFundingUsd`
+- on failure: marks entry `failed`, preserves `fundingError`, leaves the lifetime totals untouched, and
+  decrements `totalOutstandingFundingUsd` — both statuses are terminal, so a failed entry is never retried
 
 ### AntSeed payment boundary
 
@@ -115,7 +121,9 @@ Future payment mechanisms (sponsorships, org budgets, subscriptions, multi-buyer
 - unverified accounts (no GoodID root): bonus = 0
 - monthly bonus cap: the effective bonus is capped to `MAX_BONUS_CAP_USD - monthlyBonusUsed` for the root account; cap is tracked in `monthly-bonus:<rootAccount>:YYYY-MM`
 - total credit = `principalUsd + effectiveBonusUsd`
-- `totalOutstandingFundingUsd` tracks credit not yet successfully funded to `AntseedBuyerOperator`; decremented when `fundingStatus` transitions to `"funded"`
+- `totalOutstandingFundingUsd` tracks credit not yet funded to `AntseedBuyerOperator`; incremented when an entry is recorded and decremented when `fundingStatus` leaves `"pending"`, whether it lands on `"funded"` or `"failed"`
+- the profile's lifetime totals (`totalGdDepositedWei`, `totalGDStreamedWei`, `totalPrincipalUsd`, `totalBonusUsd`) only move when an entry is actually funded — a recorded-but-unfunded entry must never contribute, or the G$ counters drift above the credit granted. `streamFlowRateWeiPerSecond` is the exception: it is current state, not an accrual, so it is written at record time
+- `scripts/repair-credit-totals.ts` rebuilds those totals from a profile's credit entries, for profiles corrupted before this rule was enforced
 
 ## Non-goals
 
