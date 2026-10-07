@@ -778,8 +778,8 @@ function createStreamFundingId(account: string, date: Date): string {
 }
 
 /**
- * Seconds of stream to credit on this run, measured from the account's last stream credit or --
- * on the first credit -- from the stream's last on-chain update.
+ * Seconds of stream to credit on this run: the window from the later of the account's last stream
+ * credit and the current stream revision's creation, up to `now`.
  *
  * The window is deliberately not capped: a long gap means the stream really did flow for that
  * whole time (a stalled cron, a backfill), and the credit should reflect it. What must not happen

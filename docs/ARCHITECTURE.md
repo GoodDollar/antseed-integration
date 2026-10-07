@@ -53,15 +53,19 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 **Stream credit issuance** (`POST /v1/accounts/:account/stream-credits`):
 
 - reads active Superfluid streams for the account from the subgraph
-- computes elapsed seconds since last credit (24-hour cooldown enforced), measured from
-  `lastStreamCreditAt` or — on an account's first credit — the stream's `updatedAtTimestamp`
+- computes elapsed seconds since last credit (24-hour cooldown enforced), measured from the **later**
+  of `lastStreamCreditAt` and the stream's `createdAtTimestamp`
+- the creation floor matters because `lastStreamCreditAt` survives a stream being closed. Superfluid
+  does not reuse a `Stream` entity across a close/re-open — it bumps the revision index in the id and
+  creates a new entity — so `createdAtTimestamp` is the start of the *current* revision. Without it,
+  an account that closes a stream and opens a new one months later is credited for the dormant gap
 - a non-positive or unparseable baseline yields 0 rather than a window measured from the epoch: a
   stream credit is `flowRate * elapsedSeconds`, so a bad upstream timestamp would otherwise become
   decades of credit in a single entry. The window itself is **not** capped — a long gap (stalled
   cron, backfill) means the stream really did flow that whole time and the credit should reflect it
 - records a `GdCreditEntry` per stream and calls `fundCredit`
 
-**Cron (every minute)**:
+**Cron** (`0 */6 * * *` — every 6 hours, per `wrangler.toml`):
 
 - fetches all active incoming streams from the Superfluid subgraph
 - issues stream credits for each streamer and funds them
