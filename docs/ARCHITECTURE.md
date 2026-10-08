@@ -55,11 +55,12 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
   The amount is instead the window the backend owes — `streamFlowRateWeiPerSecond * elapsedSeconds`
   measured from `lastStreamCreditAt`, at the previously recorded rate, since `event.flowRate` is the
   new rate only taking effect now. Every stream credit therefore shares one baseline and one formula
-- the window is floored at the current stream revision's `createdAtTimestamp`, read from the subgraph
-  for the event's account, so a stream opening after an earlier one closed cannot bill the dormant gap
-  between them. A terminated stream is absent from that query (it filters on `currentFlowRate > 0`) and
-  the floor then does not apply, which is correct — at termination the owed window is real. The lookup
-  is cached per request, since one receipt can carry several stream events for the same account
+- the window is floored at the stream's `updatedAtTimestamp`, read from the subgraph for the event's
+  account, so a stream opening after an earlier one closed cannot bill the dormant gap between them.
+  A terminated stream is absent from that query (it filters on `currentFlowRate > 0`) so the floor
+  does not apply there — the owed window at termination is real, but it is also **not bounded by what
+  actually flowed**, which is a known gap. The lookup is cached per request, since one receipt can
+  carry several stream events for the same account
 - termination also records `streamFlowRateWeiPerSecond = 0` (an explicit `!== undefined` check, because
   `0` is falsy), but it is **not** what protects the gap — the subgraph floor above is. This endpoint is
   push-based and the event may never arrive, which is why the scheduled run re-syncs the rate itself
@@ -68,11 +69,15 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 
 - reads active Superfluid streams for the account from the subgraph
 - computes elapsed seconds since last credit (24-hour cooldown enforced), measured from the **later**
-  of `lastStreamCreditAt` and the stream's `createdAtTimestamp`
-- the creation floor matters because `lastStreamCreditAt` survives a stream being closed. Superfluid
-  does not reuse a `Stream` entity across a close/re-open — it bumps the revision index in the id and
-  creates a new entity — so `createdAtTimestamp` is the start of the *current* revision. Without it,
-  an account that closes a stream and opens a new one months later is credited for the dormant gap
+  of `lastStreamCreditAt` and the stream's `updatedAtTimestamp`
+- the floor matters because `lastStreamCreditAt` survives a stream being closed. `updatedAtTimestamp`
+  moves forward on every create, rate change and close, so a stale clock can never be reached again —
+  an account that closes a stream and opens a new one months later is not credited for the dormant
+  gap, and a brief high-rate stream cannot be charged across weeks of uncredited time
+- the trade-off is deliberate: the floor also moves on a plain rate change, so if the resulting
+  `StreamUpdated` event is never ingested (that endpoint is push-only, with no retry) the window
+  between the last credit and the rate change is skipped and never paid. This errs towards
+  under-crediting rather than over-crediting
 - a non-positive or unparseable baseline yields 0 rather than a window measured from the epoch: a
   stream credit is `flowRate * elapsedSeconds`, so a bad upstream timestamp would otherwise become
   decades of credit in a single entry. The window itself is **not** capped — a long gap (stalled

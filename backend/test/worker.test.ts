@@ -1798,7 +1798,7 @@ test("streamElapsedSeconds measures from the last credit when one exists", () =>
   assert.equal(elapsed, 24 * 60 * 60);
 });
 
-test("streamElapsedSeconds falls back to the stream's creation on the first credit", () => {
+test("streamElapsedSeconds falls back to the stream's last on-chain update on the first credit", () => {
   const now = new Date("2026-07-03T00:00:00.000Z");
   const elapsed = streamElapsedSeconds(now, undefined, "2026-07-02T00:00:00.000Z");
   assert.equal(elapsed, 24 * 60 * 60);
@@ -2000,7 +2000,7 @@ test("/v1/celo/events/record re-baselines on stream start instead of billing the
 // The floor must not depend on the close having been ingested. Here the profile still carries the
 // closed stream's rate (the termination event never arrived), and only the subgraph's
 // `createdAtTimestamp` prevents the opening event from billing the 53-day dormant gap.
-test("/v1/celo/events/record floors the window at stream creation even with a stale flow rate", { concurrency: false }, async () => {
+test("/v1/celo/events/record floors the window at the stream's last update even with a stale flow rate", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"a".repeat(64)}`;
@@ -2453,7 +2453,7 @@ test("scheduled run credits a live stream from its last credit", { concurrency: 
 // Regression for the production incident: the stored clock was ~51 days stale while the subgraph
 // still reported the stream at its opening rate, producing a single 15,244.93 G$ credit for a
 // stream that had stopped flowing weeks earlier. The creation floor bounds it.
-test("scheduled run bounds the credit by stream creation when the clock is stale", { concurrency: false }, async () => {
+test("scheduled run bounds the credit by the stream's last update when the clock is stale", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000ac3";
   const kv = new MemoryKV();
   // Clock predates the current stream revision by seven weeks.
@@ -2495,3 +2495,37 @@ test("scheduled run prices a rate change at the rate the subgraph reports", { co
   assert.equal((await store.getUser(account)).streamFlowRateWeiPerSecond, halvedRate.toString());
 });
 
+
+// The distinguishing property of flooring on `updatedAtTimestamp` rather than `createdAtTimestamp`:
+// a plain rate change moves the floor too. That is what makes a stale clock unreachable, and it is
+// also the trade-off -- if the resulting StreamUpdated event is never ingested, the window between
+// the last credit and the rate change is skipped and never paid.
+test("streamElapsedSeconds floors at a rate change, not only at stream creation", () => {
+  const now = new Date("2026-02-10T00:00:00.000Z");
+  const lastCredit = "2026-01-15T00:00:00.000Z";
+  const rateChangedAt = "2026-02-01T00:00:00.000Z";
+
+  const elapsed = streamElapsedSeconds(now, lastCredit, rateChangedAt);
+  assert.equal(elapsed, 9 * 24 * 60 * 60, "window starts at the rate change, not the last credit");
+
+  // The 17 days between the last credit and the rate change are deliberately not included here --
+  // they are the StreamUpdated event's to pay.
+  const sinceLastCredit = Math.floor((now.getTime() - Date.parse(lastCredit)) / 1000);
+  assert.equal(sinceLastCredit - elapsed, 17 * 24 * 60 * 60);
+});
+
+// A brief high-rate stream opened and closed between cron ticks cannot later be charged against a
+// stale clock: the next stream carries a fresh on-chain update that becomes the floor.
+test("streamElapsedSeconds makes a stale clock unreachable after a new stream opens", () => {
+  const now = new Date("2026-02-10T00:00:00.000Z");
+  const staleClock = "2026-01-10T00:00:00.000Z"; // 31 days of uncredited time
+  const openedAt = "2026-02-09T22:00:00.000Z"; // new stream, two hours old
+
+  const elapsed = streamElapsedSeconds(now, staleClock, openedAt);
+  assert.equal(elapsed, 2 * 60 * 60);
+
+  const hugeRate = 1_000_000n * 10n ** 18n; // 1M G$/second
+  const credited = hugeRate * BigInt(elapsed);
+  const unfloored = hugeRate * BigInt(Math.floor((now.getTime() - Date.parse(staleClock)) / 1000));
+  assert.ok(unfloored / credited > 300n, "the stale window would have been orders of magnitude larger");
+});

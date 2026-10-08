@@ -80,7 +80,6 @@ const SuperfluidStreamsResponseSchema = z.object({
       z.object({
         sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
         currentFlowRate: z.string().regex(/^\d+$/),
-        createdAtTimestamp: z.string().regex(/^\d+$/),
         updatedAtTimestamp: z.string().regex(/^\d+$/),
         flowUpdatedEvents: z.array(
           z.object({
@@ -101,8 +100,6 @@ type SuperfluidIncomingStream = {
   account: string;
   flowRateWeiPerSecond: string;
   lastUpdateAt: string;
-  /** Start of this stream revision; a close/re-open produces a new revision with a later value. */
-  createdAt: string;
   /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
   buyerAddress?: string;
 };
@@ -214,7 +211,7 @@ export default {
       // exactly the case the sync above skips.
       const profile = profileByAccount.get(stream.account.toLowerCase()) ?? (await store.getUser(stream.account));
       const now = new Date();
-      const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.createdAt);
+      const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.lastUpdateAt);
       const gdAmountWei = flowRateWeiPerSecond * BigInt(elapsedSeconds);
       if (elapsedSeconds < 60 * 60 * 24) {
         skippedCooldown += 1;
@@ -460,7 +457,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const recorded = [];
     const gdPrice = await fetchCurrentGdPrice(cfg);
     /** Per-request cache: one receipt can carry several stream events for the same account. */
-    const streamCreatedAtByAccount = new Map<string, string | undefined>();
+    const streamLastUpdateAtByAccount = new Map<string, string | undefined>();
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
 
@@ -519,12 +516,12 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         const profile = await store.getUser(event.account);
         // Lowercased: ethers hands back checksummed addresses, the subgraph lowercase ones.
         const streamCacheKey = event.account.toLowerCase();
-        if (!streamCreatedAtByAccount.has(streamCacheKey)) {
+        if (!streamLastUpdateAtByAccount.has(streamCacheKey)) {
           const accountStreams = await fetchSuperfluidStreamsForAccount(event.account, cfg);
-          streamCreatedAtByAccount.set(streamCacheKey, accountStreams[0]?.createdAt);
+          streamLastUpdateAtByAccount.set(streamCacheKey, accountStreams[0]?.lastUpdateAt);
         }
-        const streamCreatedAt = streamCreatedAtByAccount.get(streamCacheKey);
-        const elapsedSeconds = streamElapsedSeconds(new Date(), profile.lastStreamCreditAt, streamCreatedAt);
+        const streamLastUpdateAt = streamLastUpdateAtByAccount.get(streamCacheKey);
+        const elapsedSeconds = streamElapsedSeconds(new Date(), profile.lastStreamCreditAt, streamLastUpdateAt);
         const gdAmountWei = BigInt(profile.streamFlowRateWeiPerSecond) * BigInt(elapsedSeconds);
         const buyerForOperatorCheck = event.buyer || event.account;
         const hasOperatorConsent =
@@ -553,7 +550,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           rootAccount: redactAddress(entry.rootAccount),
           buyer: redactAddress(entry.buyerAddress),
           elapsedSeconds,
-          streamCreatedAt,
+          streamLastUpdateAt,
           previousFlowRateWeiPerSecond: profile.streamFlowRateWeiPerSecond,
           creditedGdAmountWei: gdAmountWei.toString(),
           reportedTotalFlowWei: event.totalFlowWei.toString()
@@ -609,7 +606,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
     const gdPrice = await fetchCurrentGdPrice(cfg);
     const now = new Date();
-    const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, streams[0].createdAt);
+    const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, streams[0].lastUpdateAt);
 
     if (elapsedSeconds < 60 * 60 * 24) {
       // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
@@ -867,17 +864,21 @@ function createStreamFundingId(account: string, date: Date): string {
  * is inventing a window out of a baseline we never had. When neither timestamp is usable the
  * answer is 0, not "since the epoch".
  */
-export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | undefined, streamCreatedAt?: string): number {
+export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | undefined, streamLastUpdateAt?: string): number {
   const lastCreditMs = lastStreamCreditAt ? Date.parse(lastStreamCreditAt) : 0;
-  const createdMs = streamCreatedAt ? Date.parse(streamCreatedAt) : 0;
+  const lastUpdateMs = streamLastUpdateAt ? Date.parse(streamLastUpdateAt) : 0;
   // The later of the two wins. `lastStreamCreditAt` alone is not enough: it survives a stream being
   // closed, so a user who closes a stream and opens a new one months later would be credited for
-  // the whole dormant gap. `createdAt` is the start of the current revision, and the stream cannot
-  // have flowed before it. `createdAt` alone is not enough either -- it would re-credit everything
-  // since the stream began on every run.
-  const baselineMs = Math.max(Number.isFinite(lastCreditMs) ? lastCreditMs : 0, Number.isFinite(createdMs) ? createdMs : 0);
+  // the whole dormant gap. The stream's last on-chain update is a hard floor -- it moves forward on
+  // every create, rate change and close, so a stale clock can never be reached again.
+  //
+  // The trade-off: it also moves on a plain rate change, so when the resulting `StreamUpdated`
+  // event is not ingested (that endpoint is push-only, no retry) the window between the last credit
+  // and the rate change is skipped and never paid. Chosen deliberately -- it errs towards
+  // under-crediting rather than over-crediting.
+  const baselineMs = Math.max(Number.isFinite(lastCreditMs) ? lastCreditMs : 0, Number.isFinite(lastUpdateMs) ? lastUpdateMs : 0);
   if (baselineMs <= 0) {
-    logWarn("stream.credits.unusable-baseline", { lastStreamCreditAt, streamCreatedAt });
+    logWarn("stream.credits.unusable-baseline", { lastStreamCreditAt, streamLastUpdateAt });
     return 0;
   }
   return Math.max(0, Math.floor((now.getTime() - baselineMs) / 1000));
@@ -1082,7 +1083,6 @@ async function fetchSuperfluidStreams(
               ) {
                 sender { id }
                 currentFlowRate
-                createdAtTimestamp
                 updatedAtTimestamp
                 flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
                   userData
@@ -1111,19 +1111,12 @@ async function fetchSuperfluidStreams(
         // first stream credit, so a 1970 value makes that credit window decades wide.
         const hasUsableUpdatedAt = Number.isFinite(updatedAtSeconds) && updatedAtSeconds > 0;
         const lastUpdateAt = hasUsableUpdatedAt ? new Date(updatedAtSeconds * 1000).toISOString() : new Date().toISOString();
-        // Superfluid does not reuse a Stream entity across a close/re-open: the revision index in
-        // the id is bumped and a new entity is created. `createdAtTimestamp` is therefore the start
-        // of *this* revision, and the floor for anything it can be credited for.
-        const createdAtSeconds = Number(stream.createdAtTimestamp);
-        const hasUsableCreatedAt = Number.isFinite(createdAtSeconds) && createdAtSeconds > 0;
-        const createdAt = hasUsableCreatedAt ? new Date(createdAtSeconds * 1000).toISOString() : new Date().toISOString();
         const rawUserData = stream.flowUpdatedEvents[0]?.userData;
         const buyerAddress = decodeBuyerFromUserData(rawUserData);
         return {
           account: stream.sender.id.toLowerCase(),
           flowRateWeiPerSecond,
           lastUpdateAt,
-          createdAt,
           buyerAddress
         };
       });
