@@ -525,3 +525,27 @@ test("recordGdCredit records a zero flow rate on stream termination", async () =
   // Which makes the next stream's owed window worth nothing, re-baselining instead of billing it.
   assert.equal(BigInt(after.streamFlowRateWeiPerSecond) * 5_000_000n, 0n);
 });
+
+// Totals mirror onto the GoodID root because they accumulate. A flow rate is absolute, so mirroring
+// it would leave the root holding whichever sub-account wrote last; the cron sums it there instead.
+test("recordStreamFlowRate does not mirror the rate onto the root account", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+
+  const entry = await store.recordGdCredit({
+    id: "stream:no-mirror",
+    account: "0xWALLET",
+    rootAccount: "0xROOT",
+    source: "streamCron",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    flowRate: 385_802_469_136n,
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapUsd: 100_000_000n
+  });
+  await store.markFundingResult(entry, { funded: true, txHash: "0xfunded" });
+
+  assert.equal((await store.getUser("0xWALLET")).streamFlowRateWeiPerSecond, "385802469136");
+  assert.equal((await store.getUser("0xROOT")).streamFlowRateWeiPerSecond, "0", "the root's rate is the cron's sum, not a mirror");
+  // The totals still aggregate on the root, which is what mirroring is for.
+  assert.equal((await store.getUser("0xROOT")).totalGDStreamedWei, "1000000000000000000");
+});

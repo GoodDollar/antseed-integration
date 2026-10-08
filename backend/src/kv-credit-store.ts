@@ -96,12 +96,16 @@ export class KVCreditStore {
       rootAccount: rootAccount,
       createdAt: current.createdAt ?? now,
       updatedAt: now,
-      // `!== undefined`, not a truthiness check: a terminated stream reports `flowRate = 0`, and
-      // treating that as "no value given" kept the closed stream's old rate on the profile forever.
-      // Recording the 0 is what makes the next stream start re-baseline instead of billing the gap.
-      streamFlowRateWeiPerSecond: input.flowRate !== undefined ? input.flowRate.toString() : current.streamFlowRateWeiPerSecond,
       totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd)
     }));
+
+    // Written separately from the mirrored update above, because the flow rate belongs to this
+    // account alone -- see `recordStreamFlowRate`. `!== undefined` rather than a truthiness check:
+    // a terminated stream reports 0, and reading that as "no value given" would leave the closed
+    // stream's rate on the profile forever.
+    if (input.flowRate !== undefined) {
+      await this.recordStreamFlowRate(await this.getUser(account), input.flowRate);
+    }
 
     logInfo("kv.credit.recorded", {
       entryId: entry.id,
@@ -124,21 +128,27 @@ export class KVCreditStore {
    * otherwise write the 0 is pushed in by `POST /v1/celo/events/record` and may never arrive.
    *
    * Deliberately leaves `lastStreamCreditAt` and every total alone -- this corrects current state,
-   * it does not settle anything. Takes the profile the caller already read rather than re-reading it,
-   * and returns whether a write was needed, so the rate is not compared twice.
+   * it does not settle anything. The caller must pass a freshly read profile: it is both the basis
+   * for the comparison and the record written back. Updates that object in place to match what was
+   * stored, and returns whether a write was needed.
    */
   async recordStreamFlowRate(profile: UserCreditProfile, flowRate: bigint): Promise<boolean> {
     const next = flowRate.toString();
     if (profile.streamFlowRateWeiPerSecond === next) return false;
     const now = new Date().toISOString();
-    await this.updateUser(profile.account, profile.rootAccount, (current) => ({
-      ...current,
-      updatedAt: now,
-      streamFlowRateWeiPerSecond: next
-    }));
+    // Writes this profile only -- deliberately not through `updateUser`, which mirrors every change
+    // onto the GoodID root. The totals mirror correctly because they accumulate; a flow rate is an
+    // absolute value, so mirroring it would leave the root holding whichever sub-account wrote last.
+    // The root's rate is maintained separately, as the sum across the identity's accounts.
+    const previousFlowRateWeiPerSecond = profile.streamFlowRateWeiPerSecond;
+    // Keep the caller's copy in step with what was stored, so a profile held across a loop and
+    // logged later does not report a stale rate or timestamp.
+    profile.streamFlowRateWeiPerSecond = next;
+    profile.updatedAt = now;
+    await this.putJson(`${USER_PREFIX}${profile.account}`, profile);
     logInfo("kv.stream.flow-rate-synced", {
       account: redactAddress(profile.account),
-      previousFlowRateWeiPerSecond: profile.streamFlowRateWeiPerSecond,
+      previousFlowRateWeiPerSecond,
       flowRateWeiPerSecond: next
     });
     return true;
@@ -241,6 +251,17 @@ export class KVCreditStore {
       offset: options.offset,
       hasMore: options.offset + options.limit < total
     };
+  }
+
+  /**
+   * The stored profile, or undefined when the account has none yet. `getUser` synthesizes a default
+   * for unknown accounts, which cannot distinguish "never seen" from "seen, all zero" -- callers
+   * that must not create a profile as a side effect need this instead.
+   */
+  async getSavedUser(account: string): Promise<UserCreditProfile | undefined> {
+    const normalized = normalizeAccount(account);
+    const saved = await this.getJson<Partial<UserCreditProfile>>(`${USER_PREFIX}${normalized}`);
+    return saved ? normalizeProfile(saved, normalized) : undefined;
   }
 
   async getUser(account: string): Promise<UserCreditProfile> {

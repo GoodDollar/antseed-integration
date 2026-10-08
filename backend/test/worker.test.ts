@@ -2171,6 +2171,24 @@ test("scheduled run keeps the live rate when an account also has a closed revisi
   try {
     console.log = (() => {}) as typeof console.log;
     const kv = new MemoryKV();
+    // The sync only corrects accounts that already have a profile, and a stale value here proves the
+    // closed revision does not win over the live one.
+    await kv.put(
+      `user:${account}`,
+      JSON.stringify({
+        account,
+        rootAccount: account,
+        createdAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+        updatedAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+        totalGdDepositedWei: "0",
+        totalBonusUsd: "0",
+        streamFlowRateWeiPerSecond: "1",
+        totalPrincipalUsd: "0",
+        totalGDStreamedWei: "0",
+        totalOutstandingFundingUsd: "0",
+        lastStreamCreditAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString()
+      })
+    );
     const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
     const nowSeconds = Math.floor(Date.now() / 1000);
 
@@ -2211,3 +2229,269 @@ test("scheduled run keeps the live rate when an account also has a closed revisi
     console.log = originalConsoleLog;
   }
 });
+
+// The scheduled run corrects state that exists; it must not enrol a streamer who has never been
+// credited. Their first credit is what creates the profile, in `recordGdCredit`.
+test("scheduled run does not create a profile for an uncredited streamer", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) {
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "3433641975308641",
+                createdAtTimestamp: (nowSeconds - 3600).toString(),
+                updatedAtTimestamp: (nowSeconds - 3600).toString(),
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv, makeExecutionContext());
+
+    assert.equal(await kv.get(`user:${account}`), null, "no profile may be written by the sync alone");
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});
+
+// A GoodID root aggregates its identity's wallets. The lifetime totals get there by mirroring in
+// `updateUser`, which works because they accumulate; a flow rate is absolute, so it is summed.
+test("scheduled run sums the flow rate across a root's accounts", { concurrency: false }, async () => {
+  const rootAccount = "0x0000000000000000000000000000000000000a00";
+  const walletA = "0x0000000000000000000000000000000000000a01";
+  const walletB = "0x0000000000000000000000000000000000000a02";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const rateA = 1_000_000_000_000_000n;
+  const rateB = 2_000_000_000_000_000n;
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    const seed = (account: string, root: string) =>
+      kv.put(
+        `user:${account}`,
+        JSON.stringify({
+          account,
+          rootAccount: root,
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+          totalGdDepositedWei: "0",
+          totalBonusUsd: "0",
+          streamFlowRateWeiPerSecond: "0",
+          totalPrincipalUsd: "0",
+          totalGDStreamedWei: "0",
+          totalOutstandingFundingUsd: "0",
+          lastStreamCreditAt: undefined
+        })
+      );
+    await seed(walletA, rootAccount);
+    await seed(walletB, rootAccount);
+    await seed(rootAccount, rootAccount);
+
+    const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) {
+        return Response.json({
+          data: {
+            streams: [
+              [walletA, rateA],
+              [walletB, rateB]
+            ].map(([sender, rate]) => ({
+              sender: { id: sender as string },
+              currentFlowRate: (rate as bigint).toString(),
+              createdAtTimestamp: (nowSeconds - 3600).toString(),
+              updatedAtTimestamp: (nowSeconds - 3600).toString(),
+              flowUpdatedEvents: [{ userData: "0x" }]
+            }))
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv, makeExecutionContext());
+
+    const store = new KVCreditStore(kv as never);
+    // Each wallet keeps its own rate — it is the pricing input for that account's stream updates.
+    assert.equal((await store.getUser(walletA)).streamFlowRateWeiPerSecond, rateA.toString());
+    assert.equal((await store.getUser(walletB)).streamFlowRateWeiPerSecond, rateB.toString());
+    // The root carries the identity's total, not whichever wallet synced last.
+    assert.equal((await store.getUser(rootAccount)).streamFlowRateWeiPerSecond, (rateA + rateB).toString());
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Scheduled run: credit issuance across the stream lifecycle.
+//
+// These drive `flowRate * elapsed -> recordGdCredit` through `scheduled` and assert the credit
+// entry. Funding is fired through `ctx.waitUntil`, which the test harness discards, so the entry --
+// not the funding result -- is the observable, and it is the part that was wrong in production.
+// ---------------------------------------------------------------------------
+
+const CRON_EVENT = { scheduledTime: 0, cron: "0 */6 * * *" } as unknown as ScheduledEvent;
+const RATE_8900 = 3_433_641_975_308_641n; // 8900 G$/month, ~296.67 G$/day
+const MIN_CREDIT_WEI = 4_000n * 10n ** 18n; // MIN_GD_STREAMED_FOR_BONUS default
+
+function seedStreamProfile(kv: MemoryKV, account: string, fields: { flowRate: bigint; lastStreamCreditAt?: string }) {
+  const stamp = fields.lastStreamCreditAt ?? new Date().toISOString();
+  return kv.put(
+    `user:${account}`,
+    JSON.stringify({
+      account,
+      rootAccount: account,
+      createdAt: stamp,
+      updatedAt: stamp,
+      totalGdDepositedWei: "0",
+      totalBonusUsd: "0",
+      streamFlowRateWeiPerSecond: fields.flowRate.toString(),
+      totalPrincipalUsd: "0",
+      totalGDStreamedWei: "0",
+      totalOutstandingFundingUsd: "0",
+      lastStreamCreditAt: fields.lastStreamCreditAt
+    })
+  );
+}
+
+function subgraphStream(account: string, flowRate: bigint, createdAtSeconds: number, updatedAtSeconds = createdAtSeconds) {
+  return {
+    sender: { id: account },
+    currentFlowRate: flowRate.toString(),
+    createdAtTimestamp: createdAtSeconds.toString(),
+    updatedAtTimestamp: updatedAtSeconds.toString(),
+    flowUpdatedEvents: [{ userData: "0x" }]
+  };
+}
+
+function cronFetchMock(streams: unknown[]) {
+  return (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    if (body.query?.includes("streams")) return Response.json({ data: { streams } });
+    return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+  }) as typeof fetch;
+}
+
+async function runCron(kv: MemoryKV, streams: unknown[]) {
+  const testEnv = env({
+    ANTSEED_KV: kv as never,
+    CELO_VAULT_ADDRESS: "0x0000000000000000000000000000000000000def",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000fed"
+  });
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+  try {
+    console.log = (() => {}) as typeof console.log;
+    globalThis.fetch = cronFetchMock(streams);
+    await worker.scheduled(CRON_EVENT, testEnv, makeExecutionContext());
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+  return new KVCreditStore(kv as never);
+}
+
+test("scheduled run issues no credit for a closed stream", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ac1";
+  const kv = new MemoryKV();
+  // 30 days of uncredited time, which would be ~8900 G$ if the stream were still running.
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - 30 * 86400_000).toISOString() });
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - 90 * 86400;
+
+  const store = await runCron(kv, [subgraphStream(account, 0n, createdAtSeconds, createdAtSeconds + 86400)]);
+
+  assert.deepEqual(await store.getGdCredits(account), [], "a stream reporting currentFlowRate 0 must not be credited");
+  assert.equal((await store.getUser(account)).streamFlowRateWeiPerSecond, "0");
+});
+
+test("scheduled run credits a live stream from its last credit", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ac2";
+  const kv = new MemoryKV();
+  const elapsedDays = 20; // clears the 24h cooldown and the 4000 G$ minimum
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - elapsedDays * 86400_000).toISOString() });
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - 200 * 86400;
+
+  const store = await runCron(kv, [subgraphStream(account, RATE_8900, createdAtSeconds)]);
+
+  const credits = await store.getGdCredits(account);
+  assert.equal(credits.length, 1);
+  assert.equal(credits[0].source, "streamCron");
+  const expected = RATE_8900 * BigInt(elapsedDays * 86400);
+  const credited = BigInt(credits[0].gdAmountWei);
+  const drift = credited > expected ? credited - expected : expected - credited;
+  assert.ok(drift <= RATE_8900 * 60n, `credited ${credited}, expected ~${expected}`);
+  assert.ok(credited > MIN_CREDIT_WEI);
+});
+
+// Regression for the production incident: the stored clock was ~51 days stale while the subgraph
+// still reported the stream at its opening rate, producing a single 15,244.93 G$ credit for a
+// stream that had stopped flowing weeks earlier. The creation floor bounds it.
+test("scheduled run bounds the credit by stream creation when the clock is stale", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ac3";
+  const kv = new MemoryKV();
+  // Clock predates the current stream revision by seven weeks.
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - 51 * 86400_000).toISOString() });
+  const reopenedDaysAgo = 20;
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - reopenedDaysAgo * 86400;
+
+  const store = await runCron(kv, [subgraphStream(account, RATE_8900, createdAtSeconds)]);
+
+  const credits = await store.getGdCredits(account);
+  assert.equal(credits.length, 1);
+  const credited = BigInt(credits[0].gdAmountWei);
+  const sinceReopen = RATE_8900 * BigInt(reopenedDaysAgo * 86400);
+  const sinceStaleClock = RATE_8900 * BigInt(51 * 86400);
+  assert.ok(credited <= sinceReopen + RATE_8900 * 60n, `credited ${credited}, must not exceed the window since the stream opened`);
+  assert.ok(sinceStaleClock > credited, "the unbounded window would have been materially larger");
+});
+
+test("scheduled run prices a rate change at the rate the subgraph reports", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ac4";
+  const halvedRate = RATE_8900 / 2n;
+  const kv = new MemoryKV();
+  // 35 days, not 20: at the halved rate a 20-day window is ~2,966 G$ and the 4000 G$ minimum would
+  // skip it entirely.
+  const elapsedDays = 35;
+  // Profile still carries the old rate; the subgraph reports the new one.
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - elapsedDays * 86400_000).toISOString() });
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - 200 * 86400;
+
+  const store = await runCron(kv, [subgraphStream(account, halvedRate, createdAtSeconds)]);
+
+  const credits = await store.getGdCredits(account);
+  assert.equal(credits.length, 1);
+  const expected = halvedRate * BigInt(elapsedDays * 86400);
+  const credited = BigInt(credits[0].gdAmountWei);
+  const drift = credited > expected ? credited - expected : expected - credited;
+  assert.ok(drift <= halvedRate * 60n, `credited ${credited}, expected ~${expected} at the new rate`);
+  // And the profile adopts the new rate for the next window.
+  assert.equal((await store.getUser(account)).streamFlowRateWeiPerSecond, halvedRate.toString());
+});
+

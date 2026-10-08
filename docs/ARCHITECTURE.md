@@ -89,6 +89,11 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
   revision alongside its replacement, and a closed row must not clobber the live one. All-closed sums
   to 0, which is how a profile stops advertising a stream that no longer exists. This writes current
   state only — `lastStreamCreditAt` and the lifetime totals are settlement and are left untouched
+- a GoodID root profile then gets the **sum across its identity's accounts**. The lifetime totals reach
+  the root by mirroring in `updateUser`, which is correct because they accumulate; a flow rate is an
+  absolute value, so mirroring it would leave the root holding whichever sub-account wrote last. The
+  rate is therefore excluded from that mirror — `recordStreamFlowRate` writes one profile only — and
+  summed onto the root here. A root that streams itself is part of its own sum
 - then issues stream credits for each account with a non-zero rate and funds them
 
 **Profile** (`GET /v1/accounts/:account/profile`):

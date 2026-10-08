@@ -161,8 +161,9 @@ export default {
     // is pushed in by `POST /v1/celo/events/record` and may never arrive.
     const streams = await fetchSuperfluidIncomingStreams(cfg);
 
-    let skippedInactive = 0;
+    let inactiveAccounts = 0;
     let syncedFlowRates = 0;
+    let syncedRootFlowRates = 0;
     let skippedCooldown = 0;
     let skippedMinAmount = 0;
     let processed = 0;
@@ -181,25 +182,37 @@ export default {
       const account = stream.account.toLowerCase();
       flowRateByAccount.set(account, (flowRateByAccount.get(account) ?? 0n) + BigInt(stream.flowRateWeiPerSecond));
     }
-    // One profile read per account, reused by the crediting pass below.
+    // One profile read per account, reused by the crediting pass below. `getSavedUser` rather than
+    // `getUser` because syncing is a correction to state that already exists -- an account that has
+    // never been credited has no profile, and the scheduled run must not create one as a side
+    // effect. Its first credit will create it, in `recordGdCredit`.
     const profileByAccount = new Map<string, UserCreditProfile>();
+    const flowRateByRoot = new Map<string, bigint>();
     for (const [account, flowRate] of flowRateByAccount) {
-      const profile = await store.getUser(account);
-      if (await store.recordStreamFlowRate(profile, flowRate)) {
-        syncedFlowRates += 1;
-        profile.streamFlowRateWeiPerSecond = flowRate.toString();
-      }
+      const profile = await store.getSavedUser(account);
+      if (!profile) continue;
+      if (await store.recordStreamFlowRate(profile, flowRate)) syncedFlowRates += 1;
       profileByAccount.set(account, profile);
+      flowRateByRoot.set(profile.rootAccount, (flowRateByRoot.get(profile.rootAccount) ?? 0n) + flowRate);
     }
+
+    // A GoodID root profile aggregates its identity's wallets. The totals get there by mirroring in
+    // `updateUser`, which works because they accumulate -- a flow rate is absolute, so it is summed
+    // here instead. A root that streams itself is part of its own sum, so this runs after the
+    // per-account pass and takes precedence over that account's own rate.
+    for (const [rootAccount, totalFlowRate] of flowRateByRoot) {
+      const rootProfile = profileByAccount.get(rootAccount) ?? (await store.getSavedUser(rootAccount));
+      if (!rootProfile) continue;
+      if (await store.recordStreamFlowRate(rootProfile, totalFlowRate)) syncedRootFlowRates += 1;
+    }
+    inactiveAccounts = [...flowRateByAccount.values()].filter((flowRate) => flowRate === 0n).length;
 
     for (const stream of streams) {
       const flowRateWeiPerSecond = BigInt(stream.flowRateWeiPerSecond);
-      if (flowRateWeiPerSecond === 0n) {
-        skippedInactive += 1;
-        continue;
-      }
-      const profile = profileByAccount.get(stream.account.toLowerCase());
-      if (!profile) continue;
+      if (flowRateWeiPerSecond === 0n) continue;
+      // Falls back to the synthesized default for an account streaming for the first time, which is
+      // exactly the case the sync above skips.
+      const profile = profileByAccount.get(stream.account.toLowerCase()) ?? (await store.getUser(stream.account));
       const now = new Date();
       const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.createdAt);
       const gdAmountWei = flowRateWeiPerSecond * BigInt(elapsedSeconds);
@@ -254,8 +267,9 @@ export default {
       processed,
       skippedCooldown,
       skippedMinAmount,
-      skippedInactive,
+      inactiveAccounts,
       syncedFlowRates,
+      syncedRootFlowRates,
       funded,
       failed,
       elapsedMs: Date.now() - startedAt
@@ -503,11 +517,13 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         // the query (it filters on `currentFlowRate > 0`) and the floor simply does not apply --
         // correct, because at termination the owed window is real.
         const profile = await store.getUser(event.account);
-        if (!streamCreatedAtByAccount.has(event.account)) {
+        // Lowercased: ethers hands back checksummed addresses, the subgraph lowercase ones.
+        const streamCacheKey = event.account.toLowerCase();
+        if (!streamCreatedAtByAccount.has(streamCacheKey)) {
           const accountStreams = await fetchSuperfluidStreamsForAccount(event.account, cfg);
-          streamCreatedAtByAccount.set(event.account, accountStreams[0]?.createdAt);
+          streamCreatedAtByAccount.set(streamCacheKey, accountStreams[0]?.createdAt);
         }
-        const streamCreatedAt = streamCreatedAtByAccount.get(event.account);
+        const streamCreatedAt = streamCreatedAtByAccount.get(streamCacheKey);
         const elapsedSeconds = streamElapsedSeconds(new Date(), profile.lastStreamCreditAt, streamCreatedAt);
         const gdAmountWei = BigInt(profile.streamFlowRateWeiPerSecond) * BigInt(elapsedSeconds);
         const buyerForOperatorCheck = event.buyer || event.account;
