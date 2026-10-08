@@ -2566,3 +2566,55 @@ test("scheduled run records the rate on a first-time streamer's new profile", { 
   assert.equal((await store.getGdCredits(account)).length, 1);
   assert.equal((await store.getUser(account)).streamFlowRateWeiPerSecond, RATE_8900.toString());
 });
+
+// Regression: on a close the stream is gone from the active-only lookup, so there is no floor and the
+// window falls back to a possibly weeks-stale `lastStreamCreditAt`. With `/v1/celo/events/record`
+// unauthenticated, a small stream open for one cron tick and then closed was credited across the whole
+// stale window. The amount is capped at the event's on-chain `totalFlowWei`.
+test("/v1/celo/events/record caps a termination credit at what actually flowed", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ad3";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const txHash = `0x${"d".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const rate = 385_802_469_135_802_469n; // ~0.386 G$/s, ~1M G$/month
+  const actuallyFlowed = rate * 6n * 3600n; // open for one 6h cron interval
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    // Rate synced by the cron while the stream ran; clock 30 days stale because nothing was credited.
+    await seedStreamProfile(kv, account, { flowRate: rate, lastStreamCreditAt: new Date(Date.now() - 30 * 86400_000).toISOString() });
+    const testEnv = env({
+      ANTSEED_KV: kv as never,
+      CELO_RPC_URL: "https://celo.rpc.local",
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000fed"
+    });
+    const closeLog = encodeVaultEventLog("StreamUpdated", [account, buyer, 0n, 0n, actuallyFlowed], celoVault, txHash, 0);
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) return Response.json({ data: { streams: [] } });
+      if (body.method === "eth_call") {
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x000000000000000000000000abababababababababababababababababababab" });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [closeLog] } });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      makeExecutionContext()
+    );
+    const body = (await res.json()) as { events: Array<{ gdAmountWei: string }> };
+
+    assert.equal(BigInt(body.events[0].gdAmountWei), actuallyFlowed, "credit must not exceed the G$ the stream carried");
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});

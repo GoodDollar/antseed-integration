@@ -525,8 +525,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         // from the subgraph rather than inferred: the cron only ever sees active streams, so it can
         // never record `flowRate = 0` on a close, and the termination event that would is pushed in
         // by `POST /v1/celo/events/record` and may never arrive. A terminated stream is absent from
-        // the query (it filters on `currentFlowRate > 0`) and the floor simply does not apply --
-        // correct, because at termination the owed window is real.
+        // the query (it filters on `currentFlowRate > 0`) and the floor does not apply, so the window
+        // falls back to `lastStreamCreditAt` -- which can be weeks stale. The amount is therefore capped
+        // at `event.totalFlowWei`: the vault computes it on-chain as what actually flowed since the
+        // last flow change, so a stale clock multiplied by a remembered rate can never be credited
+        // beyond the G$ the stream really carried.
         const profile = await store.getUser(event.account);
         // Lowercased: ethers hands back checksummed addresses, the subgraph lowercase ones.
         const streamCacheKey = event.account.toLowerCase();
@@ -536,7 +539,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         }
         const streamLastUpdateAt = streamLastUpdateAtByAccount.get(streamCacheKey);
         const elapsedSeconds = streamElapsedSeconds(new Date(), profile.lastStreamCreditAt, streamLastUpdateAt);
-        const gdAmountWei = BigInt(profile.streamFlowRateWeiPerSecond) * BigInt(elapsedSeconds);
+        const owedWei = BigInt(profile.streamFlowRateWeiPerSecond) * BigInt(elapsedSeconds);
+        const gdAmountWei = owedWei < event.totalFlowWei ? owedWei : event.totalFlowWei;
         const buyerForOperatorCheck = event.buyer || event.account;
         const hasOperatorConsent =
           antseedFundingVault.enabled && gdAmountWei > 0n ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;

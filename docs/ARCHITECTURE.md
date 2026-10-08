@@ -58,8 +58,10 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - the window is floored at the stream's `updatedAtTimestamp`, read from the subgraph for the event's
   account, so a stream opening after an earlier one closed cannot bill the dormant gap between them.
   A terminated stream is absent from that query (it filters on `currentFlowRate > 0`) so the floor
-  does not apply there — the owed window at termination is real, but it is also **not bounded by what
-  actually flowed**, which is a known gap. The lookup is cached per request, since one receipt can
+  does not apply there and the window falls back to `lastStreamCreditAt`, which can be weeks stale.
+  The amount is therefore capped at the event's `totalFlowWei` — computed on-chain as what actually
+  flowed since the last flow change — so a stale clock priced at a remembered rate can never be
+  credited beyond the G$ the stream carried. The lookup is cached per request, since one receipt can
   carry several stream events for the same account
 - termination also records `streamFlowRateWeiPerSecond = 0` (an explicit `!== undefined` check, because
   `0` is falsy), but it is **not** what protects the gap — the subgraph floor above is. This endpoint is
