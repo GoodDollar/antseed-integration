@@ -244,7 +244,10 @@ export default {
         rootAccount,
         source: "streamCron",
         gdAmountWei: BigInt(gdAmountWei),
-        flowRate: BigInt(stream.flowRateWeiPerSecond),
+        // The account's summed rate, not this row's: an account can hold several rows, and a closed
+        // one reports 0. Also what gives a first-time streamer -- skipped by the sync above for
+        // having no profile yet -- its rate on the profile this credit creates.
+        flowRate: flowRateByAccount.get(account) ?? 0n,
         isVerified: isValidForBonus, // if root acccount was found it is whitelisted & operator set
         gdPrice,
         maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
@@ -620,6 +623,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const gdPrice = await fetchCurrentGdPrice(cfg);
     const now = new Date();
     const previousFlowRateWeiPerSecond = BigInt(profile.streamFlowRateWeiPerSecond);
+    const accountFlowRateWeiPerSecond = streams.reduce((sum, stream) => sum + BigInt(stream.flowRateWeiPerSecond), 0n);
     // The widest window any of this account's streams is owed, used only for the cooldown gate --
     // each stream's own amount is computed per stream below.
     const elapsedSeconds = Math.max(
@@ -664,7 +668,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         rootAccount,
         source: "streamRequest",
         gdAmountWei,
-        flowRate: BigInt(stream.flowRateWeiPerSecond),
+        // Summed across the account's rows for the same reason as the scheduled run.
+        flowRate: accountFlowRateWeiPerSecond,
         isVerified,
         gdPrice,
         maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,

@@ -2529,3 +2529,40 @@ test("streamElapsedSeconds makes a stale clock unreachable after a new stream op
   const unfloored = hugeRate * BigInt(Math.floor((now.getTime() - Date.parse(staleClock)) / 1000));
   assert.ok(unfloored / credited > 300n, "the stale window would have been orders of magnitude larger");
 });
+
+// Regression: the credit loop used to pass a single row's `flowRate` into `recordGdCredit`, which
+// overwrote the per-account sum the sync pass had just written. Only one row per account per day
+// reaches that write (they share a daily deposit id), so whichever row clears the cooldown and the
+// minimum decided the stored rate -- and a closed row carries 0.
+test("scheduled run keeps the summed rate when only a closed row is creditable", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ad1";
+  const kv = new MemoryKV();
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - 40 * 86400_000).toISOString() });
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const store = await runCron(kv, [
+    // Live, but changed two hours ago, so its window is under the 24h cooldown and it is skipped.
+    subgraphStream(account, RATE_8900, nowSeconds - 100 * 86400, nowSeconds - 2 * 3600),
+    // Closed 20 days ago, with a long uncredited final interval, so this is the row that credits.
+    subgraphStream(account, 0n, nowSeconds - 60 * 86400, nowSeconds - 20 * 86400)
+  ]);
+
+  const credits = await store.getGdCredits(account);
+  assert.equal(credits.length, 1, "the closed row's final interval is credited");
+
+  const profile = await store.getUser(account);
+  assert.equal(profile.streamFlowRateWeiPerSecond, RATE_8900.toString(), "the live stream's rate must survive the closed row's credit");
+});
+
+// A first-time streamer has no profile, so the sync pass skips it; the profile is created by its first
+// credit, which must carry the account's rate rather than leave it at the default 0.
+test("scheduled run records the rate on a first-time streamer's new profile", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ad2";
+  const kv = new MemoryKV();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const store = await runCron(kv, [subgraphStream(account, RATE_8900, nowSeconds - 30 * 86400)]);
+
+  assert.equal((await store.getGdCredits(account)).length, 1);
+  assert.equal((await store.getUser(account)).streamFlowRateWeiPerSecond, RATE_8900.toString());
+});
