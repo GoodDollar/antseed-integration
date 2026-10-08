@@ -536,7 +536,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         const gdAmountWei = BigInt(profile.streamFlowRateWeiPerSecond) * BigInt(elapsedSeconds);
         const buyerForOperatorCheck = event.buyer || event.account;
         const hasOperatorConsent =
-          antseedFundingVault.enabled && event.totalFlowWei > 0n ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
+          antseedFundingVault.enabled && gdAmountWei > 0n ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
         const isValidForBonus = !!rootAccount && hasOperatorConsent;
         const entry = await store.recordGdCredit({
           id: depositId,
