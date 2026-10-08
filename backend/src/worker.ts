@@ -81,7 +81,6 @@ const SuperfluidStreamsResponseSchema = z.object({
         sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
         currentFlowRate: z.string().regex(/^\d+$/),
         updatedAtTimestamp: z.string().regex(/^\d+$/),
-        streamedUntilUpdatedAt: z.string().regex(/^\d+$/),
         flowUpdatedEvents: z.array(
           z.object({
             userData: z.string()
@@ -102,8 +101,6 @@ type SuperfluidIncomingStream = {
   flowRateWeiPerSecond: string;
   /** For a closed stream this is its termination; for a live one, its last on-chain change. */
   lastUpdateAt: string;
-  /** Superfluid's own running total for this stream, final once the stream has closed. */
-  streamedUntilUpdateWei: string;
   /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
   buyerAddress?: string;
 };
@@ -915,10 +912,11 @@ export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | und
  *
  * Closed stream: from the last credit up to the **termination**, at the rate that was flowing before
  * it closed. The end has to be the termination rather than `now` -- the stream stopped carrying G$
- * then, so measuring to `now` would invent time it did not flow. There is no floor available here
- * (a closed stream's last update *is* its termination), so the amount is capped at what Superfluid
- * says the stream ever carried. That cap is what stops a stale clock turning a brief stream into
- * weeks of credit.
+ * then, so measuring to `now` would invent time it did not flow.
+ *
+ * NOTE: this branch has neither a floor (a closed stream's last update *is* its termination) nor a
+ * ceiling, so a stale `lastStreamCreditAt` priced at a remembered rate can over-credit. Tracked in
+ * the PR notes -- reading `streamPeriods` is the fix, not another guard.
  */
 function streamCreditAmount(input: {
   now: Date;
@@ -944,9 +942,7 @@ function streamCreditAmount(input: {
   }
 
   const elapsedSeconds = Math.max(0, Math.floor((terminatedAtMs - lastCreditMs) / 1000));
-  const owed = input.previousFlowRateWeiPerSecond * BigInt(elapsedSeconds);
-  const everStreamed = BigInt(input.stream.streamedUntilUpdateWei);
-  return { elapsedSeconds, gdAmountWei: owed < everStreamed ? owed : everStreamed };
+  return { elapsedSeconds, gdAmountWei: input.previousFlowRateWeiPerSecond * BigInt(elapsedSeconds) };
 }
 
 async function readAnalyticsRefreshTimestamp(kv: Pick<KVNamespace, "get">): Promise<number | undefined> {
@@ -1153,7 +1149,6 @@ async function fetchSuperfluidStreams(
                 sender { id }
                 currentFlowRate
                 updatedAtTimestamp
-                streamedUntilUpdatedAt
                 flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
                   userData
                 }
@@ -1187,7 +1182,6 @@ async function fetchSuperfluidStreams(
           account: stream.sender.id.toLowerCase(),
           flowRateWeiPerSecond,
           lastUpdateAt,
-          streamedUntilUpdateWei: stream.streamedUntilUpdatedAt,
           buyerAddress
         };
       });
