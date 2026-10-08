@@ -519,7 +519,7 @@ test("request exceptions send slack webhook with path, body, and error", { concu
   }
 });
 
-test("POST /v1/accounts/:account/stream-credits returns no streams when none active", { concurrency: false }, async () => {
+test("POST /v1/accounts/:account/stream-credits returns no streams when the account has none", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const celoVault = "0x0000000000000000000000000000000000000def";
   const gdSuperToken = "0x0000000000000000000000000000000000000fed";
@@ -556,7 +556,7 @@ test("POST /v1/accounts/:account/stream-credits returns no streams when none act
     );
     assert.equal(res.status, 200);
     const body = (await res.json()) as { account: string; streams: unknown[]; message: string };
-    assert.equal(body.message, "no active streams found");
+    assert.equal(body.message, "no streams found");
     assert.equal(body.streams.length, 0);
   } finally {
     globalThis.fetch = originalFetch;

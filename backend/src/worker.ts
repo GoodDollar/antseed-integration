@@ -81,6 +81,7 @@ const SuperfluidStreamsResponseSchema = z.object({
         sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
         currentFlowRate: z.string().regex(/^\d+$/),
         updatedAtTimestamp: z.string().regex(/^\d+$/),
+        streamedUntilUpdatedAt: z.string().regex(/^\d+$/),
         flowUpdatedEvents: z.array(
           z.object({
             userData: z.string()
@@ -99,7 +100,10 @@ const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superfluid.dev/
 type SuperfluidIncomingStream = {
   account: string;
   flowRateWeiPerSecond: string;
+  /** For a closed stream this is its termination; for a live one, its last on-chain change. */
   lastUpdateAt: string;
+  /** Superfluid's own running total for this stream, final once the stream has closed. */
+  streamedUntilUpdateWei: string;
   /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
   buyerAddress?: string;
 };
@@ -185,9 +189,13 @@ export default {
     // effect. Its first credit will create it, in `recordGdCredit`.
     const profileByAccount = new Map<string, UserCreditProfile>();
     const flowRateByRoot = new Map<string, bigint>();
+    // The rate as it stood before this run's sync. A stream that has just closed reports 0, so its
+    // final window has to be priced at what was flowing beforehand.
+    const previousFlowRateByAccount = new Map<string, bigint>();
     for (const [account, flowRate] of flowRateByAccount) {
       const profile = await store.getSavedUser(account);
       if (!profile) continue;
+      previousFlowRateByAccount.set(account, BigInt(profile.streamFlowRateWeiPerSecond));
       if (await store.recordStreamFlowRate(profile, flowRate)) syncedFlowRates += 1;
       profileByAccount.set(account, profile);
       flowRateByRoot.set(profile.rootAccount, (flowRateByRoot.get(profile.rootAccount) ?? 0n) + flowRate);
@@ -205,14 +213,20 @@ export default {
     inactiveAccounts = [...flowRateByAccount.values()].filter((flowRate) => flowRate === 0n).length;
 
     for (const stream of streams) {
-      const flowRateWeiPerSecond = BigInt(stream.flowRateWeiPerSecond);
-      if (flowRateWeiPerSecond === 0n) continue;
+      const account = stream.account.toLowerCase();
       // Falls back to the synthesized default for an account streaming for the first time, which is
       // exactly the case the sync above skips.
-      const profile = profileByAccount.get(stream.account.toLowerCase()) ?? (await store.getUser(stream.account));
+      const profile = profileByAccount.get(account) ?? (await store.getUser(stream.account));
       const now = new Date();
-      const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, stream.lastUpdateAt);
-      const gdAmountWei = flowRateWeiPerSecond * BigInt(elapsedSeconds);
+      // Closed streams are credited too, for the window between the last credit and the termination
+      // -- without this the tail of every stream is silently forfeited.
+      const { elapsedSeconds, gdAmountWei } = streamCreditAmount({
+        now,
+        lastStreamCreditAt: profile.lastStreamCreditAt,
+        stream,
+        previousFlowRateWeiPerSecond: previousFlowRateByAccount.get(account) ?? 0n
+      });
+      if (gdAmountWei === 0n) continue;
       if (elapsedSeconds < 60 * 60 * 24) {
         skippedCooldown += 1;
         continue;
@@ -590,7 +604,9 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const account = decodeURIComponent(streamCreditsMatch[1]).toLowerCase();
     const profile = await store.getUser(account);
     const rootAccount = await fetchGoodIdRoot(account, cfg);
-    const streams = await fetchSuperfluidStreamsForAccount(account, cfg);
+    // Closed streams included: a user whose stream has ended is still owed the window between the
+    // last credit and the termination, and the scheduled run is only every 6 hours.
+    const streams = await fetchSuperfluidStreamsForAccount(account, cfg, true);
 
     logInfo("stream.credits.start", {
       account: redactAddress(account),
@@ -601,12 +617,19 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       logInfo("stream.credits.empty", {
         account: redactAddress(account)
       });
-      return json({ account, streams: [], message: "no active streams found" });
+      return json({ account, streams: [], message: "no streams found" });
     }
 
     const gdPrice = await fetchCurrentGdPrice(cfg);
     const now = new Date();
-    const elapsedSeconds = streamElapsedSeconds(now, profile.lastStreamCreditAt, streams[0].lastUpdateAt);
+    const previousFlowRateWeiPerSecond = BigInt(profile.streamFlowRateWeiPerSecond);
+    // The widest window any of this account's streams is owed, used only for the cooldown gate --
+    // each stream's own amount is computed per stream below.
+    const elapsedSeconds = Math.max(
+      ...streams.map(
+        (stream) => streamCreditAmount({ now, lastStreamCreditAt: profile.lastStreamCreditAt, stream, previousFlowRateWeiPerSecond }).elapsedSeconds
+      )
+    );
 
     if (elapsedSeconds < 60 * 60 * 24) {
       // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
@@ -628,7 +651,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
       const isValidForBonus = !!rootAccount && hasOperatorConsent;
       const isVerified = isValidForBonus;
-      const gdAmountWei = BigInt(stream.flowRateWeiPerSecond) * BigInt(elapsedSeconds);
+      const { gdAmountWei } = streamCreditAmount({ now, lastStreamCreditAt: profile.lastStreamCreditAt, stream, previousFlowRateWeiPerSecond });
       if (gdAmountWei <= cfg.MIN_STREAM_BONUS_WEI) {
         skippedMinAmount += 1;
         recorded.push({
@@ -884,6 +907,48 @@ export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | und
   return Math.max(0, Math.floor((now.getTime() - baselineMs) / 1000));
 }
 
+/**
+ * What a stream owes credit for, and over what window.
+ *
+ * Live stream: from the later of the last credit and the stream's last on-chain update, up to now,
+ * at the rate the subgraph reports.
+ *
+ * Closed stream: from the last credit up to the **termination**, at the rate that was flowing before
+ * it closed. The end has to be the termination rather than `now` -- the stream stopped carrying G$
+ * then, so measuring to `now` would invent time it did not flow. There is no floor available here
+ * (a closed stream's last update *is* its termination), so the amount is capped at what Superfluid
+ * says the stream ever carried. That cap is what stops a stale clock turning a brief stream into
+ * weeks of credit.
+ */
+function streamCreditAmount(input: {
+  now: Date;
+  lastStreamCreditAt: string | undefined;
+  stream: SuperfluidIncomingStream;
+  /** The rate recorded before this run zeroed it; only consulted for a closed stream. */
+  previousFlowRateWeiPerSecond: bigint;
+}): { elapsedSeconds: number; gdAmountWei: bigint } {
+  const flowRateWeiPerSecond = BigInt(input.stream.flowRateWeiPerSecond);
+  if (flowRateWeiPerSecond > 0n) {
+    const elapsedSeconds = streamElapsedSeconds(input.now, input.lastStreamCreditAt, input.stream.lastUpdateAt);
+    return { elapsedSeconds, gdAmountWei: flowRateWeiPerSecond * BigInt(elapsedSeconds) };
+  }
+
+  const terminatedAtMs = Date.parse(input.stream.lastUpdateAt);
+  const lastCreditMs = input.lastStreamCreditAt ? Date.parse(input.lastStreamCreditAt) : 0;
+  if (!Number.isFinite(terminatedAtMs) || terminatedAtMs <= 0 || !Number.isFinite(lastCreditMs) || lastCreditMs <= 0) {
+    logWarn("stream.credits.unusable-final-window", {
+      lastStreamCreditAt: input.lastStreamCreditAt,
+      terminatedAt: input.stream.lastUpdateAt
+    });
+    return { elapsedSeconds: 0, gdAmountWei: 0n };
+  }
+
+  const elapsedSeconds = Math.max(0, Math.floor((terminatedAtMs - lastCreditMs) / 1000));
+  const owed = input.previousFlowRateWeiPerSecond * BigInt(elapsedSeconds);
+  const everStreamed = BigInt(input.stream.streamedUntilUpdateWei);
+  return { elapsedSeconds, gdAmountWei: owed < everStreamed ? owed : everStreamed };
+}
+
 async function readAnalyticsRefreshTimestamp(kv: Pick<KVNamespace, "get">): Promise<number | undefined> {
   const raw = await kv.get(ANALYTICS_REFRESH_LAST_RUN_KEY);
   if (!raw) return undefined;
@@ -1015,8 +1080,12 @@ async function fetchSuperfluidIncomingStreams(cfg: ReturnType<typeof configFromE
 }
 
 /** Active streams for one account; callers here use it to answer "is this account streaming now". */
-async function fetchSuperfluidStreamsForAccount(account: string, cfg: ReturnType<typeof configFromEnv>): Promise<SuperfluidIncomingStream[]> {
-  return fetchSuperfluidStreams(cfg, account);
+async function fetchSuperfluidStreamsForAccount(
+  account: string,
+  cfg: ReturnType<typeof configFromEnv>,
+  includeClosed = false
+): Promise<SuperfluidIncomingStream[]> {
+  return fetchSuperfluidStreams(cfg, account, includeClosed);
 }
 
 async function fetchSuperfluidStreams(
@@ -1084,6 +1153,7 @@ async function fetchSuperfluidStreams(
                 sender { id }
                 currentFlowRate
                 updatedAtTimestamp
+                streamedUntilUpdatedAt
                 flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
                   userData
                 }
@@ -1117,6 +1187,7 @@ async function fetchSuperfluidStreams(
           account: stream.sender.id.toLowerCase(),
           flowRateWeiPerSecond,
           lastUpdateAt,
+          streamedUntilUpdateWei: stream.streamedUntilUpdatedAt,
           buyerAddress
         };
       });
