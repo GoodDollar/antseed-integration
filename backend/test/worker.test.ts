@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface, Wallet } from "ethers";
-import worker, { fundCredit } from "../src/worker.js";
+import worker, { fundCredit, streamElapsedSeconds } from "../src/worker.js";
 import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
 import { Env } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
@@ -519,7 +519,7 @@ test("request exceptions send slack webhook with path, body, and error", { concu
   }
 });
 
-test("POST /v1/accounts/:account/stream-credits returns no streams when none active", { concurrency: false }, async () => {
+test("POST /v1/accounts/:account/stream-credits returns no streams when the account has none", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const celoVault = "0x0000000000000000000000000000000000000def";
   const gdSuperToken = "0x0000000000000000000000000000000000000fed";
@@ -556,7 +556,7 @@ test("POST /v1/accounts/:account/stream-credits returns no streams when none act
     );
     assert.equal(res.status, 200);
     const body = (await res.json()) as { account: string; streams: unknown[]; message: string };
-    assert.equal(body.message, "no active streams found");
+    assert.equal(body.message, "no streams found");
     assert.equal(body.streams.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1206,7 +1206,7 @@ test("POST /v1/accounts/:account/withdraw returns enabled:false when vault not c
   assert.equal(body.bridge.enabled, false);
 });
 
-test("/v1/celo/events/record processes StreamUpdated logs into stream credits", { concurrency: false }, async () => {
+test("/v1/celo/events/record credits the owed window, not the event's totalFlowWei", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"3".repeat(64)}`;
@@ -1214,8 +1214,32 @@ test("/v1/celo/events/record processes StreamUpdated logs into stream credits", 
   const goodIdAddr = "0x0000000000000000000000000000000000001234";
   const originalFetch = globalThis.fetch;
 
+  // The previously recorded rate, and a credit one day old. The event's own `totalFlowWei` is
+  // measured from the last on-chain flow change and overlaps this window, so it must not be used.
+  const previousFlowRate = 385_802_469_136n;
+  const lastStreamCreditAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
   try {
+    const kv = new MemoryKV();
+    await kv.put(
+      `user:${account.toLowerCase()}`,
+      JSON.stringify({
+        account: account.toLowerCase(),
+        rootAccount: account.toLowerCase(),
+        createdAt: lastStreamCreditAt,
+        updatedAt: lastStreamCreditAt,
+        totalGdDepositedWei: "0",
+        totalBonusUsd: "0",
+        streamFlowRateWeiPerSecond: previousFlowRate.toString(),
+        totalPrincipalUsd: "0",
+        totalGDStreamedWei: "0",
+        totalOutstandingFundingUsd: "0",
+        lastStreamCreditAt
+      })
+    );
+
     const testEnv = env({
+      ANTSEED_KV: kv as never,
       CELO_RPC_URL: "https://celo.rpc.local",
       CELO_VAULT_ADDRESS: celoVault,
       CELO_GOODID_ADDRESS: goodIdAddr
@@ -1256,16 +1280,27 @@ test("/v1/celo/events/record processes StreamUpdated logs into stream credits", 
 
     assert.equal(res.status, 200);
     const body = (await res.json()) as {
-      events: Array<{ source: string; fundingStatus: string; principalUsd: string; bonusUsd: string; buyerAddress?: string }>;
+      events: Array<{ source: string; fundingStatus: string; gdAmountWei: string; principalUsd: string; bonusUsd: string; buyerAddress?: string }>;
     };
     assert.equal(body.events.length, 1);
     assert.equal(body.events[0].source, "streamUpdate");
     assert.equal(body.events[0].fundingStatus, "funded");
-    // GD_CUSD_PRICE default = 0.0001; totalFlowWei = 2 G$ → principalUsd = 200
-    assert.equal(body.events[0].principalUsd, "200");
-    // verified + stream source → 20% bonus: 200 × 20% = 40
-    assert.equal(body.events[0].bonusUsd, "40");
     assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
+
+    // The owed window is one day at the previously recorded rate. Allow a few seconds of slack for
+    // wall-clock drift between seeding the profile and the request being handled.
+    const credited = BigInt(body.events[0].gdAmountWei);
+    const expected = previousFlowRate * BigInt(24 * 60 * 60);
+    const drift = credited > expected ? credited - expected : expected - credited;
+    assert.ok(drift <= previousFlowRate * 10n, `credited ${credited}, expected ~${expected}`);
+
+    // And emphatically not the event's own figure.
+    assert.notEqual(body.events[0].gdAmountWei, "2000000000000000000");
+
+    // verified + stream source → 20% bonus on whatever principal the window produced
+    const principalUsd = BigInt(body.events[0].principalUsd);
+    assert.ok(principalUsd > 0n);
+    assert.equal(BigInt(body.events[0].bonusUsd), (principalUsd * 20n) / 100n);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1502,9 +1537,32 @@ test("/v1/celo/events/record sets stream bonus to 0 when buyer revoked operator"
   const originalDepositForBuyerWithId = AntSeedFundingVaultClient.prototype.depositForBuyerWithId;
 
   let depositCalls = 0;
+  const previousFlowRate = 385_802_469_136n;
+  const lastStreamCreditAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
   try {
+    // A stream credit is now the owed window at the previously recorded rate, so the profile needs
+    // both before a StreamUpdated event can produce a non-zero principal.
+    const kv = new MemoryKV();
+    await kv.put(
+      `user:${account.toLowerCase()}`,
+      JSON.stringify({
+        account: account.toLowerCase(),
+        rootAccount: account.toLowerCase(),
+        createdAt: lastStreamCreditAt,
+        updatedAt: lastStreamCreditAt,
+        totalGdDepositedWei: "0",
+        totalBonusUsd: "0",
+        streamFlowRateWeiPerSecond: previousFlowRate.toString(),
+        totalPrincipalUsd: "0",
+        totalGDStreamedWei: "0",
+        totalOutstandingFundingUsd: "0",
+        lastStreamCreditAt
+      })
+    );
+
     const testEnv = env({
+      ANTSEED_KV: kv as never,
       CELO_RPC_URL: "https://celo.rpc.local",
       CELO_VAULT_ADDRESS: celoVault,
       CELO_GOODID_ADDRESS: goodIdAddr,
@@ -1528,9 +1586,9 @@ test("/v1/celo/events/record sets stream bonus to 0 when buyer revoked operator"
     AntSeedFundingVaultClient.prototype.depositForBuyerWithId = async function (operatorBuyer: string, principalUsd: bigint, bonusUsd: bigint) {
       depositCalls += 1;
       assert.equal(operatorBuyer, buyer.toLowerCase());
-      assert.equal(principalUsd, 200n);
-      assert.equal(bonusUsd, 0n);
-      return { enabled: true, buyer: operatorBuyer, amountUsd: "200", txHash: "0xfunded" };
+      assert.ok(principalUsd > 0n, "principal is still deposited when the operator is revoked");
+      assert.equal(bonusUsd, 0n, "revoked operator must zero the bonus");
+      return { enabled: true, buyer: operatorBuyer, amountUsd: principalUsd.toString(), txHash: "0xfunded" };
     };
 
     globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -1562,7 +1620,7 @@ test("/v1/celo/events/record sets stream bonus to 0 when buyer revoked operator"
     assert.equal(body.events.length, 1);
     assert.equal(body.events[0].source, "streamUpdate");
     assert.equal(body.events[0].fundingStatus, "funded");
-    assert.equal(body.events[0].principalUsd, "200");
+    assert.ok(BigInt(body.events[0].principalUsd) > 0n);
     assert.equal(body.events[0].bonusUsd, "0");
     assert.equal(body.events[0].buyerAddress, buyer.toLowerCase());
     assert.equal(depositCalls, 1);
@@ -1653,6 +1711,7 @@ test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued 
               {
                 sender: { id: account },
                 currentFlowRate: "1000000000000000",
+                createdAtTimestamp: "1735000000",
                 updatedAtTimestamp: "1735000000",
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
@@ -1703,6 +1762,7 @@ test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ a
               {
                 sender: { id: account },
                 currentFlowRate: "1",
+                createdAtTimestamp: "1735000000",
                 updatedAtTimestamp: "1735000000",
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
@@ -1729,5 +1789,832 @@ test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ a
     assert.ok(body.streams[0].message.includes("below minimum"));
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("streamElapsedSeconds measures from the last credit when one exists", () => {
+  const now = new Date("2026-09-11T06:00:00.000Z");
+  const elapsed = streamElapsedSeconds(now, "2026-09-10T06:00:00.000Z", "2026-07-02T00:00:00.000Z");
+  assert.equal(elapsed, 24 * 60 * 60);
+});
+
+test("streamElapsedSeconds falls back to the stream's last on-chain update on the first credit", () => {
+  const now = new Date("2026-07-03T00:00:00.000Z");
+  const elapsed = streamElapsedSeconds(now, undefined, "2026-07-02T00:00:00.000Z");
+  assert.equal(elapsed, 24 * 60 * 60);
+});
+
+// A long gap is legitimate -- a stalled cron or a backfill -- and the stream really did flow for
+// all of it, so the full window is credited rather than capped.
+test("streamElapsedSeconds credits the whole window for a long gap", () => {
+  const now = new Date("2026-09-11T06:00:00.000Z");
+  const elapsed = streamElapsedSeconds(now, "2026-01-01T00:00:00.000Z", "2025-06-01T00:00:00.000Z");
+  assert.equal(elapsed, Math.floor((Date.parse("2026-09-11T06:00:00.000Z") - Date.parse("2026-01-01T00:00:00.000Z")) / 1000));
+});
+
+// Regression, from account 0x2ceade86...0627: stream a-0.0 ran 07-02 -> 07-06, then nothing flowed
+// for 53 days, then a new revision a-1.0 opened on 08-28. `lastStreamCreditAt` survives the close,
+// so without the creation floor the dormant gap gets credited at the new stream's rate.
+test("streamElapsedSeconds does not credit the gap before a re-opened stream", () => {
+  const now = new Date("2026-08-29T06:00:00.000Z");
+  const lastCreditOnClosedStream = "2026-07-02T18:24:14.244Z";
+  const reopenedAt = "2026-08-28T15:18:07.000Z";
+
+  const elapsed = streamElapsedSeconds(now, lastCreditOnClosedStream, reopenedAt);
+  assert.equal(elapsed, Math.floor((now.getTime() - Date.parse(reopenedAt)) / 1000));
+
+  const flowRateWeiPerSecond = 3433641975308641n; // 8900 G$/month
+  const credited = flowRateWeiPerSecond * BigInt(elapsed);
+  assert.ok(credited < 200n * 10n ** 18n, `expected under 200 G$, got ${credited}`);
+
+  // Without the floor the baseline would have been the pre-close credit, 57 days earlier.
+  const unflooredElapsed = Math.floor((now.getTime() - Date.parse(lastCreditOnClosedStream)) / 1000);
+  assert.ok(flowRateWeiPerSecond * BigInt(unflooredElapsed) > 16_000n * 10n ** 18n);
+});
+
+// Regression: a 1970 baseline made elapsedSeconds the whole Unix epoch, so a 9000 G$/month stream
+// was credited 6.19M G$ (~$730) in a single entry.
+test("streamElapsedSeconds rejects an epoch-zero baseline instead of crediting 56 years", () => {
+  const now = new Date("2026-07-02T18:22:51.590Z");
+  const elapsed = streamElapsedSeconds(now, undefined, "1970-01-01T00:00:00.000Z");
+  assert.equal(elapsed, 0);
+
+  const flowRateWeiPerSecond = (9000n * 10n ** 18n) / 2592000n;
+  assert.equal(flowRateWeiPerSecond * BigInt(elapsed), 0n);
+  // What the old code produced for this exact account:
+  assert.equal(flowRateWeiPerSecond * BigInt(Math.floor(now.getTime() / 1000)), 6191029760416666270440762n);
+});
+
+test("streamElapsedSeconds rejects an unparseable baseline", () => {
+  const now = new Date("2026-09-11T06:00:00.000Z");
+  assert.equal(streamElapsedSeconds(now, undefined, "not-a-date"), 0);
+});
+
+test("streamElapsedSeconds never returns a negative window", () => {
+  const now = new Date("2026-07-02T00:00:00.000Z");
+  assert.equal(streamElapsedSeconds(now, "2026-09-11T06:00:00.000Z", "2026-07-02T00:00:00.000Z"), 0);
+});
+
+// Regression: the subgraph returning `updatedAtTimestamp: "0"` used to become a 1970 baseline,
+// which credited the whole Unix epoch of stream in one entry.
+test("POST /v1/accounts/:account/stream-credits does not credit the epoch on a zero subgraph timestamp", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const originalFetch = globalThis.fetch;
+
+  try {
+    const kv = new MemoryKV();
+    const testEnv = env({
+      ANTSEED_KV: kv as never,
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken
+    });
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.query) {
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "3472222222222222", // 9000 G$/month, the real account's rate
+                createdAtTimestamp: "0",
+                updatedAtTimestamp: "0",
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x0000000000000000000000000000000000000000000000000000000000000000" });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, {
+        method: "POST",
+        headers: { "content-type": "application/json" }
+      }),
+      testEnv,
+      makeExecutionContext()
+    );
+
+    assert.equal(res.status, 200);
+    const store = new KVCreditStore(kv as never);
+    const credits = await store.getGdCredits(account);
+    assert.equal(credits.length, 0, "a zero subgraph timestamp must not produce a credit entry");
+    const profile = await store.getUser(account);
+    assert.equal(profile.totalGdDepositedWei, "0");
+    assert.equal(profile.totalGDStreamedWei, "0");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// Regression, from account 0x2ceade86...0627: stream a-0.0 closed 2026-07-06, a-1.0 opened
+// 2026-08-28. `lastStreamCreditAt` survives the close, so the opening event must not bill the
+// 53-day dormant gap. Termination records flowRate 0, which zeroes the owed window and lets the
+// funding path re-baseline the clock to now.
+test("/v1/celo/events/record re-baselines on stream start instead of billing the dormant gap", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const txHash = `0x${"9".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const goodIdAddr = "0x0000000000000000000000000000000000001234";
+  const originalFetch = globalThis.fetch;
+
+  const closedAt = new Date(Date.now() - 53 * 24 * 60 * 60 * 1000).toISOString();
+
+  try {
+    const kv = new MemoryKV();
+    // Profile as it looks after a termination: clock 53 days stale, recorded rate zeroed.
+    await kv.put(
+      `user:${account.toLowerCase()}`,
+      JSON.stringify({
+        account: account.toLowerCase(),
+        rootAccount: account.toLowerCase(),
+        createdAt: closedAt,
+        updatedAt: closedAt,
+        totalGdDepositedWei: "0",
+        totalBonusUsd: "0",
+        streamFlowRateWeiPerSecond: "0",
+        totalPrincipalUsd: "0",
+        totalGDStreamedWei: "0",
+        totalOutstandingFundingUsd: "0",
+        lastStreamCreditAt: closedAt
+      })
+    );
+
+    const testEnv = env({
+      ANTSEED_KV: kv as never,
+      CELO_RPC_URL: "https://celo.rpc.local",
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GOODID_ADDRESS: goodIdAddr
+    });
+
+    // Stream creation: totalFlowWei is always 0 because there was no previous flow.
+    const creationLog = encodeVaultEventLog("StreamUpdated", [account, buyer, 3_433_641_975_308_641n, 8_900_000_000_000_000_000_000n, 0n], celoVault, txHash, 0);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "eth_call") {
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x000000000000000000000000abababababababababababababababababababab" });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [creationLog] } });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      makeExecutionContext()
+    );
+
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { events: Array<{ gdAmountWei: string; principalUsd: string; fundingStatus: string }> };
+    assert.equal(body.events.length, 1);
+    assert.equal(body.events[0].gdAmountWei, "0", "the dormant gap must not be credited");
+    assert.equal(body.events[0].principalUsd, "0");
+    assert.equal(body.events[0].fundingStatus, "funded");
+
+    const store = new KVCreditStore(kv as never);
+    const profile = await store.getUser(account);
+    // Clock re-baselined to now, and the new stream's rate adopted for the next window.
+    assert.ok(Date.parse(profile.lastStreamCreditAt!) > Date.parse(closedAt));
+    assert.ok(Date.now() - Date.parse(profile.lastStreamCreditAt!) < 60_000);
+    assert.equal(profile.streamFlowRateWeiPerSecond, "3433641975308641");
+    assert.equal(profile.totalGDStreamedWei, "0");
+
+    // What the unfixed path would have billed: 53 days at the closed stream's old rate.
+    const staleRate = 3_433_641_975_308_641n;
+    assert.ok(staleRate * BigInt(53 * 24 * 60 * 60) > 15_000n * 10n ** 18n);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// The floor must not depend on the close having been ingested. Here the profile still carries the
+// closed stream's rate (the termination event never arrived), and only the subgraph's
+// `createdAtTimestamp` prevents the opening event from billing the 53-day dormant gap.
+test("/v1/celo/events/record floors the window at the stream's last update even with a stale flow rate", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const txHash = `0x${"a".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const goodIdAddr = "0x0000000000000000000000000000000000001234";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const originalFetch = globalThis.fetch;
+
+  const staleRate = 3_433_641_975_308_641n; // 8900 G$/month, left over from the closed stream
+  const closedAt = new Date(Date.now() - 53 * 24 * 60 * 60 * 1000).toISOString();
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - 60; // new stream opened a minute ago
+
+  try {
+    const kv = new MemoryKV();
+    await kv.put(
+      `user:${account.toLowerCase()}`,
+      JSON.stringify({
+        account: account.toLowerCase(),
+        rootAccount: account.toLowerCase(),
+        createdAt: closedAt,
+        updatedAt: closedAt,
+        totalGdDepositedWei: "0",
+        totalBonusUsd: "0",
+        streamFlowRateWeiPerSecond: staleRate.toString(), // never zeroed — close was not ingested
+        totalPrincipalUsd: "0",
+        totalGDStreamedWei: "0",
+        totalOutstandingFundingUsd: "0",
+        lastStreamCreditAt: closedAt
+      })
+    );
+
+    const testEnv = env({
+      ANTSEED_KV: kv as never,
+      CELO_RPC_URL: "https://celo.rpc.local",
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GOODID_ADDRESS: goodIdAddr,
+      CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken
+    });
+
+    const creationLog = encodeVaultEventLog("StreamUpdated", [account, buyer, staleRate, 8_900_000_000_000_000_000_000n, 0n], celoVault, txHash, 0);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.query) {
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: staleRate.toString(),
+                createdAtTimestamp: createdAtSeconds.toString(),
+                updatedAtTimestamp: createdAtSeconds.toString(),
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
+      if (body.method === "eth_call") {
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x000000000000000000000000abababababababababababababababababababab" });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [creationLog] } });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      makeExecutionContext()
+    );
+
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { events: Array<{ gdAmountWei: string; fundingStatus: string }> };
+    assert.equal(body.events.length, 1);
+
+    // At most the ~60s since the stream opened — not the 53 days since the last credit.
+    const credited = BigInt(body.events[0].gdAmountWei);
+    assert.ok(credited <= staleRate * 300n, `credited ${credited}, expected at most a few minutes' worth`);
+    assert.ok(staleRate * BigInt(53 * 24 * 60 * 60) > 15_000n * 10n ** 18n, "the gap would have been >15k G$");
+
+    const store = new KVCreditStore(kv as never);
+    const profile = await store.getUser(account);
+    assert.ok(Date.now() - Date.parse(profile.lastStreamCreditAt!) < 60_000, "clock re-baselined to now");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// The subgraph is the source of truth for whether a stream still exists. A closed stream reports
+// currentFlowRate 0, and the cron must write that through — the termination event that would
+// otherwise do it is pushed in by POST /v1/celo/events/record and may never arrive.
+test("scheduled run zeroes the recorded flow rate once a stream closes", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const staleRate = 3_433_641_975_308_641n;
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    await kv.put(
+      `user:${account}`,
+      JSON.stringify({
+        account,
+        rootAccount: account,
+        createdAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString(),
+        updatedAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString(),
+        totalGdDepositedWei: "0",
+        totalBonusUsd: "0",
+        streamFlowRateWeiPerSecond: staleRate.toString(),
+        totalPrincipalUsd: "0",
+        totalGDStreamedWei: "0",
+        totalOutstandingFundingUsd: "0",
+        lastStreamCreditAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString()
+      })
+    );
+
+    const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
+    const createdAtSeconds = Math.floor(Date.now() / 1000) - 90 * 24 * 60 * 60;
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) {
+        // Two revisions for one account, both closed — the shape the live subgraph returns.
+        return Response.json({
+          data: {
+            streams: [0, 1].map((revision) => ({
+              sender: { id: account },
+              currentFlowRate: "0",
+              createdAtTimestamp: (createdAtSeconds + revision * 1000).toString(),
+              updatedAtTimestamp: (createdAtSeconds + revision * 2000).toString(),
+              flowUpdatedEvents: [{ userData: "0x" }]
+            }))
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv, makeExecutionContext());
+
+    const profile = await new KVCreditStore(kv as never).getUser(account);
+    assert.equal(profile.streamFlowRateWeiPerSecond, "0", "a closed stream must not keep advertising its rate");
+    // Current state only — the clock and the totals are settlement, and must not move here.
+    assert.equal(profile.totalGDStreamedWei, "0");
+    assert.equal(profile.totalPrincipalUsd, "0");
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});
+
+// One account can hold a closed revision and a live one at the same time. Summing per account is
+// what stops the closed row from clobbering the live rate, whatever order the subgraph returns them.
+test("scheduled run keeps the live rate when an account also has a closed revision", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const liveRate = 3_433_641_975_308_641n;
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    // The sync only corrects accounts that already have a profile, and a stale value here proves the
+    // closed revision does not win over the live one.
+    await kv.put(
+      `user:${account}`,
+      JSON.stringify({
+        account,
+        rootAccount: account,
+        createdAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+        updatedAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+        totalGdDepositedWei: "0",
+        totalBonusUsd: "0",
+        streamFlowRateWeiPerSecond: "1",
+        totalPrincipalUsd: "0",
+        totalGDStreamedWei: "0",
+        totalOutstandingFundingUsd: "0",
+        lastStreamCreditAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString()
+      })
+    );
+    const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) {
+        return Response.json({
+          data: {
+            streams: [
+              // Live revision first, closed one after it — the clobbering order.
+              {
+                sender: { id: account },
+                currentFlowRate: liveRate.toString(),
+                createdAtTimestamp: (nowSeconds - 3600).toString(),
+                updatedAtTimestamp: (nowSeconds - 3600).toString(),
+                flowUpdatedEvents: [{ userData: "0x" }]
+              },
+              {
+                sender: { id: account },
+                currentFlowRate: "0",
+                createdAtTimestamp: (nowSeconds - 90 * 24 * 3600).toString(),
+                updatedAtTimestamp: (nowSeconds - 60 * 24 * 3600).toString(),
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv, makeExecutionContext());
+
+    const profile = await new KVCreditStore(kv as never).getUser(account);
+    assert.equal(profile.streamFlowRateWeiPerSecond, liveRate.toString());
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});
+
+// The scheduled run corrects state that exists; it must not enrol a streamer who has never been
+// credited. Their first credit is what creates the profile, in `recordGdCredit`.
+test("scheduled run does not create a profile for an uncredited streamer", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) {
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "3433641975308641",
+                createdAtTimestamp: (nowSeconds - 3600).toString(),
+                updatedAtTimestamp: (nowSeconds - 3600).toString(),
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv, makeExecutionContext());
+
+    assert.equal(await kv.get(`user:${account}`), null, "no profile may be written by the sync alone");
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});
+
+// A GoodID root aggregates its identity's wallets. The lifetime totals get there by mirroring in
+// `updateUser`, which works because they accumulate; a flow rate is absolute, so it is summed.
+test("scheduled run sums the flow rate across a root's accounts", { concurrency: false }, async () => {
+  const rootAccount = "0x0000000000000000000000000000000000000a00";
+  const walletA = "0x0000000000000000000000000000000000000a01";
+  const walletB = "0x0000000000000000000000000000000000000a02";
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const gdSuperToken = "0x0000000000000000000000000000000000000fed";
+  const rateA = 1_000_000_000_000_000n;
+  const rateB = 2_000_000_000_000_000n;
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    const seed = (account: string, root: string) =>
+      kv.put(
+        `user:${account}`,
+        JSON.stringify({
+          account,
+          rootAccount: root,
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+          totalGdDepositedWei: "0",
+          totalBonusUsd: "0",
+          streamFlowRateWeiPerSecond: "0",
+          totalPrincipalUsd: "0",
+          totalGDStreamedWei: "0",
+          totalOutstandingFundingUsd: "0",
+          lastStreamCreditAt: undefined
+        })
+      );
+    await seed(walletA, rootAccount);
+    await seed(walletB, rootAccount);
+    await seed(rootAccount, rootAccount);
+
+    const testEnv = env({ ANTSEED_KV: kv as never, CELO_VAULT_ADDRESS: celoVault, CELO_GD_SUPERTOKEN_ADDRESS: gdSuperToken });
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) {
+        return Response.json({
+          data: {
+            streams: [
+              [walletA, rateA],
+              [walletB, rateB]
+            ].map(([sender, rate]) => ({
+              sender: { id: sender as string },
+              currentFlowRate: (rate as bigint).toString(),
+              createdAtTimestamp: (nowSeconds - 3600).toString(),
+              updatedAtTimestamp: (nowSeconds - 3600).toString(),
+              flowUpdatedEvents: [{ userData: "0x" }]
+            }))
+          }
+        });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv, makeExecutionContext());
+
+    const store = new KVCreditStore(kv as never);
+    // Each wallet keeps its own rate — it is the pricing input for that account's stream updates.
+    assert.equal((await store.getUser(walletA)).streamFlowRateWeiPerSecond, rateA.toString());
+    assert.equal((await store.getUser(walletB)).streamFlowRateWeiPerSecond, rateB.toString());
+    // The root carries the identity's total, not whichever wallet synced last.
+    assert.equal((await store.getUser(rootAccount)).streamFlowRateWeiPerSecond, (rateA + rateB).toString());
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Scheduled run: credit issuance across the stream lifecycle.
+//
+// These drive `flowRate * elapsed -> recordGdCredit` through `scheduled` and assert the credit
+// entry. Funding is fired through `ctx.waitUntil`, which the test harness discards, so the entry --
+// not the funding result -- is the observable, and it is the part that was wrong in production.
+// ---------------------------------------------------------------------------
+
+const CRON_EVENT = { scheduledTime: 0, cron: "0 */6 * * *" } as unknown as ScheduledEvent;
+const RATE_8900 = 3_433_641_975_308_641n; // 8900 G$/month, ~296.67 G$/day
+const MIN_CREDIT_WEI = 4_000n * 10n ** 18n; // MIN_GD_STREAMED_FOR_BONUS default
+
+function seedStreamProfile(kv: MemoryKV, account: string, fields: { flowRate: bigint; lastStreamCreditAt?: string }) {
+  const stamp = fields.lastStreamCreditAt ?? new Date().toISOString();
+  return kv.put(
+    `user:${account}`,
+    JSON.stringify({
+      account,
+      rootAccount: account,
+      createdAt: stamp,
+      updatedAt: stamp,
+      totalGdDepositedWei: "0",
+      totalBonusUsd: "0",
+      streamFlowRateWeiPerSecond: fields.flowRate.toString(),
+      totalPrincipalUsd: "0",
+      totalGDStreamedWei: "0",
+      totalOutstandingFundingUsd: "0",
+      lastStreamCreditAt: fields.lastStreamCreditAt
+    })
+  );
+}
+
+function subgraphStream(account: string, flowRate: bigint, createdAtSeconds: number, updatedAtSeconds = createdAtSeconds) {
+  return {
+    sender: { id: account },
+    currentFlowRate: flowRate.toString(),
+    createdAtTimestamp: createdAtSeconds.toString(),
+    updatedAtTimestamp: updatedAtSeconds.toString(),
+    flowUpdatedEvents: [{ userData: "0x" }]
+  };
+}
+
+function cronFetchMock(streams: unknown[]) {
+  return (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    if (body.query?.includes("streams")) return Response.json({ data: { streams } });
+    return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+  }) as typeof fetch;
+}
+
+async function runCron(kv: MemoryKV, streams: unknown[]) {
+  const testEnv = env({
+    ANTSEED_KV: kv as never,
+    CELO_VAULT_ADDRESS: "0x0000000000000000000000000000000000000def",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000fed"
+  });
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+  try {
+    console.log = (() => {}) as typeof console.log;
+    globalThis.fetch = cronFetchMock(streams);
+    await worker.scheduled(CRON_EVENT, testEnv, makeExecutionContext());
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+  }
+  return new KVCreditStore(kv as never);
+}
+
+test("scheduled run issues no credit for a closed stream", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ac1";
+  const kv = new MemoryKV();
+  // 30 days of uncredited time, which would be ~8900 G$ if the stream were still running.
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - 30 * 86400_000).toISOString() });
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - 90 * 86400;
+
+  const store = await runCron(kv, [subgraphStream(account, 0n, createdAtSeconds, createdAtSeconds + 86400)]);
+
+  assert.deepEqual(await store.getGdCredits(account), [], "a stream reporting currentFlowRate 0 must not be credited");
+  assert.equal((await store.getUser(account)).streamFlowRateWeiPerSecond, "0");
+});
+
+test("scheduled run credits a live stream from its last credit", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ac2";
+  const kv = new MemoryKV();
+  const elapsedDays = 20; // clears the 24h cooldown and the 4000 G$ minimum
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - elapsedDays * 86400_000).toISOString() });
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - 200 * 86400;
+
+  const store = await runCron(kv, [subgraphStream(account, RATE_8900, createdAtSeconds)]);
+
+  const credits = await store.getGdCredits(account);
+  assert.equal(credits.length, 1);
+  assert.equal(credits[0].source, "streamCron");
+  const expected = RATE_8900 * BigInt(elapsedDays * 86400);
+  const credited = BigInt(credits[0].gdAmountWei);
+  const drift = credited > expected ? credited - expected : expected - credited;
+  assert.ok(drift <= RATE_8900 * 60n, `credited ${credited}, expected ~${expected}`);
+  assert.ok(credited > MIN_CREDIT_WEI);
+});
+
+// Regression for the production incident: the stored clock was ~51 days stale while the subgraph
+// still reported the stream at its opening rate, producing a single 15,244.93 G$ credit for a
+// stream that had stopped flowing weeks earlier. The creation floor bounds it.
+test("scheduled run bounds the credit by the stream's last update when the clock is stale", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ac3";
+  const kv = new MemoryKV();
+  // Clock predates the current stream revision by seven weeks.
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - 51 * 86400_000).toISOString() });
+  const reopenedDaysAgo = 20;
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - reopenedDaysAgo * 86400;
+
+  const store = await runCron(kv, [subgraphStream(account, RATE_8900, createdAtSeconds)]);
+
+  const credits = await store.getGdCredits(account);
+  assert.equal(credits.length, 1);
+  const credited = BigInt(credits[0].gdAmountWei);
+  const sinceReopen = RATE_8900 * BigInt(reopenedDaysAgo * 86400);
+  const sinceStaleClock = RATE_8900 * BigInt(51 * 86400);
+  assert.ok(credited <= sinceReopen + RATE_8900 * 60n, `credited ${credited}, must not exceed the window since the stream opened`);
+  assert.ok(sinceStaleClock > credited, "the unbounded window would have been materially larger");
+});
+
+test("scheduled run prices a rate change at the rate the subgraph reports", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ac4";
+  const halvedRate = RATE_8900 / 2n;
+  const kv = new MemoryKV();
+  // 35 days, not 20: at the halved rate a 20-day window is ~2,966 G$ and the 4000 G$ minimum would
+  // skip it entirely.
+  const elapsedDays = 35;
+  // Profile still carries the old rate; the subgraph reports the new one.
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - elapsedDays * 86400_000).toISOString() });
+  const createdAtSeconds = Math.floor(Date.now() / 1000) - 200 * 86400;
+
+  const store = await runCron(kv, [subgraphStream(account, halvedRate, createdAtSeconds)]);
+
+  const credits = await store.getGdCredits(account);
+  assert.equal(credits.length, 1);
+  const expected = halvedRate * BigInt(elapsedDays * 86400);
+  const credited = BigInt(credits[0].gdAmountWei);
+  const drift = credited > expected ? credited - expected : expected - credited;
+  assert.ok(drift <= halvedRate * 60n, `credited ${credited}, expected ~${expected} at the new rate`);
+  // And the profile adopts the new rate for the next window.
+  assert.equal((await store.getUser(account)).streamFlowRateWeiPerSecond, halvedRate.toString());
+});
+
+
+// The distinguishing property of flooring on `updatedAtTimestamp` rather than `createdAtTimestamp`:
+// a plain rate change moves the floor too. That is what makes a stale clock unreachable, and it is
+// also the trade-off -- if the resulting StreamUpdated event is never ingested, the window between
+// the last credit and the rate change is skipped and never paid.
+test("streamElapsedSeconds floors at a rate change, not only at stream creation", () => {
+  const now = new Date("2026-02-10T00:00:00.000Z");
+  const lastCredit = "2026-01-15T00:00:00.000Z";
+  const rateChangedAt = "2026-02-01T00:00:00.000Z";
+
+  const elapsed = streamElapsedSeconds(now, lastCredit, rateChangedAt);
+  assert.equal(elapsed, 9 * 24 * 60 * 60, "window starts at the rate change, not the last credit");
+
+  // The 17 days between the last credit and the rate change are deliberately not included here --
+  // they are the StreamUpdated event's to pay.
+  const sinceLastCredit = Math.floor((now.getTime() - Date.parse(lastCredit)) / 1000);
+  assert.equal(sinceLastCredit - elapsed, 17 * 24 * 60 * 60);
+});
+
+// A brief high-rate stream opened and closed between cron ticks cannot later be charged against a
+// stale clock: the next stream carries a fresh on-chain update that becomes the floor.
+test("streamElapsedSeconds makes a stale clock unreachable after a new stream opens", () => {
+  const now = new Date("2026-02-10T00:00:00.000Z");
+  const staleClock = "2026-01-10T00:00:00.000Z"; // 31 days of uncredited time
+  const openedAt = "2026-02-09T22:00:00.000Z"; // new stream, two hours old
+
+  const elapsed = streamElapsedSeconds(now, staleClock, openedAt);
+  assert.equal(elapsed, 2 * 60 * 60);
+
+  const hugeRate = 1_000_000n * 10n ** 18n; // 1M G$/second
+  const credited = hugeRate * BigInt(elapsed);
+  const unfloored = hugeRate * BigInt(Math.floor((now.getTime() - Date.parse(staleClock)) / 1000));
+  assert.ok(unfloored / credited > 300n, "the stale window would have been orders of magnitude larger");
+});
+
+// Regression: the credit loop used to pass a single row's `flowRate` into `recordGdCredit`, which
+// overwrote the per-account sum the sync pass had just written. Only one row per account per day
+// reaches that write (they share a daily deposit id), so whichever row clears the cooldown and the
+// minimum decided the stored rate -- and a closed row carries 0.
+test("scheduled run keeps the summed rate when only a closed row is creditable", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ad1";
+  const kv = new MemoryKV();
+  await seedStreamProfile(kv, account, { flowRate: RATE_8900, lastStreamCreditAt: new Date(Date.now() - 40 * 86400_000).toISOString() });
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const store = await runCron(kv, [
+    // Live, but changed two hours ago, so its window is under the 24h cooldown and it is skipped.
+    subgraphStream(account, RATE_8900, nowSeconds - 100 * 86400, nowSeconds - 2 * 3600),
+    // Closed 20 days ago, with a long uncredited final interval, so this is the row that credits.
+    subgraphStream(account, 0n, nowSeconds - 60 * 86400, nowSeconds - 20 * 86400)
+  ]);
+
+  const credits = await store.getGdCredits(account);
+  assert.equal(credits.length, 1, "the closed row's final interval is credited");
+
+  const profile = await store.getUser(account);
+  assert.equal(profile.streamFlowRateWeiPerSecond, RATE_8900.toString(), "the live stream's rate must survive the closed row's credit");
+});
+
+// A first-time streamer has no profile, so the sync pass skips it; the profile is created by its first
+// credit, which must carry the account's rate rather than leave it at the default 0.
+test("scheduled run records the rate on a first-time streamer's new profile", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ad2";
+  const kv = new MemoryKV();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const store = await runCron(kv, [subgraphStream(account, RATE_8900, nowSeconds - 30 * 86400)]);
+
+  assert.equal((await store.getGdCredits(account)).length, 1);
+  assert.equal((await store.getUser(account)).streamFlowRateWeiPerSecond, RATE_8900.toString());
+});
+
+// Regression: on a close the stream is gone from the active-only lookup, so there is no floor and the
+// window falls back to a possibly weeks-stale `lastStreamCreditAt`. With `/v1/celo/events/record`
+// unauthenticated, a small stream open for one cron tick and then closed was credited across the whole
+// stale window. The amount is capped at the event's on-chain `totalFlowWei`.
+test("/v1/celo/events/record caps a termination credit at what actually flowed", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000ad3";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const txHash = `0x${"d".repeat(64)}`;
+  const celoVault = "0x0000000000000000000000000000000000000def";
+  const rate = 385_802_469_135_802_469n; // ~0.386 G$/s, ~1M G$/month
+  const actuallyFlowed = rate * 6n * 3600n; // open for one 6h cron interval
+  const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+  try {
+    console.log = (() => {}) as typeof console.log;
+    const kv = new MemoryKV();
+    // Rate synced by the cron while the stream ran; clock 30 days stale because nothing was credited.
+    await seedStreamProfile(kv, account, { flowRate: rate, lastStreamCreditAt: new Date(Date.now() - 30 * 86400_000).toISOString() });
+    const testEnv = env({
+      ANTSEED_KV: kv as never,
+      CELO_RPC_URL: "https://celo.rpc.local",
+      CELO_VAULT_ADDRESS: celoVault,
+      CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000fed"
+    });
+    const closeLog = encodeVaultEventLog("StreamUpdated", [account, buyer, 0n, 0n, actuallyFlowed], celoVault, txHash, 0);
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.query?.includes("streams")) return Response.json({ data: { streams: [] } });
+      if (body.method === "eth_call") {
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x000000000000000000000000abababababababababababababababababababab" });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [closeLog] } });
+    }) as typeof fetch;
+
+    const res = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      testEnv,
+      makeExecutionContext()
+    );
+    const body = (await res.json()) as { events: Array<{ gdAmountWei: string }> };
+
+    assert.equal(BigInt(body.events[0].gdAmountWei), actuallyFlowed, "credit must not exceed the G$ the stream carried");
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
   }
 });

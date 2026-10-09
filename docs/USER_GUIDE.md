@@ -182,7 +182,14 @@ curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/celo/events/record" \
   -d '{"txHash":"0xYOUR_STREAM_TX_HASH"}'
 ```
 
-The Worker uses this to record the stream's `totalFlowWei` as a credit entry and issue the +20% streaming bonus.
+The Worker records a credit entry and issues the +20% streaming bonus. The credited amount is **not**
+the event's `totalFlowWei` — that figure is measured from the last on-chain flow change, which overlaps
+the window the scheduled run already credits, so counting it would double-pay. The Worker credits the
+window it actually owes instead: the time since your last stream credit, at your recorded flow rate.
+
+You do not have to submit this call for a rate change to be picked up. The scheduled run reads your
+streams from the Superfluid subgraph every 6 hours and credits the same window. Submitting the event
+simply settles it sooner.
 
 ## Step 4 — Check your credit balance
 
