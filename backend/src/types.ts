@@ -50,6 +50,8 @@ export type GdCreditEntry = {
   streamUpdateMonth: string;
   /** AntSeed buyer account address to which credits are funded. */
   buyerAddress?: string;
+  /** End of the stream window this entry pays for; becomes the account's `lastStreamCreditAt` once funded. */
+  streamCreditedThrough?: string;
 };
 
 export type StreamState = {

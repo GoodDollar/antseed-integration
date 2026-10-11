@@ -1,0 +1,220 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import worker from "../src/worker.js";
+import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
+import { Env } from "../src/env.js";
+import { KVCreditStore } from "../src/kv-credit-store.js";
+import { encodeVaultEventLog } from "../src/celo-events.js";
+
+class MemoryKV {
+  private data = new Map<string, string>();
+  async get(key: string, type?: "text" | "json") {
+    const raw = this.data.get(key) ?? null;
+    if (type === "json") return raw ? JSON.parse(raw) : null;
+    return raw;
+  }
+  async put(key: string, value: string) {
+    this.data.set(key, value);
+  }
+}
+
+const VAULT = "0x0000000000000000000000000000000000000def";
+const SUPERTOKEN = "0x0000000000000000000000000000000000000fed";
+const RATE = 3_433_641_975_308_641n; // 8900 G$/month
+const DAY = 86_400;
+
+/** Collects `waitUntil` work so a test can await the funding the scheduled run fires off. */
+function trackingContext() {
+  const pending: Promise<unknown>[] = [];
+  const ctx = {
+    waitUntil(promise: Promise<unknown>) {
+      pending.push(promise);
+    },
+    passThroughOnException() {}
+  } as unknown as ExecutionContext;
+  return { ctx, settle: () => Promise.all(pending) };
+}
+
+/**
+ * Stands in for `AntseedBuyerOperator.depositForWithId`: one funding per id, as the contract enforces
+ * with `DuplicateDepositId`. Every distinct id is real money landing in the buyer's deposits.
+ */
+function stubOnChainFunding() {
+  const original = AntSeedFundingVaultClient.prototype.depositForBuyerWithId;
+  const funded = new Map<string, bigint>();
+  AntSeedFundingVaultClient.prototype.depositForBuyerWithId = async function (buyer, principalUsd, bonusUsd, id) {
+    // Yield like a real RPC round trip, so concurrent requests interleave.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    if (!funded.has(id)) funded.set(id, principalUsd + bonusUsd);
+    return { enabled: true, buyer, amountUsd: (principalUsd + bonusUsd).toString(), txHash: `0x${funded.size}` };
+  };
+  return { funded, restore: () => (AntSeedFundingVaultClient.prototype.depositForBuyerWithId = original) };
+}
+
+async function seedProfile(kv: MemoryKV, account: string, lastStreamCreditAt: string) {
+  await kv.put(
+    `user:${account}`,
+    JSON.stringify({
+      account,
+      rootAccount: account,
+      createdAt: lastStreamCreditAt,
+      updatedAt: lastStreamCreditAt,
+      totalGdDepositedWei: "0",
+      totalBonusUsd: "0",
+      streamFlowRateWeiPerSecond: RATE.toString(),
+      totalPrincipalUsd: "0",
+      totalGDStreamedWei: "0",
+      totalOutstandingFundingUsd: "0",
+      lastStreamCreditAt
+    })
+  );
+}
+
+function testEnv(kv: MemoryKV): Env {
+  return {
+    ANTSEED_KV: kv as never,
+    CELO_RPC_URL: "https://celo.rpc.local",
+    CELO_VAULT_ADDRESS: VAULT,
+    CELO_GD_SUPERTOKEN_ADDRESS: SUPERTOKEN
+  } as Env;
+}
+
+/**
+ * The account streamed for 30 days, was last credited 20 days ago and closed its stream an hour ago.
+ * It is owed exactly 20 days minus an hour of G$, once.
+ */
+function closedStreamScenario() {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const openedAt = nowSeconds - 30 * DAY;
+  const closedAt = nowSeconds - 3600;
+  const lastCreditAt = new Date((nowSeconds - 20 * DAY) * 1000).toISOString();
+  const owedWei = RATE * BigInt(closedAt - (nowSeconds - 20 * DAY));
+  return { nowSeconds, openedAt, closedAt, lastCreditAt, owedWei };
+}
+
+function subgraphMock(account: string, scenario: ReturnType<typeof closedStreamScenario>, closeLog: unknown) {
+  return (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    if (typeof body.query === "string") {
+      if (body.query.includes("streamPeriods")) {
+        return Response.json({
+          data: {
+            _meta: { block: { timestamp: scenario.nowSeconds } },
+            streamPeriods: [
+              {
+                id: `${account}-period-0`,
+                sender: { id: account },
+                flowRate: RATE.toString(),
+                startedAtTimestamp: scenario.openedAt.toString(),
+                stoppedAtTimestamp: scenario.closedAt.toString(),
+                startedAtEvent: { userData: "0x" }
+              }
+            ]
+          }
+        });
+      }
+      const activeOnly = body.query.includes("currentFlowRate_gt");
+      return Response.json({
+        data: {
+          streams: activeOnly
+            ? []
+            : [
+                {
+                  sender: { id: account },
+                  currentFlowRate: "0",
+                  updatedAtTimestamp: scenario.closedAt.toString(),
+                  flowUpdatedEvents: [{ userData: "0x" }]
+                }
+              ]
+        }
+      });
+    }
+    if (body.method === "eth_call") {
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x000000000000000000000000abababababababababababababababababababab" });
+    }
+    return Response.json({ jsonrpc: "2.0", id: body.id, result: { logs: [closeLog] } });
+  }) as typeof fetch;
+}
+
+function totalFundedGdWei(entries: Array<{ gdAmountWei: string; fundingStatus: string }>): bigint {
+  return entries.filter((entry) => entry.fundingStatus === "funded").reduce((sum, entry) => sum + BigInt(entry.gdAmountWei), 0n);
+}
+
+// Race audit. `/stream-credits` keyed its entry `stream:<day>:<account>` and `/v1/celo/events/record`
+// keyed a termination `<txHash>:<logIndex>`. Both priced the same window from the same
+// `lastStreamCreditAt`, which only moves once funding lands -- so fired together, each saw the stale
+// clock and each funded the full tail under its own id. On-chain `DuplicateDepositId` cannot help:
+// the ids differ. Both endpoints are unauthenticated, so any streamer could double their credit.
+test("concurrent user-triggered requests cannot double-credit a stream window", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000b01";
+  const scenario = closedStreamScenario();
+  const kv = new MemoryKV();
+  await seedProfile(kv, account, scenario.lastCreditAt);
+  const txHash = `0x${"e".repeat(64)}`;
+  const closeLog = encodeVaultEventLog("StreamUpdated", [account, account, 0n, 0n, RATE * BigInt(30 * DAY)], VAULT, txHash, 0);
+
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const onChain = stubOnChainFunding();
+  try {
+    console.log = (() => {}) as typeof console.log;
+    globalThis.fetch = subgraphMock(account, scenario, closeLog);
+    const env = testEnv(kv);
+    const { ctx } = trackingContext();
+
+    // The second request lands while the first is still waiting for its Base deposit to confirm.
+    await Promise.all([
+      worker.fetch(
+        new Request("https://worker.test/v1/celo/events/record", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ txHash })
+        }),
+        env,
+        ctx
+      ),
+      new Promise((resolve) => setTimeout(resolve, 10)).then(() =>
+        worker.fetch(new Request(`https://worker.test/v1/accounts/${account}/stream-credits`, { method: "POST" }), env, ctx)
+      )
+    ]);
+
+    const credited = totalFundedGdWei(await new KVCreditStore(kv as never).getGdCredits(account));
+    assert.ok(credited <= scenario.owedWei, `credited ${credited} G$ wei across ${onChain.funded.size} on-chain deposits, owed ${scenario.owedWei}`);
+  } finally {
+    onChain.restore();
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
+// Two scheduled runs overlapping (a slow run still funding when the next tick fires, or a manual
+// trigger) both read the same stale clock. Keying the deposit id on the window's start rather than
+// on the calendar day makes them collide on the id, so the contract funds the window once.
+test("overlapping scheduled runs fund a stream window once", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000b02";
+  const scenario = closedStreamScenario();
+  const kv = new MemoryKV();
+  await seedProfile(kv, account, scenario.lastCreditAt);
+
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const onChain = stubOnChainFunding();
+  try {
+    console.log = (() => {}) as typeof console.log;
+    globalThis.fetch = subgraphMock(account, scenario, undefined);
+    const env = testEnv(kv);
+    const first = trackingContext();
+    const second = trackingContext();
+    const event = { scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent;
+
+    await Promise.all([worker.scheduled(event, env, first.ctx), worker.scheduled(event, env, second.ctx)]);
+    await Promise.all([first.settle(), second.settle()]);
+
+    assert.equal(onChain.funded.size, 1, `expected one on-chain deposit, got ${[...onChain.funded.keys()].join(", ")}`);
+  } finally {
+    onChain.restore();
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});

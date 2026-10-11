@@ -129,7 +129,7 @@ UI agents in `GoodDollar/GoodWidget` should treat this repo as the source of tru
 - Auth/API key endpoints listed in `backend/README.md`.
 - Credit quote and account balance endpoints.
 - Celo deposit/stream event ingestion flows.
-- Outstanding credit and stream-credits endpoints.
+- Outstanding credit endpoint (stream credits are cron-only; there is no on-demand endpoint).
 - OpenAI-compatible `POST /v1/chat/completions` behavior (planned; not yet implemented).
 
 If real deployed backend URLs are not provided in an issue, use Storybook/fixture mocks in GoodWidget rather than inventing production endpoints.

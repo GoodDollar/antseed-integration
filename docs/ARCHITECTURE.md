@@ -49,47 +49,25 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - parses `GdDeposited` and `StreamUpdated` events from `CeloGdAntSeedVault`
 - resolves `getWhitelistedRoot(account)` to determine GoodID verification and root-account aggregation
 - records a `GdCreditEntry` in KV and calls `fundCredit` immediately
-- for `StreamUpdated`, the credited amount is **not** the event's `totalFlowWei`. That figure is
-  `previousFlowRate * (now − last on-chain flow change)`, a baseline the backend does not track, so it
-  overlaps the window the scheduled run credits from `lastStreamCreditAt` and would be counted twice.
-  The amount is instead the window the backend owes — `streamFlowRateWeiPerSecond * elapsedSeconds`
-  measured from `lastStreamCreditAt`, at the previously recorded rate, since `event.flowRate` is the
-  new rate only taking effect now. Every stream credit therefore shares one baseline and one formula
-- the window is floored at the stream's `updatedAtTimestamp`, read from the subgraph for the event's
-  account, so a stream opening after an earlier one closed cannot bill the dormant gap between them.
-  A terminated stream is absent from that query (it filters on `currentFlowRate > 0`) so the floor
-  does not apply there and the window falls back to `lastStreamCreditAt`, which can be weeks stale.
-  The amount is therefore capped at the event's `totalFlowWei` — computed on-chain as what actually
-  flowed since the last flow change — so a stale clock priced at a remembered rate can never be
-  credited beyond the G$ the stream carried. The lookup is cached per request, since one receipt can
-  carry several stream events for the same account
-- termination also records `streamFlowRateWeiPerSecond = 0` (an explicit `!== undefined` check, because
-  `0` is falsy), but it is **not** what protects the gap — the subgraph floor above is. This endpoint is
-  push-based and the event may never arrive, which is why the scheduled run re-syncs the rate itself
+- for `StreamUpdated`, the endpoint records a **zero-amount acknowledgement** entry (`source: "stream"`,
+  id `txHash:logIndex`) so callers polling for the tx see a terminal entry. It never credits: all
+  stream crediting happens in the cron (below), so repeated or concurrent calls cannot pay twice
 
-**Stream credit issuance** (`POST /v1/accounts/:account/stream-credits`):
+**Cron** (`0 */6 * * *` — every 6 hours, per `wrangler.toml`) is the **only** stream crediting path:
 
-- reads active Superfluid streams for the account from the subgraph
-- computes elapsed seconds since last credit (24-hour cooldown enforced), measured from the **later**
-  of `lastStreamCreditAt` and the stream's `updatedAtTimestamp`
-- the floor matters because `lastStreamCreditAt` survives a stream being closed. `updatedAtTimestamp`
-  moves forward on every create, rate change and close, so a stale clock can never be reached again —
-  an account that closes a stream and opens a new one months later is not credited for the dormant
-  gap, and a brief high-rate stream cannot be charged across weeks of uncredited time
-- the trade-off is deliberate: the floor also moves on a plain rate change, so if the resulting
-  `StreamUpdated` event is never ingested (that endpoint is push-only, with no retry) the window
-  between the last credit and the rate change is skipped and never paid. This errs towards
-  under-crediting rather than over-crediting
-- a non-positive or unparseable baseline yields 0 rather than a window measured from the epoch: a
-  stream credit is `flowRate * elapsedSeconds`, so a bad upstream timestamp would otherwise become
-  decades of credit in a single entry. The window itself is **not** capped — a long gap (stalled
-  cron, backfill) means the stream really did flow that whole time and the credit should reflect it
-- records a `GdCreditEntry` per stream and calls `fundCredit`
-
-**Cron** (`0 */6 * * *` — every 6 hours, per `wrangler.toml`):
-
-- fetches **all** incoming streams from the Superfluid subgraph, closed ones included — a terminated
-  stream reports `currentFlowRate = 0`, and seeing that row is how the backend learns it stopped
+- fetches Superfluid `StreamPeriod`s for the vault: every open period, plus closed periods stopped after
+  the persisted `streams:closed-periods-cursor`. Closed periods at or before the cursor are fully settled
+  and are not fetched again. The cursor only advances to just before the earliest closed period that
+  some account has not yet been credited through, so a held-back account keeps its periods in view
+- per account, the amount owed is the sum over its periods of `flowRate × overlap(period, (lastStreamCreditAt, asOf])`,
+  where `asOf` is the subgraph's indexed block timestamp. Gaps between periods earn nothing and each
+  rate is priced only for the time it was actually in force
+- an account with a live stream is held by the 24-hour cooldown and the `MIN_GD_STREAMED_FOR_BONUS`
+  minimum; an account whose streams are all closed is settled for its final window regardless
+- the deposit id is `stream:<account>:<lastStreamCreditAt>` (the window start). Concurrent or repeated
+  runs over the same window derive the same id, which `AntseedBuyerOperator.usedDepositIds` dedupes
+  on-chain. `lastStreamCreditAt` advances to `asOf` only once that entry is **funded**; a failed entry
+  is retried with the same id on the next run
 - syncs `streamFlowRateWeiPerSecond` for every account from that result before crediting, so the rate
   is refreshed on every run rather than only when a credit clears the cooldown and the 4000 G$ minimum
   (which can be a fortnight apart). The rate is **summed per account**: one account can hold a closed
@@ -101,7 +79,7 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
   absolute value, so mirroring it would leave the root holding whichever sub-account wrote last. The
   rate is therefore excluded from that mirror — `recordStreamFlowRate` writes one profile only — and
   summed onto the root here. A root that streams itself is part of its own sum
-- then issues stream credits for each account with a non-zero rate and funds them
+- then issues and funds the stream credits described above
 
 **Profile** (`GET /v1/accounts/:account/profile`):
 
