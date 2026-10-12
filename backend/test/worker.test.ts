@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface, Wallet } from "ethers";
-import worker, { fundCredit, streamElapsedSeconds } from "../src/worker.js";
+import worker, { fundCredit } from "../src/worker.js";
+import { streamElapsedSeconds } from "../src/stream-credits.js";
 import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
 import { Env } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
