@@ -6,7 +6,7 @@ import { KVCreditStore } from "./kv-credit-store.js";
 import { UserCreditProfile } from "./types.js";
 import { logInfo, logWarn, redactAddress } from "./logging.js";
 import { fetchSuperfluidIncomingStreams } from "./superfluid.js";
-import { SuperfluidIncomingStream } from "./superfluid.js";
+import { StreamPeriod, SuperfluidIncomingStream } from "./superfluid.js";
 
 /**
  * Stream credit entries are keyed per account per day, so the scheduled run and a user's own
@@ -47,44 +47,47 @@ export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | und
 }
 
 /**
- * What a stream owes credit for, and over what window.
+ * What a stream owes credit for between `lastStreamCreditAt` and `now`, read from Superfluid's own
+ * constant-rate periods rather than reconstructed from a rate and a window.
  *
- * Live stream: from the later of the last credit and the stream's last on-chain update, up to now,
- * at the rate the subgraph reports.
+ * Each period carries one rate for its whole span, so `flowRate * overlap` is exact. Summing the
+ * overlaps makes every awkward case fall out for free:
  *
- * Closed stream: from the last credit up to the **termination**, at the rate that was flowing before
- * it closed. The end has to be the termination rather than `now` -- the stream stopped carrying G$
- * then, so measuring to `now` would invent time it did not flow.
+ * - a rate change is two periods, each priced at its own rate, so nothing is skipped or averaged;
+ * - a closed period stops at its termination, so time after a stream ended is never credited;
+ * - the gap between a closed stream and its replacement has no period, so it cannot be billed;
+ * - a stale `lastStreamCreditAt` cannot inflate anything, because only real periods are summed.
  *
- * NOTE: this branch has neither a floor (a closed stream's last update *is* its termination) nor a
- * ceiling, so a stale `lastStreamCreditAt` priced at a remembered rate can over-credit. Tracked in
- * the PR notes -- reading `streamPeriods` is the fix, not another guard.
+ * With no previous credit the whole history is owed, which is correct -- it is what the stream
+ * actually carried.
  */
-export function streamCreditAmount(input: {
-  now: Date;
-  lastStreamCreditAt: string | undefined;
-  stream: SuperfluidIncomingStream;
-  /** The rate recorded before this run zeroed it; only consulted for a closed stream. */
-  previousFlowRateWeiPerSecond: bigint;
-}): { elapsedSeconds: number; gdAmountWei: bigint } {
-  const flowRateWeiPerSecond = BigInt(input.stream.flowRateWeiPerSecond);
-  if (flowRateWeiPerSecond > 0n) {
-    const elapsedSeconds = streamElapsedSeconds(input.now, input.lastStreamCreditAt, input.stream.lastUpdateAt);
-    return { elapsedSeconds, gdAmountWei: flowRateWeiPerSecond * BigInt(elapsedSeconds) };
+export function streamCreditFromPeriods(now: Date, lastStreamCreditAt: string | undefined, periods: StreamPeriod[]): bigint {
+  const nowMs = now.getTime();
+  const lastCreditMs = lastStreamCreditAt ? Date.parse(lastStreamCreditAt) : 0;
+  if (lastStreamCreditAt && !Number.isFinite(lastCreditMs)) {
+    logWarn("stream.credits.unusable-baseline", { lastStreamCreditAt });
+    return 0n;
   }
 
-  const terminatedAtMs = Date.parse(input.stream.lastUpdateAt);
-  const lastCreditMs = input.lastStreamCreditAt ? Date.parse(input.lastStreamCreditAt) : 0;
-  if (!Number.isFinite(terminatedAtMs) || terminatedAtMs <= 0 || !Number.isFinite(lastCreditMs) || lastCreditMs <= 0) {
-    logWarn("stream.credits.unusable-final-window", {
-      lastStreamCreditAt: input.lastStreamCreditAt,
-      terminatedAt: input.stream.lastUpdateAt
-    });
-    return { elapsedSeconds: 0, gdAmountWei: 0n };
+  let gdAmountWei = 0n;
+  for (const period of periods) {
+    const from = Math.max(period.startedAtMs, lastCreditMs);
+    const to = Math.min(period.stoppedAtMs ?? nowMs, nowMs);
+    if (to <= from) continue;
+    gdAmountWei += period.flowRateWeiPerSecond * BigInt(Math.floor((to - from) / 1000));
   }
+  return gdAmountWei;
+}
 
-  const elapsedSeconds = Math.max(0, Math.floor((terminatedAtMs - lastCreditMs) / 1000));
-  return { elapsedSeconds, gdAmountWei: input.previousFlowRateWeiPerSecond * BigInt(elapsedSeconds) };
+/**
+ * Seconds since the account was last credited, used only for the 24-hour cooldown. The amount owed
+ * comes from the periods above; this gates how often a credit may be issued at all.
+ */
+export function secondsSinceLastCredit(now: Date, lastStreamCreditAt: string | undefined): number {
+  if (!lastStreamCreditAt) return Number.MAX_SAFE_INTEGER;
+  const lastCreditMs = Date.parse(lastStreamCreditAt);
+  if (!Number.isFinite(lastCreditMs)) return 0;
+  return Math.max(0, Math.floor((now.getTime() - lastCreditMs) / 1000));
 }
 
 /**
@@ -103,12 +106,10 @@ export async function runStreamCreditCycle(
   startedAt: number
 ): Promise<void> {
   const gdPrice = await fetchCurrentGdPrice(cfg);
-  // Includes closed streams: a terminated stream reports `currentFlowRate = 0`, and seeing that is
-  // the only way the backend learns it stopped. The termination event that would otherwise say so
-  // is pushed in by `POST /v1/celo/events/record` and may never arrive.
+  // Includes closed streams: their periods carry the tail of what was streamed before termination,
+  // and their `currentFlowRate: 0` is how the backend learns the stream stopped.
   const streams = await fetchSuperfluidIncomingStreams(cfg);
 
-  let inactiveAccounts = 0;
   let syncedFlowRates = 0;
   let syncedRootFlowRates = 0;
   let skippedCooldown = 0;
@@ -118,61 +119,57 @@ export async function runStreamCreditCycle(
   let failed = 0;
   const createdAt = new Date().toISOString();
 
-  // Sync every account's recorded rate from the subgraph before crediting. Doing it here rather
-  // than inside `recordGdCredit` means it happens on every run, not only when a credit clears the
-  // cooldown and the minimum -- at a 4000 G$ minimum those can be a fortnight apart. Summed per
-  // account, because one account can hold several revisions (a closed stream and its replacement)
-  // and a closed row must not clobber the rate of the live one. All-closed sums to 0, which is
-  // how the profile stops advertising a stream that no longer exists.
-  const flowRateByAccount = new Map<string, bigint>();
+  // Collapse the subgraph rows to one entry per account. An account can hold several stream
+  // revisions -- a closed one and its replacement -- and they are credited together, because a
+  // credit entry is keyed per account per day.
+  type AccountStreams = { flowRateWeiPerSecond: bigint; periods: StreamPeriod[]; buyerAddress?: string };
+  const byAccount = new Map<string, AccountStreams>();
   for (const stream of streams) {
     const account = stream.account.toLowerCase();
-    flowRateByAccount.set(account, (flowRateByAccount.get(account) ?? 0n) + BigInt(stream.flowRateWeiPerSecond));
-  }
-  // One profile read per account, reused by the crediting pass below. `getSavedUser` rather than
-  // `getUser` because syncing is a correction to state that already exists -- an account that has
-  // never been credited has no profile, and the scheduled run must not create one as a side
-  // effect. Its first credit will create it, in `recordGdCredit`.
-  const profileByAccount = new Map<string, UserCreditProfile>();
-  const flowRateByRoot = new Map<string, bigint>();
-  // The rate as it stood before this run's sync. A stream that has just closed reports 0, so its
-  // final window has to be priced at what was flowing beforehand.
-  const previousFlowRateByAccount = new Map<string, bigint>();
-  for (const [account, flowRate] of flowRateByAccount) {
-    const profile = await store.getSavedUser(account);
-    if (!profile) continue;
-    previousFlowRateByAccount.set(account, BigInt(profile.streamFlowRateWeiPerSecond));
-    if (await store.recordStreamFlowRate(profile, flowRate)) syncedFlowRates += 1;
-    profileByAccount.set(account, profile);
-    flowRateByRoot.set(profile.rootAccount, (flowRateByRoot.get(profile.rootAccount) ?? 0n) + flowRate);
+    const current = byAccount.get(account) ?? { flowRateWeiPerSecond: 0n, periods: [] };
+    current.flowRateWeiPerSecond += BigInt(stream.flowRateWeiPerSecond);
+    current.periods.push(...stream.periods);
+    // Rows arrive newest-first, so the first buyer seen is the most recently declared one.
+    current.buyerAddress ??= stream.buyerAddress;
+    byAccount.set(account, current);
   }
 
-  // A GoodID root profile aggregates its identity's wallets. The totals get there by mirroring in
-  // `updateUser`, which works because they accumulate -- a flow rate is absolute, so it is summed
-  // here instead. A root that streams itself is part of its own sum, so this runs after the
-  // per-account pass and takes precedence over that account's own rate.
+  // Sync each account's recorded rate before crediting, so the profile reflects reality on every
+  // run rather than only when a credit clears the gates. Summed per account: a closed row reports
+  // 0 and must not clobber a live replacement. All-closed sums to 0, which is how a profile stops
+  // advertising a stream that no longer exists.
+  //
+  // `getSavedUser` rather than `getUser`: syncing corrects state that already exists, and must not
+  // enrol an account that has never been credited. Its first credit creates the profile.
+  const profileByAccount = new Map<string, UserCreditProfile>();
+  const flowRateByRoot = new Map<string, bigint>();
+  for (const [account, streamsForAccount] of byAccount) {
+    const profile = await store.getSavedUser(account);
+    if (!profile) continue;
+    if (await store.recordStreamFlowRate(profile, streamsForAccount.flowRateWeiPerSecond)) syncedFlowRates += 1;
+    profileByAccount.set(account, profile);
+    flowRateByRoot.set(profile.rootAccount, (flowRateByRoot.get(profile.rootAccount) ?? 0n) + streamsForAccount.flowRateWeiPerSecond);
+  }
+
+  // A GoodID root profile aggregates its identity's wallets. The totals reach it by mirroring in
+  // `updateUser`, which works because they accumulate; a flow rate is absolute, so it is summed
+  // here instead. A root that streams itself is part of its own sum, so this runs second and wins.
   for (const [rootAccount, totalFlowRate] of flowRateByRoot) {
     const rootProfile = profileByAccount.get(rootAccount) ?? (await store.getSavedUser(rootAccount));
     if (!rootProfile) continue;
     if (await store.recordStreamFlowRate(rootProfile, totalFlowRate)) syncedRootFlowRates += 1;
   }
-  inactiveAccounts = [...flowRateByAccount.values()].filter((flowRate) => flowRate === 0n).length;
+  const inactiveAccounts = [...byAccount.values()].filter((entry) => entry.flowRateWeiPerSecond === 0n).length;
 
-  for (const stream of streams) {
-    const account = stream.account.toLowerCase();
+  for (const [account, streamsForAccount] of byAccount) {
     // Falls back to the synthesized default for an account streaming for the first time, which is
     // exactly the case the sync above skips.
-    const profile = profileByAccount.get(account) ?? (await store.getUser(stream.account));
+    const profile = profileByAccount.get(account) ?? (await store.getUser(account));
     const now = new Date();
-    // Closed streams are credited too, for the window between the last credit and the termination
-    // -- without this the tail of every stream is silently forfeited.
-    const { elapsedSeconds, gdAmountWei } = streamCreditAmount({
-      now,
-      lastStreamCreditAt: profile.lastStreamCreditAt,
-      stream,
-      previousFlowRateWeiPerSecond: previousFlowRateByAccount.get(account) ?? 0n
-    });
+    const gdAmountWei = streamCreditFromPeriods(now, profile.lastStreamCreditAt, streamsForAccount.periods);
     if (gdAmountWei === 0n) continue;
+
+    const elapsedSeconds = secondsSinceLastCredit(now, profile.lastStreamCreditAt);
     if (elapsedSeconds < 60 * 60 * 24) {
       skippedCooldown += 1;
       continue;
@@ -181,28 +178,25 @@ export async function runStreamCreditCycle(
       skippedMinAmount += 1;
       continue;
     }
-    const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
-    const buyerForOperatorCheck = stream.buyerAddress || stream.account;
+
+    const rootAccount = await fetchGoodIdRoot(account, cfg);
+    const buyerForOperatorCheck = streamsForAccount.buyerAddress || account;
     const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
     const isValidForBonus = !!rootAccount && hasOperatorConsent;
 
-    const depositId = createStreamFundingId(stream.account, new Date(createdAt));
     const entry = await store.recordGdCredit({
-      id: depositId,
-      account: stream.account,
+      id: createStreamFundingId(account, new Date(createdAt)),
+      account,
       rootAccount,
       source: "streamCron",
-      gdAmountWei: BigInt(gdAmountWei),
-      // The account's summed rate, not this row's: an account can hold several rows, and a closed
-      // one reports 0. Also what gives a first-time streamer -- skipped by the sync above for
-      // having no profile yet -- its rate on the profile this credit creates.
-      flowRate: flowRateByAccount.get(account) ?? 0n,
+      gdAmountWei,
+      flowRate: streamsForAccount.flowRateWeiPerSecond,
       isVerified: isValidForBonus, // if root acccount was found it is whitelisted & operator set
       gdPrice,
       maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
       regularBonusBps: cfg.REGULAR_BONUS_BPS,
       streamingBonusBps: cfg.STREAMING_BONUS_BPS,
-      buyerAddress: stream.buyerAddress
+      buyerAddress: streamsForAccount.buyerAddress
     });
     logInfo("streamCron.credits.entry", {
       entryId: entry.id,
@@ -210,7 +204,8 @@ export async function runStreamCreditCycle(
       rootAccount: redactAddress(entry.rootAccount),
       buyer: redactAddress(entry.buyerAddress),
       elapsedSeconds,
-      stream,
+      periodCount: streamsForAccount.periods.length,
+      gdAmountWei: gdAmountWei.toString(),
       entry,
       profile
     });
@@ -224,6 +219,7 @@ export async function runStreamCreditCycle(
   }
   logInfo("cron.summary", {
     streamCount: streams.length,
+    accountCount: byAccount.size,
     processed,
     skippedCooldown,
     skippedMinAmount,

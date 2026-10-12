@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface, Wallet } from "ethers";
 import worker, { fundCredit } from "../src/worker.js";
-import { streamElapsedSeconds } from "../src/stream-credits.js";
+import { streamCreditFromPeriods, streamElapsedSeconds } from "../src/stream-credits.js";
 import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
 import { Env } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
@@ -1243,7 +1243,8 @@ test("/v1/celo/events/record credits the owed window, not the event's totalFlowW
       ANTSEED_KV: kv as never,
       CELO_RPC_URL: "https://celo.rpc.local",
       CELO_VAULT_ADDRESS: celoVault,
-      CELO_GOODID_ADDRESS: goodIdAddr
+      CELO_GOODID_ADDRESS: goodIdAddr,
+      CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000fed"
     });
 
     // totalFlowWei = 2 G$, flowRate ≈ 1 G$/month, monthlyGdAmountWei = 1 G$
@@ -1257,6 +1258,28 @@ test("/v1/celo/events/record credits the owed window, not the event's totalFlowW
 
     globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
+      if (body.query) {
+        // The stream the credit is measured from: one open period, running for ten days.
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: previousFlowRate.toString(),
+                updatedAtTimestamp: Math.floor(Date.now() / 1000).toString(),
+                streamPeriods: [
+                  {
+                    startedAtTimestamp: (Math.floor(Date.now() / 1000) - 10 * 86400).toString(),
+                    stoppedAtTimestamp: null,
+                    flowRate: previousFlowRate.toString()
+                  }
+                ],
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
       if (body.method === "eth_call") {
         // GoodID root lookup — non-zero root means verified (32-byte ABI-encoded address)
         return Response.json({
@@ -1567,6 +1590,7 @@ test("/v1/celo/events/record sets stream bonus to 0 when buyer revoked operator"
       CELO_RPC_URL: "https://celo.rpc.local",
       CELO_VAULT_ADDRESS: celoVault,
       CELO_GOODID_ADDRESS: goodIdAddr,
+      CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000fed",
       ANTSEED_FUNDING_RPC_URL: "https://base.rpc.local",
       ANTSEED_FUNDING_VAULT_ADDRESS: "0x0000000000000000000000000000000000000b01",
       ANTSEED_FUNDING_OPERATOR_PRIVATE_KEY: Wallet.createRandom().privateKey
@@ -1594,6 +1618,25 @@ test("/v1/celo/events/record sets stream bonus to 0 when buyer revoked operator"
 
     globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
+      if (body.query) {
+        // One open period covering the owed window, so the credit is non-zero and the operator
+        // check is actually exercised.
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "3472222222222222",
+                updatedAtTimestamp: Math.floor(Date.now() / 1000).toString(),
+                streamPeriods: [
+                  { startedAtTimestamp: (Math.floor(Date.now() / 1000) - 40 * 86400).toString(), stoppedAtTimestamp: null, flowRate: "3472222222222222" }
+                ],
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
       if (body.method === "eth_call") {
         return Response.json({
           jsonrpc: "2.0",
@@ -1714,6 +1757,7 @@ test("POST /v1/accounts/:account/stream-credits rate-limits when credits issued 
                 currentFlowRate: "1000000000000000",
                 createdAtTimestamp: "1735000000",
                 updatedAtTimestamp: "1735000000",
+                streamPeriods: [{ startedAtTimestamp: "1735000000", stoppedAtTimestamp: null, flowRate: "1" }],
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
             ]
@@ -1765,6 +1809,7 @@ test("POST /v1/accounts/:account/stream-credits skips streams below minimum G$ a
                 currentFlowRate: "1",
                 createdAtTimestamp: "1735000000",
                 updatedAtTimestamp: "1735000000",
+                streamPeriods: [{ startedAtTimestamp: "1735000000", stoppedAtTimestamp: null, flowRate: "1" }],
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
             ]
@@ -1883,6 +1928,7 @@ test("POST /v1/accounts/:account/stream-credits does not credit the epoch on a z
                 currentFlowRate: "3472222222222222", // 9000 G$/month, the real account's rate
                 createdAtTimestamp: "0",
                 updatedAtTimestamp: "0",
+                streamPeriods: [],
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
             ]
@@ -2054,6 +2100,7 @@ test("/v1/celo/events/record floors the window at the stream's last update even 
                 currentFlowRate: staleRate.toString(),
                 createdAtTimestamp: createdAtSeconds.toString(),
                 updatedAtTimestamp: createdAtSeconds.toString(),
+                streamPeriods: [{ startedAtTimestamp: createdAtSeconds.toString(), stoppedAtTimestamp: null, flowRate: staleRate.toString() }],
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
             ]
@@ -2138,6 +2185,7 @@ test("scheduled run zeroes the recorded flow rate once a stream closes", { concu
               currentFlowRate: "0",
               createdAtTimestamp: (createdAtSeconds + revision * 1000).toString(),
               updatedAtTimestamp: (createdAtSeconds + revision * 2000).toString(),
+              streamPeriods: [],
               flowUpdatedEvents: [{ userData: "0x" }]
             }))
           }
@@ -2205,6 +2253,7 @@ test("scheduled run keeps the live rate when an account also has a closed revisi
                 currentFlowRate: liveRate.toString(),
                 createdAtTimestamp: (nowSeconds - 3600).toString(),
                 updatedAtTimestamp: (nowSeconds - 3600).toString(),
+                streamPeriods: [{ startedAtTimestamp: (nowSeconds - 3600).toString(), stoppedAtTimestamp: null, flowRate: liveRate.toString() }],
                 flowUpdatedEvents: [{ userData: "0x" }]
               },
               {
@@ -2212,6 +2261,7 @@ test("scheduled run keeps the live rate when an account also has a closed revisi
                 currentFlowRate: "0",
                 createdAtTimestamp: (nowSeconds - 90 * 24 * 3600).toString(),
                 updatedAtTimestamp: (nowSeconds - 60 * 24 * 3600).toString(),
+                streamPeriods: [],
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
             ]
@@ -2257,6 +2307,7 @@ test("scheduled run does not create a profile for an uncredited streamer", { con
                 currentFlowRate: "3433641975308641",
                 createdAtTimestamp: (nowSeconds - 3600).toString(),
                 updatedAtTimestamp: (nowSeconds - 3600).toString(),
+                streamPeriods: [{ startedAtTimestamp: (nowSeconds - 3600).toString(), stoppedAtTimestamp: null, flowRate: "3433641975308641" }],
                 flowUpdatedEvents: [{ userData: "0x" }]
               }
             ]
@@ -2328,6 +2379,7 @@ test("scheduled run sums the flow rate across a root's accounts", { concurrency:
               currentFlowRate: (rate as bigint).toString(),
               createdAtTimestamp: (nowSeconds - 3600).toString(),
               updatedAtTimestamp: (nowSeconds - 3600).toString(),
+              streamPeriods: [{ startedAtTimestamp: (nowSeconds - 3600).toString(), stoppedAtTimestamp: null, flowRate: (rate as bigint).toString() }],
               flowUpdatedEvents: [{ userData: "0x" }]
             }))
           }
@@ -2382,12 +2434,30 @@ function seedStreamProfile(kv: MemoryKV, account: string, fields: { flowRate: bi
   );
 }
 
-function subgraphStream(account: string, flowRate: bigint, createdAtSeconds: number, updatedAtSeconds = createdAtSeconds) {
+function streamPeriod(flowRate: bigint, startedAtSeconds: number, stoppedAtSeconds: number | null) {
+  return {
+    startedAtTimestamp: startedAtSeconds.toString(),
+    stoppedAtTimestamp: stoppedAtSeconds === null ? null : stoppedAtSeconds.toString(),
+    flowRate: flowRate.toString()
+  };
+}
+
+function subgraphStream(
+  account: string,
+  flowRate: bigint,
+  createdAtSeconds: number,
+  updatedAtSeconds = createdAtSeconds,
+  periods?: ReturnType<typeof streamPeriod>[]
+) {
   return {
     sender: { id: account },
     currentFlowRate: flowRate.toString(),
     createdAtTimestamp: createdAtSeconds.toString(),
     updatedAtTimestamp: updatedAtSeconds.toString(),
+    // A live row is one open period at its rate. A closed row carries whatever it ran through
+    // before terminating, which a test must state explicitly -- `currentFlowRate` is 0 by then and
+    // says nothing about what flowed.
+    streamPeriods: periods ?? (flowRate > 0n ? [streamPeriod(flowRate, createdAtSeconds, null)] : []),
     flowUpdatedEvents: [{ userData: "0x" }]
   };
 }
@@ -2572,7 +2642,7 @@ test("scheduled run records the rate on a first-time streamer's new profile", { 
 // window falls back to a possibly weeks-stale `lastStreamCreditAt`. With `/v1/celo/events/record`
 // unauthenticated, a small stream open for one cron tick and then closed was credited across the whole
 // stale window. The amount is capped at the event's on-chain `totalFlowWei`.
-test("/v1/celo/events/record caps a termination credit at what actually flowed", { concurrency: false }, async () => {
+test("/v1/celo/events/record credits a termination for exactly what the stream carried", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000ad3";
   const buyer = "0x0000000000000000000000000000000000000aaa";
   const txHash = `0x${"d".repeat(64)}`;
@@ -2581,6 +2651,7 @@ test("/v1/celo/events/record caps a termination credit at what actually flowed",
   const actuallyFlowed = rate * 6n * 3600n; // open for one 6h cron interval
   const originalFetch = globalThis.fetch;
   const originalConsoleLog = console.log;
+  const closedAtSeconds = Math.floor(Date.now() / 1000);
   try {
     console.log = (() => {}) as typeof console.log;
     const kv = new MemoryKV();
@@ -2595,7 +2666,29 @@ test("/v1/celo/events/record caps a termination credit at what actually flowed",
     const closeLog = encodeVaultEventLog("StreamUpdated", [account, buyer, 0n, 0n, actuallyFlowed], celoVault, txHash, 0);
     globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body ?? "{}"));
-      if (body.query?.includes("streams")) return Response.json({ data: { streams: [] } });
+      if (body.query?.includes("streams")) {
+        // The closed stream with the single period it ran through. This is what bounds the credit
+        // now -- no ceiling is applied, because nothing is estimated.
+        return Response.json({
+          data: {
+            streams: [
+              {
+                sender: { id: account },
+                currentFlowRate: "0",
+                updatedAtTimestamp: closedAtSeconds.toString(),
+                streamPeriods: [
+                  {
+                    startedAtTimestamp: (closedAtSeconds - 6 * 3600).toString(),
+                    stoppedAtTimestamp: closedAtSeconds.toString(),
+                    flowRate: rate.toString()
+                  }
+                ],
+                flowUpdatedEvents: [{ userData: "0x" }]
+              }
+            ]
+          }
+        });
+      }
       if (body.method === "eth_call") {
         return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x000000000000000000000000abababababababababababababababababababab" });
       }
@@ -2613,9 +2706,68 @@ test("/v1/celo/events/record caps a termination credit at what actually flowed",
     );
     const body = (await res.json()) as { events: Array<{ gdAmountWei: string }> };
 
-    assert.equal(BigInt(body.events[0].gdAmountWei), actuallyFlowed, "credit must not exceed the G$ the stream carried");
+    assert.equal(BigInt(body.events[0].gdAmountWei), actuallyFlowed, "the credit is exactly the G$ the stream carried");
   } finally {
     globalThis.fetch = originalFetch;
     console.log = originalConsoleLog;
   }
+});
+
+// A closed period must stop contributing at its termination. Without this, time after a stream
+// ended is credited as though it were still flowing -- the failure mode the whole periods switch
+// exists to make impossible.
+test("streamCreditFromPeriods stops a closed period at its termination", () => {
+  const now = new Date("2026-03-01T00:00:00.000Z");
+  const rate = 1_000_000_000_000n;
+  const startedAtMs = Date.parse("2026-01-01T00:00:00.000Z");
+  const stoppedAtMs = Date.parse("2026-01-11T00:00:00.000Z"); // ran ten days, then closed
+
+  const credited = streamCreditFromPeriods(now, "2026-01-01T00:00:00.000Z", [
+    { startedAtMs, stoppedAtMs, flowRateWeiPerSecond: rate }
+  ]);
+
+  assert.equal(credited, rate * BigInt(10 * 86400), "only the ten days it actually ran");
+  // Measuring to `now` instead would be six times larger.
+  assert.ok(rate * BigInt(60 * 86400) > credited * 5n);
+});
+
+test("streamCreditFromPeriods prices each rate change at its own rate", () => {
+  const now = new Date("2026-02-01T00:00:00.000Z");
+  const firstRate = 1_000_000_000_000n;
+  const secondRate = 3_000_000_000_000n;
+
+  const credited = streamCreditFromPeriods(now, "2026-01-01T00:00:00.000Z", [
+    { startedAtMs: Date.parse("2026-01-01T00:00:00.000Z"), stoppedAtMs: Date.parse("2026-01-11T00:00:00.000Z"), flowRateWeiPerSecond: firstRate },
+    { startedAtMs: Date.parse("2026-01-11T00:00:00.000Z"), stoppedAtMs: null, flowRateWeiPerSecond: secondRate }
+  ]);
+
+  assert.equal(credited, firstRate * BigInt(10 * 86400) + secondRate * BigInt(21 * 86400));
+});
+
+// The dormant gap between a closed stream and its replacement has no period, so there is nothing
+// to bill -- no floor or ceiling required.
+test("streamCreditFromPeriods ignores the gap between a closed stream and its replacement", () => {
+  const now = new Date("2026-03-01T00:00:00.000Z");
+  const rate = 1_000_000_000_000n;
+
+  const credited = streamCreditFromPeriods(now, "2026-01-01T00:00:00.000Z", [
+    { startedAtMs: Date.parse("2026-01-01T00:00:00.000Z"), stoppedAtMs: Date.parse("2026-01-06T00:00:00.000Z"), flowRateWeiPerSecond: rate },
+    { startedAtMs: Date.parse("2026-02-24T00:00:00.000Z"), stoppedAtMs: null, flowRateWeiPerSecond: rate }
+  ]);
+
+  // Five days, then a 49-day gap carrying nothing, then five days.
+  assert.equal(credited, rate * BigInt(10 * 86400));
+});
+
+// The last credit usually falls in the middle of a period, not on its edge. Without clamping the
+// start, every run would re-credit the whole history from the stream's beginning.
+test("streamCreditFromPeriods credits only the part of a period after the last credit", () => {
+  const now = new Date("2026-02-01T00:00:00.000Z");
+  const rate = 1_000_000_000_000n;
+
+  const credited = streamCreditFromPeriods(now, "2026-01-22T00:00:00.000Z", [
+    { startedAtMs: Date.parse("2026-01-01T00:00:00.000Z"), stoppedAtMs: null, flowRateWeiPerSecond: rate }
+  ]);
+
+  assert.equal(credited, rate * BigInt(10 * 86400), "ten days since the last credit, not 31 since the stream opened");
 });

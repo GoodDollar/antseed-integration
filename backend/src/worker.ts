@@ -7,7 +7,7 @@ import { errorMessage, logError, logInfo, redactAddress, redactHash } from "./lo
 import { getAnalyticsWindow } from "./analytics.js";
 import { fundCredit } from "./funding.js";
 import { cors, json, notifySlackOnRequestError, parseJson, readRequestBody } from "./http.js";
-import { createStreamFundingId, runStreamCreditCycle, streamCreditAmount, streamElapsedSeconds } from "./stream-credits.js";
+import { createStreamFundingId, runStreamCreditCycle, secondsSinceLastCredit, streamCreditFromPeriods } from "./stream-credits.js";
 import {
   ANALYTICS_CRON_BACKFILL_DAYS,
   ANALYTICS_REFRESH_COOLDOWN_MS,
@@ -15,7 +15,7 @@ import {
   backFillAnalytics,
   readAnalyticsRefreshTimestamp
 } from "./analytics-cron.js";
-import { SUPERFLUID_CELO_SUBGRAPH_URL, fetchSuperfluidStreamsForAccount } from "./superfluid.js";
+import { SUPERFLUID_CELO_SUBGRAPH_URL, StreamPeriod, fetchSuperfluidStreamsForAccount } from "./superfluid.js";
 const CeloEventsRecordSchema = z
   .object({
     txHash: z
@@ -289,7 +289,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     const recorded = [];
     const gdPrice = await fetchCurrentGdPrice(cfg);
     /** Per-request cache: one receipt can carry several stream events for the same account. */
-    const streamLastUpdateAtByAccount = new Map<string, string | undefined>();
+    const periodsByAccount = new Map<string, StreamPeriod[]>();
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
 
@@ -351,14 +351,17 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         const profile = await store.getUser(event.account);
         // Lowercased: ethers hands back checksummed addresses, the subgraph lowercase ones.
         const streamCacheKey = event.account.toLowerCase();
-        if (!streamLastUpdateAtByAccount.has(streamCacheKey)) {
-          const accountStreams = await fetchSuperfluidStreamsForAccount(event.account, cfg);
-          streamLastUpdateAtByAccount.set(streamCacheKey, accountStreams[0]?.lastUpdateAt);
+        if (!periodsByAccount.has(streamCacheKey)) {
+          const accountStreams = await fetchSuperfluidStreamsForAccount(event.account, cfg, true);
+          periodsByAccount.set(
+            streamCacheKey,
+            accountStreams.flatMap((accountStream) => accountStream.periods)
+          );
         }
-        const streamLastUpdateAt = streamLastUpdateAtByAccount.get(streamCacheKey);
-        const elapsedSeconds = streamElapsedSeconds(new Date(), profile.lastStreamCreditAt, streamLastUpdateAt);
-        const owedWei = BigInt(profile.streamFlowRateWeiPerSecond) * BigInt(elapsedSeconds);
-        const gdAmountWei = owedWei < event.totalFlowWei ? owedWei : event.totalFlowWei;
+        const periods = periodsByAccount.get(streamCacheKey) ?? [];
+        const now = new Date();
+        const gdAmountWei = streamCreditFromPeriods(now, profile.lastStreamCreditAt, periods);
+        const elapsedSeconds = secondsSinceLastCredit(now, profile.lastStreamCreditAt);
         const buyerForOperatorCheck = event.buyer || event.account;
         const hasOperatorConsent =
           antseedFundingVault.enabled && gdAmountWei > 0n ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
@@ -386,8 +389,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           rootAccount: redactAddress(entry.rootAccount),
           buyer: redactAddress(entry.buyerAddress),
           elapsedSeconds,
-          streamLastUpdateAt,
-          previousFlowRateWeiPerSecond: profile.streamFlowRateWeiPerSecond,
+          periodCount: periods.length,
           creditedGdAmountWei: gdAmountWei.toString(),
           reportedTotalFlowWei: event.totalFlowWei.toString()
         });
@@ -444,15 +446,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
     const gdPrice = await fetchCurrentGdPrice(cfg);
     const now = new Date();
-    const previousFlowRateWeiPerSecond = BigInt(profile.streamFlowRateWeiPerSecond);
     const accountFlowRateWeiPerSecond = streams.reduce((sum, stream) => sum + BigInt(stream.flowRateWeiPerSecond), 0n);
-    // The widest window any of this account's streams is owed, used only for the cooldown gate --
-    // each stream's own amount is computed per stream below.
-    const elapsedSeconds = Math.max(
-      ...streams.map(
-        (stream) => streamCreditAmount({ now, lastStreamCreditAt: profile.lastStreamCreditAt, stream, previousFlowRateWeiPerSecond }).elapsedSeconds
-      )
-    );
+    // One credit per account: the entry id is per account per day, and the owed amount is the sum
+    // over every constant-rate period across all of this account's stream revisions.
+    const accountPeriods = streams.flatMap((stream) => stream.periods);
+    const elapsedSeconds = secondsSinceLastCredit(now, profile.lastStreamCreditAt);
 
     if (elapsedSeconds < 60 * 60 * 24) {
       // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
@@ -469,19 +467,19 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
     const recorded = [];
     let skippedMinAmount = 0;
-    for (const stream of streams) {
-      const buyerForOperatorCheck = stream.buyerAddress || account;
+    {
+      const buyerForOperatorCheck = streams[0]?.buyerAddress || account;
       const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
       const isValidForBonus = !!rootAccount && hasOperatorConsent;
       const isVerified = isValidForBonus;
-      const { gdAmountWei } = streamCreditAmount({ now, lastStreamCreditAt: profile.lastStreamCreditAt, stream, previousFlowRateWeiPerSecond });
+      const stream = streams[0];
+      const gdAmountWei = streamCreditFromPeriods(now, profile.lastStreamCreditAt, accountPeriods);
       if (gdAmountWei <= cfg.MIN_STREAM_BONUS_WEI) {
         skippedMinAmount += 1;
         recorded.push({
           message: `stream credit amount ${gdAmountWei} is below minimum ${cfg.MIN_STREAM_BONUS_WEI}`
         });
-        continue;
-      }
+      } else {
 
       const depositId = createStreamFundingId(account, now);
       const entry = await store.recordGdCredit({
@@ -509,6 +507,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       });
       const res = await fundCredit(entry, store, antseedFundingVault);
       recorded.push(res);
+      }
     }
     if (recorded.length === 0) {
       return json({

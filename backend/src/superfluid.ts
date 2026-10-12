@@ -3,6 +3,9 @@ import { decodeBuyerFromUserData } from "./celo-events.js";
 import { configFromEnv } from "./env.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress } from "./logging.js";
 
+/** Upper bound on constant-rate spans fetched per stream; a truncated list is logged, not silently dropped. */
+const PERIOD_PAGE_SIZE = 1000;
+
 /** Default endpoint, used when `SUPERFLUID_SUBGRAPH_URL` is unset. */
 export const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superfluid.dev/celo-mainnet/protocol-v1";
 
@@ -13,6 +16,18 @@ const SuperfluidStreamsResponseSchema = z.object({
         sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
         currentFlowRate: z.string().regex(/^\d+$/),
         updatedAtTimestamp: z.string().regex(/^\d+$/),
+        // Optional with an empty default: a subgraph that stops returning the field, or returns a
+        // shape we do not expect, must degrade to "no periods, no credit" rather than failing the
+        // whole response and silently blinding the scheduled run to every stream.
+        streamPeriods: z
+          .array(
+            z.object({
+              startedAtTimestamp: z.string().regex(/^\d+$/),
+              stoppedAtTimestamp: z.string().regex(/^\d+$/).nullable(),
+              flowRate: z.string().regex(/^\d+$/)
+            })
+          )
+          .default([]),
         flowUpdatedEvents: z.array(
           z.object({
             userData: z.string()
@@ -23,11 +38,25 @@ const SuperfluidStreamsResponseSchema = z.object({
   })
 });
 
+/**
+ * A span during which the stream carried a constant rate. Superfluid closes one and opens another
+ * on every rate change, so `flowRate * overlap` is exact for any sub-interval of a period -- no
+ * rate has to be remembered or assumed to have held.
+ */
+export type StreamPeriod = {
+  startedAtMs: number;
+  /** null while the period is still running. */
+  stoppedAtMs: number | null;
+  flowRateWeiPerSecond: bigint;
+};
+
 export type SuperfluidIncomingStream = {
   account: string;
   flowRateWeiPerSecond: string;
   /** For a closed stream this is its termination; for a live one, its last on-chain change. */
   lastUpdateAt: string;
+  /** Constant-rate spans, newest first. The exact record of what this stream carried. */
+  periods: StreamPeriod[];
   /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
   buyerAddress?: string;
 };
@@ -114,6 +143,11 @@ export async function fetchSuperfluidStreams(
                 sender { id }
                 currentFlowRate
                 updatedAtTimestamp
+                streamPeriods(orderBy: startedAtTimestamp, orderDirection: desc, first: ${PERIOD_PAGE_SIZE}) {
+                  startedAtTimestamp
+                  stoppedAtTimestamp
+                  flowRate
+                }
                 flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
                   userData
                 }
@@ -141,12 +175,24 @@ export async function fetchSuperfluidStreams(
         // first stream credit, so a 1970 value makes that credit window decades wide.
         const hasUsableUpdatedAt = Number.isFinite(updatedAtSeconds) && updatedAtSeconds > 0;
         const lastUpdateAt = hasUsableUpdatedAt ? new Date(updatedAtSeconds * 1000).toISOString() : new Date().toISOString();
+        if (stream.streamPeriods.length === PERIOD_PAGE_SIZE) {
+          logWarn("superfluid.streams.periods-truncated", {
+            sender: redactAddress(stream.sender.id),
+            pageSize: PERIOD_PAGE_SIZE
+          });
+        }
+        const periods: StreamPeriod[] = stream.streamPeriods.map((period) => ({
+          startedAtMs: Number(period.startedAtTimestamp) * 1000,
+          stoppedAtMs: period.stoppedAtTimestamp === null ? null : Number(period.stoppedAtTimestamp) * 1000,
+          flowRateWeiPerSecond: BigInt(period.flowRate)
+        }));
         const rawUserData = stream.flowUpdatedEvents[0]?.userData;
         const buyerAddress = decodeBuyerFromUserData(rawUserData);
         return {
           account: stream.sender.id.toLowerCase(),
           flowRateWeiPerSecond,
           lastUpdateAt,
+          periods,
           buyerAddress
         };
       });
