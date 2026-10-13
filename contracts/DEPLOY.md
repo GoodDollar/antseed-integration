@@ -209,6 +209,13 @@ forge create contracts/src/CeloGdAntSeedVault.sol:CeloGdAntSeedVault \
   --constructor-args "$GD_TOKEN"
 ```
 
+```bash
+forge create contracts/src/AntseedBuyerOperator.sol:AntseedBuyerOperator \
+  --rpc-url "$BASE_RPC_URL" \
+  --private-key "$DEPLOYER_PRIVATE_KEY" \
+  --constructor-args "$ANTSEED_REGISTRY"
+```
+
 3. Call `upgradeToAndCall` from the owner:
 
 ```bash
