@@ -4,6 +4,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Contract, Interface, JsonRpcProvider, getAddress, id } from "ethers";
 import { base } from "viem/chains";
 import { z } from "zod";
+import { RuntimeConfig } from "../src/env.js";
+import { fetchStreamPeriods, streamOwedWei } from "../src/stream-periods.js";
 
 const CREDIT_PREFIX = "gd-credit:";
 const STREAM_SOURCES = new Set(["streamUpdate", "streamRequest", "streamCron"]);
@@ -34,19 +36,24 @@ const entrySchema = z
   .passthrough();
 
 export type LegacyEntry = z.infer<typeof entrySchema>;
-export type FundingEvidence = {
-  buyer: string;
-  principalUsd: string;
-  bonusUsd: string;
-  txHash: string;
-  blockNumber: number;
-  fundedAt: string;
+/** What Superfluid says an account actually streamed, and what KV claims it was credited. */
+export type StreamedReconciliation = {
+  account: string;
+  /** Sum of the account's periods up to its stream clock -- what the backend should have credited. */
+  owedToClockWei: bigint;
+  /** `totalGDStreamedWei` on the profile. */
+  creditedWei: bigint;
+  /** Highest rate the account ever ran, used to express drift as seconds of flow. */
+  maxFlowRateWeiPerSecond?: bigint;
+  lastStreamCreditAt?: string;
 };
 export type AuditDependencies = {
   keys(): AsyncIterable<string>;
   get(key: string): Promise<unknown>;
+  /** `usedDepositIds(keccak256(id))` on the operator: did this entry's deposit actually land. */
   used(entryId: string): Promise<boolean>;
-  evidence(entryId: string): Promise<FundingEvidence | undefined>;
+  /** Per-account reconciliation of streamed-vs-credited, keyed by lowercase account. */
+  reconcile(): Promise<Map<string, StreamedReconciliation>>;
   progress?(event: string, details: Record<string, unknown>): void;
 };
 export type AuditFinding = {
@@ -57,15 +64,22 @@ export type AuditFinding = {
   fundingStatus?: string;
   lastStreamCreditAt?: string;
   usedOnChain?: boolean;
-  evidence?: FundingEvidence;
   issues: string[];
   action: string;
 };
 
-/** Audit every credit key; account history indexes retain only the most recent 500 IDs. */
+function abs(value: bigint): bigint {
+  return value < 0n ? -value : value;
+}
+
+/**
+ * Audits the credit entries it is given. Coverage is bounded by what the Worker API exposes: accounts
+ * come from the subgraph, so an account that was credited without ever streaming is not examined, and
+ * per-account history indexes retain only the most recent 500 IDs.
+ */
 export async function auditLegacyStreams(deps: AuditDependencies) {
   const findings: AuditFinding[] = [];
-  const counts = { scanned: 0, legacyStreams: 0, skippedDeposits: 0, skippedNewStreams: 0, needsReview: 0 };
+  const counts = { scanned: 0, legacyStreams: 0, skippedDeposits: 0, skippedNewStreams: 0, reconciliationMismatches: 0, needsReview: 0 };
   for await (const key of deps.keys()) {
     counts.scanned += 1;
     if (counts.scanned === 1 || counts.scanned % 100 === 0) deps.progress?.("kv.audit.progress", { ...counts });
@@ -98,14 +112,8 @@ export async function auditLegacyStreams(deps: AuditDependencies) {
     if (!lastStreamCreditAt) issues.push("missing_stream_clock");
     if (entry.account.toLowerCase() !== entry.rootAccount.toLowerCase()) issues.push("legacy_root_clock_may_be_mirrored");
     const usedOnChain = await deps.used(entry.id);
-    const evidence = usedOnChain ? await deps.evidence(entry.id) : undefined;
     const nonzero = BigInt(entry.totalCreditUsd) > 0n;
     if (BigInt(entry.principalUsd) + BigInt(entry.bonusUsd) !== BigInt(entry.totalCreditUsd)) issues.push("invalid_credit_total");
-    if (usedOnChain && !evidence) issues.push("used_id_without_funding_event_in_scan_range");
-    if (evidence) {
-      if (evidence.buyer.toLowerCase() !== (entry.buyerAddress ?? entry.account).toLowerCase()) issues.push("funding_buyer_mismatch");
-      if (evidence.principalUsd !== entry.principalUsd || evidence.bonusUsd !== entry.bonusUsd) issues.push("funding_amount_mismatch");
-    }
     let action = "Preserve the existing clock; historical under-credit before it needs separate reconciliation.";
     if (usedOnChain && entry.fundingStatus !== "funded") {
       issues.push("landed_deposit_not_recorded_as_funded");
@@ -129,11 +137,37 @@ export async function auditLegacyStreams(deps: AuditDependencies) {
       fundingStatus: entry.fundingStatus,
       lastStreamCreditAt,
       usedOnChain,
-      evidence,
       issues,
       action
     });
   }
+  // Reconciliation: what the subgraph says each account streamed up to its clock, against what KV
+  // claims it credited. This is the check that surfaces accounting drift directly -- a legacy
+  // profile reporting 6.2M G$ streamed against 7.1k G$ actually streamed fails here regardless of
+  // which individual entries look healthy.
+  deps.progress?.("kv.audit.reconciling", {});
+  for (const row of (await deps.reconcile()).values()) {
+    const drift = row.creditedWei - row.owedToClockWei;
+    if (drift === 0n) continue;
+    counts.reconciliationMismatches += 1;
+    // Drift priced as seconds of the account's own flow, which is what makes a finding readable. The
+    // credit path truncates to whole seconds, so a handful of seconds is accumulated rounding; the
+    // accounts that matter are off by months or decades of flow, and no epsilon has to be guessed to
+    // tell the two apart.
+    const driftSeconds =
+      row.maxFlowRateWeiPerSecond && row.maxFlowRateWeiPerSecond > 0n ? ` = ${abs(drift) / row.maxFlowRateWeiPerSecond}s of flow at the account's peak rate` : "";
+    findings.push({
+      key: `user:${row.account}`,
+      account: row.account,
+      lastStreamCreditAt: row.lastStreamCreditAt,
+      issues: [drift > 0n ? "credited_more_than_streamed" : "credited_less_than_streamed"],
+      action:
+        drift > 0n
+          ? `KV credits ${row.creditedWei} wei against ${row.owedToClockWei} wei streamed to the clock (over by ${drift}${driftSeconds}). Correct the profile totals before trusting them.`
+          : `KV credits ${row.creditedWei} wei against ${row.owedToClockWei} wei streamed to the clock (short by ${-drift}${driftSeconds}). Reconcile the shortfall; the clock may have advanced past unpaid time.`
+    });
+  }
+
   counts.needsReview = findings.filter((finding) => finding.issues.length > 0).length;
   deps.progress?.("kv.audit.complete", { ...counts });
   return {
@@ -141,145 +175,57 @@ export async function auditLegacyStreams(deps: AuditDependencies) {
     counts,
     warnings: [
       "KV is eventually consistent: pause ingestion and cron, wait for writes to propagate, and rerun before reconciliation.",
+      "Accounts are taken from the Superfluid subgraph and records from the Worker API; this is not a full KV key scan. Accounts that never streamed, and entries beyond the newest 500 per account, are not examined.",
       "A funding block timestamp is NOT a paid-through boundary; legacy entries did not record that boundary.",
-      "No records, totals, bonus caps, stream clocks, or closed-period cursors are changed."
+      "No records, totals, bonus caps, stream clocks, or closed-period cursors are changed.",
+      "Reconciliation compares the subgraph against the API; it does not prove a deposit landed. `usedDepositIds` does that."
     ],
     findings
   };
 }
 
-export class CloudflareKvReader {
+/**
+ * Reads the backend's own public API instead of Cloudflare KV.
+ *
+ * Everything the audit needs is already exposed -- profiles and credit history -- so it needs no
+ * Cloudflare account, namespace id or API token, and it sees exactly what the deployed Worker serves
+ * rather than raw storage.
+ */
+export class WorkerApiReader {
   constructor(
-    private readonly accountId: string,
-    private readonly namespaceId: string,
-    private readonly token: string,
+    private readonly baseUrl: string,
     private readonly request: typeof fetch = fetch
   ) {}
 
-  private url(path: string) {
-    return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.accountId)}/storage/kv/namespaces/${encodeURIComponent(this.namespaceId)}/${path}`;
-  }
-
-  /** Traverse the namespace rather than truncated per-account credit indexes. */
-  async *keys(): AsyncIterable<string> {
-    let cursor = "";
-    const seen = new Set<string>();
-    do {
-      const query = new URLSearchParams({ prefix: CREDIT_PREFIX, limit: "1000" });
-      if (cursor) query.set("cursor", cursor);
-      const response = await this.request(this.url(`keys?${query}`), { headers: { authorization: `Bearer ${this.token}` } });
-      if (!response.ok) throw new Error(`KV list failed (${response.status})`);
-      const page = z
-        .object({
-          success: z.literal(true),
-          result: z.array(z.object({ name: z.string() })),
-          result_info: z.object({ cursor: z.string().optional() }).optional()
-        })
-        .parse(await response.json());
-      for (const key of page.result) yield key.name;
-      cursor = page.result_info?.cursor ?? "";
-      if (cursor && seen.has(cursor)) throw new Error("KV pagination repeated a cursor");
-      if (cursor) seen.add(cursor);
-    } while (cursor);
-  }
-
-  /** Read the exact value without logging the API token or raw request errors. */
-  async get(key: string): Promise<unknown> {
-    const response = await this.request(this.url(`values/${encodeURIComponent(key)}`), { headers: { authorization: `Bearer ${this.token}` } });
+  private async getJson(path: string): Promise<unknown> {
+    // A browser-ish agent: some edge configurations reject the default agent of a bare HTTP client.
+    const response = await this.request(new URL(path, this.baseUrl), { headers: { accept: "application/json", "user-agent": "antseed-audit" } });
     if (response.status === 404) return undefined;
-    if (!response.ok) throw new Error(`KV read failed (${response.status})`);
+    if (!response.ok) throw new Error(`API read failed (${response.status})`);
     return response.json();
   }
-}
 
-const OPERATOR_ABI = [
-  "function usedDepositIds(bytes32) view returns (bool)",
-  "event BuyerDepositFundedWithId(address indexed buyer,uint256 principal,uint256 bonus,string id)"
-];
+  async profile(account: string): Promise<{ totalGDStreamedWei?: string; lastStreamCreditAt?: string } | undefined> {
+    const body = (await this.getJson(`/v1/accounts/${encodeURIComponent(account)}/profile`)) as { profile?: Record<string, unknown> } | undefined;
+    return body?.profile as { totalGDStreamedWei?: string; lastStreamCreditAt?: string } | undefined;
+  }
 
-/** Paginate Etherscan results over one fixed block range. */
-export async function* fetchFundingLogs(
-  apiKey: string,
-  operatorAddress: string,
-  fromBlock: number,
-  toBlock: number,
-  request: typeof fetch = fetch,
-  progress?: AuditDependencies["progress"]
-) {
-  const url = new URL("https://api.etherscan.io/v2/api");
-  const topic = id("BuyerDepositFundedWithId(address,uint256,uint256,string)");
-  const hexInteger = z
-    .string()
-    .regex(/^0x[0-9a-fA-F]+$/)
-    .transform((value) => Number(BigInt(value)))
-    .refine((value) => Number.isSafeInteger(value) && value >= 0);
-  const schema = z.array(
-    z.object({
-      blockNumber: hexInteger,
-      transactionHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/),
-      data: z.string().regex(/^0x[0-9a-fA-F]*$/),
-      topics: z.array(
-        z
-          .string()
-          .regex(/^0x[0-9a-fA-F]{64}$/)
-          .or(z.null())
-      ),
-      logIndex: hexInteger
-    })
-  );
-  const pageSize = 1000;
-  url.search = new URLSearchParams({
-    chainid: String(base.id),
-    module: "logs",
-    action: "getLogs",
-    address: getAddress(operatorAddress),
-    fromBlock: String(fromBlock),
-    toBlock: String(toBlock),
-    topic0: topic,
-    offset: String(pageSize),
-    apikey: apiKey
-  }).toString();
-  const seen = new Set<string>();
-  let pageNumber = 0;
-  while (true) {
-    url.searchParams.set("page", String(++pageNumber));
-    progress?.("chain.scan.page.start", { page: pageNumber });
-    const response = await request(url, { signal: AbortSignal.timeout(30000) });
-    if (!response.ok) {
-      console.error(await response.text());
-      throw new Error(`Etherscan logs failed (${response.status})`);
+  /** Every credit entry the Worker has indexed for this account. */
+  async *creditHistory(account: string): AsyncIterable<unknown> {
+    const limit = 100;
+    for (let offset = 0; ; offset += limit) {
+      const page = (await this.getJson(`/v1/accounts/${encodeURIComponent(account)}/credit-history?limit=${limit}&offset=${offset}`)) as
+        | { items?: unknown[]; hasMore?: boolean }
+        | undefined;
+      for (const item of page?.items ?? []) yield item;
+      if (!page?.hasMore || !page.items?.length) return;
     }
-    const body = z.object({ status: z.string(), message: z.string(), result: z.unknown() }).parse(await response.json());
-    // Etherscan signals an empty range with status 0 / "No records found" and a `[]` result, which is
-    // a legitimate answer, not a failure. A genuine rejection (bad key, rate limit) carries "NOTOK"
-    // and a string result, so only that must fail the audit closed.
-    const emptyRange = body.status === "0" && body.message === "No records found";
-    if (!emptyRange && body.message !== "OK")
-      throw new Error("Etherscan API rejected logs request; check API key, Base access, and rate limits");
-    const logs = schema.parse(body.result);
-    for (const log of logs) {
-      if (log.blockNumber < fromBlock || log.blockNumber > toBlock || log.topics[0]?.toLowerCase() !== topic)
-        throw new Error("Etherscan returned logs outside the requested filter");
-      const identity = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
-      if (seen.has(identity)) throw new Error("Etherscan pagination returned duplicate logs");
-      seen.add(identity);
-      yield {
-        blockNumber: log.blockNumber,
-        transactionHash: log.transactionHash,
-        index: log.logIndex,
-        data: log.data,
-        topics: log.topics
-      };
-    }
-    progress?.("chain.scan.page.complete", { page: pageNumber, logs: logs.length });
-    if (logs.length < pageSize) break;
   }
 }
 
-let auditStage = "startup";
+const OPERATOR_ABI = ["function usedDepositIds(bytes32) view returns (bool)"];
 
 function logProgress(event: string, details: Record<string, unknown> = {}) {
-  auditStage = event;
   console.error(JSON.stringify({ timestamp: new Date().toISOString(), event, ...details }));
 }
 
@@ -287,140 +233,175 @@ function logProgress(event: string, details: Record<string, unknown> = {}) {
 export function getAuditErrorMessage(error: unknown): string {
   const messages = [
     "Expected --output <new-report.json>; use --help",
-    "Missing Cloudflare account, KV namespace, or operator address",
-    "Missing CLOUDFLARE_API_TOKEN",
-    "Missing ETHERSCAN_API_KEY",
-    "Ambiguous ANTSEED_KV namespace",
+    "Missing ANTSEED_API_URL or operator address",
+    "Invalid ANTSEED_API_URL; expected an http(s) URL for the deployed Worker",
+    "Invalid ANTSEED_FUNDING_RPC_URL; expected an http(s) Base mainnet endpoint",
     "Expected a safe unsigned block number",
-    "Invalid or unavailable finalized block range",
     "Operator contract or block unavailable",
-    "Etherscan pagination returned duplicate logs",
-    "Etherscan API rejected logs request; check API key, Base access, and rate limits",
-    "Etherscan returned logs outside the requested filter",
     "Audit RPC must use Base mainnet",
-    "Could not decode funding log",
-    "Duplicate deposit ID in event history",
-    "Funding event block is unavailable or reorged",
-    "Audit block changed; rerun the audit",
-    "KV pagination repeated a cursor"
+    "Finalized block unavailable",
+    "Superfluid subgraph unavailable; reconciliation cannot be trusted",
+    "Audit block changed; rerun the audit"
   ];
-  console.log(error);
   if (error instanceof Error && messages.includes(error.message)) return error.message.replace(/[\r\n]/g, "_");
-  if (error instanceof Error && /^(KV (list|read)|Etherscan logs) failed \(\d{3}\)$/.test(error.message)) return error.message;
+  if (error instanceof Error && /^API read failed \(\d{3}\)$/.test(error.message)) return error.message;
   const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
   const codes = ["EEXIST", "ENOENT", "EACCES", "ENOSPC", "NETWORK_ERROR", "SERVER_ERROR", "TIMEOUT", "CALL_EXCEPTION", "BAD_DATA", "ECONNREFUSED", "ENOTFOUND"];
   return typeof code === "string" && codes.includes(code) ? `Operation failed (${code})` : "Operation failed (remote details omitted to protect credentials)";
 }
 
 type WranglerAuditConfig = {
-  account_id?: string;
   vars?: Record<string, unknown>;
-  kv_namespaces?: Array<{ binding: string; id?: string }>;
 };
 
 /** Explicit environment values override deployment configuration and Base defaults. */
 export function resolveAuditConfig(wrangler: WranglerAuditConfig, env: NodeJS.ProcessEnv = process.env) {
-  const namespaces = wrangler.kv_namespaces?.filter((binding) => binding.binding === "ANTSEED_KV") ?? [];
-  if (!env.ANTSEED_KV_NAMESPACE_ID && namespaces.length > 1) throw new Error("Ambiguous ANTSEED_KV namespace");
   const configString = (name: string) => (typeof wrangler.vars?.[name] === "string" ? (wrangler.vars[name] as string) : undefined);
   return {
-    accountId: env.CLOUDFLARE_ACCOUNT_ID || wrangler.account_id,
-    namespaceId: env.ANTSEED_KV_NAMESPACE_ID || namespaces[0]?.id,
+    // The deployed hostname is not derivable from the Worker name (it depends on the account's
+    // workers.dev subdomain or a custom route), so it has to be supplied.
+    apiBaseUrl: env.ANTSEED_API_URL || configString("ANTSEED_API_URL"),
     rpcUrl: env.ANTSEED_FUNDING_RPC_URL || configString("ANTSEED_FUNDING_RPC_URL") || base.rpcUrls.default.http[0],
     operatorAddress: env.ANTSEED_FUNDING_VAULT_ADDRESS || configString("ANTSEED_FUNDING_VAULT_ADDRESS"),
-    // Matches the historical funding scan in migrate-buyer-accounting.ts.
-    fromBlock: integer(env.FROM_BLOCK || configString("FROM_BLOCK") || "48055111")
+    celoVaultAddress: env.CELO_VAULT_ADDRESS || configString("CELO_VAULT_ADDRESS"),
+    gdSuperTokenAddress: env.CELO_GD_SUPERTOKEN_ADDRESS || configString("CELO_GD_SUPERTOKEN_ADDRESS"),
+    subgraphUrl: env.SUPERFLUID_SUBGRAPH_URL || configString("SUPERFLUID_SUBGRAPH_URL")
   };
+}
+
+/**
+ * Everything the audit reads, gathered from the subgraph and the Worker API.
+ *
+ * The subgraph is the authority on which accounts have ever streamed, so it -- not a KV key listing --
+ * defines the accounts to examine. For each one the API supplies the profile and the indexed credit
+ * entries, which together give both halves of the audit:
+ *
+ *  - `records`: the legacy entries to check against `usedDepositIds`, keyed as the audit expects.
+ *  - `reconciliations`: what Superfluid says the account streamed up to its own stream clock, against
+ *    what the profile claims was credited. Measured to `lastStreamCreditAt` rather than to now, because
+ *    time after the clock is simply not yet credited -- normal, and not a finding.
+ *
+ * Uses the backend's own `fetchStreamPeriods` and `streamOwedWei`, so the audit cannot drift from the
+ * code it is auditing.
+ */
+async function loadFromApi(
+  config: ReturnType<typeof resolveAuditConfig>,
+  api: WorkerApiReader,
+  progress: (event: string, details?: Record<string, unknown>) => void
+): Promise<{ records: Map<string, unknown>; reconciliations: Map<string, StreamedReconciliation> }> {
+  const records = new Map<string, unknown>();
+  const reconciliations = new Map<string, StreamedReconciliation>();
+  if (!config.celoVaultAddress || !config.gdSuperTokenAddress) {
+    progress("reconcile.skipped", { reason: "missing_celo_vault_or_supertoken" });
+    return { records, reconciliations };
+  }
+  const snapshot = await fetchStreamPeriods(
+    {
+      CELO_VAULT_ADDRESS: config.celoVaultAddress,
+      CELO_GD_SUPERTOKEN_ADDRESS: config.gdSuperTokenAddress,
+      SUPERFLUID_SUBGRAPH_URL: config.subgraphUrl
+    } as unknown as RuntimeConfig,
+    0
+  );
+  if (!snapshot) throw new Error("Superfluid subgraph unavailable; reconciliation cannot be trusted");
+
+  const periodsByAccount = new Map<string, typeof snapshot.periods>();
+  for (const period of snapshot.periods) {
+    const list = periodsByAccount.get(period.account) ?? [];
+    list.push(period);
+    periodsByAccount.set(period.account, list);
+  }
+  progress("reconcile.accounts", { accounts: periodsByAccount.size });
+
+  for (const [account, periods] of periodsByAccount) {
+    const profile = await api.profile(account);
+    records.set(`user:${account}`, profile);
+    const lastStreamCreditAt = profile?.lastStreamCreditAt;
+    const clock = lastStreamCreditAt ? Math.floor(Date.parse(lastStreamCreditAt) / 1000) : 0;
+    reconciliations.set(account, {
+      account,
+      owedToClockWei: Number.isFinite(clock) ? streamOwedWei(periods, 0, clock) : 0n,
+      creditedWei: BigInt(profile?.totalGDStreamedWei ?? "0"),
+      maxFlowRateWeiPerSecond: periods.reduce((peak, period) => (period.flowRateWeiPerSecond > peak ? period.flowRateWeiPerSecond : peak), 0n),
+      lastStreamCreditAt
+    });
+    let entries = 0;
+    for await (const item of api.creditHistory(account)) {
+      const entryId = item && typeof item === "object" && "id" in item && typeof item.id === "string" ? item.id : undefined;
+      if (!entryId) continue;
+      records.set(`${CREDIT_PREFIX}${entryId}`, item);
+      entries += 1;
+    }
+    progress("api.account.loaded", { entries, hasProfile: Boolean(profile) });
+  }
+  return { records, reconciliations };
 }
 
 async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     console.log(`Read-only legacy stream audit (no transactions or KV writes).
-Usage: npm run audit:legacy-streams -- --output <new-report.json>
-Required environment:
-  CLOUDFLARE_API_TOKEN (KV read permission only)
-  ETHERSCAN_API_KEY (Etherscan V2 with Base access)
-  CLOUDFLARE_ACCOUNT_ID (unless account_id is configured in Wrangler)
+Usage: yarn audit:legacy-streams --output <new-report.json>   (npm: npm run audit:legacy-streams -- --output <file>)
+Required environment (a backend/.env is loaded automatically; real environment variables win):
+  ANTSEED_API_URL (base URL of the deployed Worker, e.g. https://<worker>.workers.dev)
 Defaults:
-  ANTSEED_KV_NAMESPACE_ID: ANTSEED_KV binding in wrangler.toml
   ANTSEED_FUNDING_VAULT_ADDRESS: vars in wrangler.toml
   ANTSEED_FUNDING_RPC_URL: Wrangler vars, then Base public RPC
-  FROM_BLOCK: Wrangler vars, then 48055111 (existing historical funding scan)
-Environment values override all defaults; override FROM_BLOCK for a different deployment.
-Optional: TO_BLOCK (defaults to finalized). Funding logs use Etherscan V2 result pages on Base (8453).
+  CELO_VAULT_ADDRESS / CELO_GD_SUPERTOKEN_ADDRESS / SUPERFLUID_SUBGRAPH_URL: vars in wrangler.toml
+Environment values override all defaults.
+Optional: TO_BLOCK (defaults to finalized). Deposit landing is checked with usedDepositIds; streamed-vs-credited comes from the Superfluid subgraph.\nAccounts come from the subgraph and records from the Worker API, so no Cloudflare credentials are needed.
+Optional: --verbose prints the raw error on failure (may reveal credentials; local use only).
 Exit codes: 0 = no flagged records, 2 = review required, 1 = audit failed.
 Pause cron and event ingestion for a stable audit. Reports contain wallet and credit data.
 Legacy entries lack window-end timestamps: repairs must be reviewed, not guessed from funding time.`);
     return;
   }
+  // Load `.env` for local runs. Variables already in the environment win, so CI and production are
+  // unaffected, and a missing file is not an error -- it just means the environment is supplied some
+  // other way. Without this every invocation needs `set -a; . ./.env; set +a` first.
+  try {
+    process.loadEnvFile(fileURLToPath(new URL("../.env", import.meta.url)));
+  } catch {
+    // No .env, or unreadable: fall back to the ambient environment.
+  }
   logProgress("audit.start", { readOnly: true });
-  const args = process.argv.slice(2);
+  // `npm run x -- --output f` needs the separator; Yarn Berry forwards it literally, so accept both.
+  const args = process.argv.slice(2).filter((arg) => arg !== "--" && arg !== "--verbose");
   if (args.length !== 2 || args[0] !== "--output" || !args[1]) throw new Error("Expected --output <new-report.json>; use --help");
   logProgress("config.loading");
   const { experimental_readRawConfig } = await import("wrangler");
   const { rawConfig } = experimental_readRawConfig({ config: fileURLToPath(new URL("../wrangler.toml", import.meta.url)) });
   const config = resolveAuditConfig(rawConfig as WranglerAuditConfig);
-  if (!config.accountId || !config.namespaceId || !config.operatorAddress) throw new Error("Missing Cloudflare account, KV namespace, or operator address");
-  const kv = new CloudflareKvReader(config.accountId, config.namespaceId, required("CLOUDFLARE_API_TOKEN"));
-  const etherscanApiKey = required("ETHERSCAN_API_KEY");
-  logProgress("config.loaded", { fromBlock: config.fromBlock });
+  if (!config.apiBaseUrl || !config.operatorAddress) throw new Error("Missing ANTSEED_API_URL or operator address");
+  // Checked explicitly: an unset or placeholder URL otherwise surfaces as the generic sanitised
+  // error, which is indistinguishable from a credential problem.
+  if (!/^https?:\/\//.test(config.apiBaseUrl)) throw new Error("Invalid ANTSEED_API_URL; expected an http(s) URL for the deployed Worker");
+  if (!/^https?:\/\//.test(config.rpcUrl)) throw new Error("Invalid ANTSEED_FUNDING_RPC_URL; expected an http(s) Base mainnet endpoint");
+  const api = new WorkerApiReader(config.apiBaseUrl);
+  logProgress("config.loaded");
   const rpc = new JsonRpcProvider(config.rpcUrl);
   try {
     const operatorAddress = getAddress(config.operatorAddress);
     const operator = new Contract(operatorAddress, OPERATOR_ABI, rpc);
-    const fromBlock = config.fromBlock;
     logProgress("chain.resolving-range");
     const toBlock = process.env.TO_BLOCK ? integer(process.env.TO_BLOCK) : (await rpc.getBlock("finalized"))?.number;
-    if (toBlock === undefined || toBlock < fromBlock) throw new Error("Invalid or unavailable finalized block range");
+    if (toBlock === undefined) throw new Error("Finalized block unavailable");
     const block = await rpc.getBlock(toBlock);
     if (!block?.hash || (await rpc.getCode(operatorAddress, toBlock)) === "0x") throw new Error("Operator contract or block unavailable");
     const chainId = (await rpc.getNetwork()).chainId.toString();
     if (chainId !== String(base.id)) throw new Error("Audit RPC must use Base mainnet");
-    logProgress("chain.scan.start", { chainId, fromBlock, toBlock, source: "etherscan" });
-    const iface = new Interface(OPERATOR_ABI);
-    const evidence = new Map<string, FundingEvidence>();
-    const timestamps = new Map<number, string>();
-    for await (const log of fetchFundingLogs(etherscanApiKey, operatorAddress, fromBlock, toBlock, fetch, logProgress)) {
-      // const receipt = await rpc.getTransactionReceipt(log.transactionHash);
-      // const confirmed = receipt?.logs.find((item) => item.index === log.index && item.address.toLowerCase() === operatorAddress.toLowerCase());
-      // if (
-      //   !receipt ||
-      //   receipt.status !== 1 ||
-      //   receipt.blockNumber !== log.blockNumber ||
-      //   !confirmed ||
-      //   confirmed.data !== log.data ||
-      //   JSON.stringify(confirmed.topics) !== JSON.stringify(log.topics)
-      // )
-      //   throw new Error("Funding event block is unavailable or reorged");
-      // Etherscan pads absent topics with null; drop them so the decoder sees the real topic list.
-      // Narrowed rather than mutated, so the array is typed `string[]` for `parseLog`.
-      const topics = log.topics.filter((topic): topic is string => topic !== null);
-      const event = iface.parseLog({ topics, data: log.data });
-      if (!event) throw new Error("Could not decode funding log");
-      const entryId = event.args.id as string;
-      if (evidence.has(entryId)) throw new Error("Duplicate deposit ID in event history");
-      let fundedAt = timestamps.get(log.blockNumber);
-      if (!fundedAt) {
-        const fundedBlock = await rpc.getBlock(log.blockNumber);
-        if (!fundedBlock) throw new Error("Funding event block is unavailable or reorged");
-        fundedAt = new Date(fundedBlock.timestamp * 1000).toISOString();
-        timestamps.set(log.blockNumber, fundedAt);
-      }
-      evidence.set(entryId, {
-        buyer: event.args.buyer,
-        principalUsd: event.args.principal.toString(),
-        bonusUsd: event.args.bonus.toString(),
-        txHash: log.transactionHash,
-        blockNumber: log.blockNumber,
-        fundedAt
-      });
-    }
-    logProgress("kv.audit.start", { fundingEvents: evidence.size });
+    logProgress("reconcile.start", { chainId, toBlock });
+    // Streamed-vs-credited comes from the subgraph and the Worker API; no explorer, no block scan.
+    // The only chain fact the audit needs is whether each legacy deposit id actually landed, which is
+    // one `usedDepositIds` call per entry.
+    const { records, reconciliations } = await loadFromApi(config, api, logProgress);
+    logProgress("kv.audit.start", { accountsReconciled: reconciliations.size, records: records.size });
     const report = await auditLegacyStreams({
-      keys: () => kv.keys(),
-      get: (key) => kv.get(key),
+      async *keys() {
+        for (const key of records.keys()) if (key.startsWith(CREDIT_PREFIX)) yield key;
+      },
+      get: async (key) => records.get(key),
       used: async (entryId) => Boolean(await operator.usedDepositIds(id(entryId), { blockTag: toBlock })),
-      evidence: async (entryId) => evidence.get(entryId),
+      reconcile: async () => reconciliations,
       progress: logProgress
     });
     logProgress("chain.verifying-block");
@@ -428,7 +409,7 @@ Legacy entries lack window-end timestamps: repairs must be reviewed, not guessed
     logProgress("report.writing");
     await writeFile(
       resolve(args[1]),
-      JSON.stringify({ generatedAt: new Date().toISOString(), chainId, operatorAddress, fromBlock, toBlock, blockHash: block.hash, ...report }, null, 2),
+      JSON.stringify({ generatedAt: new Date().toISOString(), chainId, operatorAddress, toBlock, blockHash: block.hash, ...report }, null, 2),
       { flag: "wx", mode: 0o600 }
     );
     console.log(JSON.stringify(report.counts));
@@ -439,12 +420,6 @@ Legacy entries lack window-end timestamps: repairs must be reviewed, not guessed
   }
 }
 
-function required(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing ${name}`);
-  return value;
-}
-
 function integer(value: string): number {
   if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error("Expected a safe unsigned block number");
   return Number(value);
@@ -453,7 +428,11 @@ function integer(value: string): number {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main().catch((error: unknown) => {
     const message = getAuditErrorMessage(error);
-    console.error(JSON.stringify({ timestamp: new Date().toISOString(), event: "audit.failed", stage: auditStage, message, remoteWrites: false }));
+    console.error(JSON.stringify({ timestamp: new Date().toISOString(), event: "audit.failed", message, remoteWrites: false }));
+    // The message above is deliberately sanitised, because remote errors can carry credentials and
+    // authenticated URLs. That also hides ordinary misconfiguration, so `--verbose` prints the raw
+    // error for local diagnosis. Never use it where the output is shared or logged.
+    if (process.argv.includes("--verbose")) console.error(error);
     process.exitCode = 1;
   });
 }
