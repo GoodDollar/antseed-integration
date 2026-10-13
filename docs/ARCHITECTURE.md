@@ -49,7 +49,7 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - parses `GdDeposited` and `StreamUpdated` events from `CeloGdAntSeedVault`
 - resolves `getWhitelistedRoot(account)` to determine GoodID verification and root-account aggregation
 - records a `GdCreditEntry` in KV and calls `fundCredit` immediately
-- for `StreamUpdated`, the endpoint records a **zero-amount acknowledgement** entry (`source: "stream"`,
+- for `StreamUpdated`, the endpoint records a **zero-amount acknowledgement** entry (`source: "streamUpdate"`,
   id `txHash:logIndex`) so callers polling for the tx see a terminal entry. It never credits: all
   stream crediting happens in the cron (below), so repeated or concurrent calls cannot pay twice
 

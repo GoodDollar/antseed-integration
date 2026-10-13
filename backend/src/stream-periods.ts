@@ -7,6 +7,15 @@ export const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superflu
 
 const PAGE_SIZE = 1000;
 
+/** A plausible unix-seconds timestamp: positive, and small enough to stay an exact integer. */
+const unixSeconds = z
+  .string()
+  .regex(/^\d+$/)
+  .refine((value) => {
+    const seconds = Number(value);
+    return Number.isSafeInteger(seconds) && seconds > 0;
+  }, "timestamp must be a positive safe integer");
+
 const StreamPeriodsResponseSchema = z.object({
   data: z.object({
     _meta: z.object({ block: z.object({ timestamp: z.coerce.number().int().positive() }) }),
@@ -15,8 +24,12 @@ const StreamPeriodsResponseSchema = z.object({
         id: z.string().min(1),
         sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
         flowRate: z.string().regex(/^\d+$/),
-        startedAtTimestamp: z.string().regex(/^\d+$/),
-        stoppedAtTimestamp: z.string().regex(/^\d+$/).nullable(),
+        // Positive and safe, not merely numeric. A zero or absent start would be read as 1970, and
+        // on an account's first credit -- where `creditedThrough` is 0 and nothing clamps the window
+        // -- that bills decades at the period's rate. This is the shape that produced a single
+        // 6,191,029 G$ entry once already, so the snapshot is rejected rather than priced.
+        startedAtTimestamp: unixSeconds,
+        stoppedAtTimestamp: unixSeconds.nullable(),
         startedAtEvent: z.object({ userData: z.string() }).nullable()
       })
     )
@@ -156,14 +169,43 @@ export function liveFlowRate(periods: StreamPeriod[]): bigint {
   return periods.reduce((sum, period) => (period.stoppedAt === undefined ? sum + period.flowRateWeiPerSecond : sum), 0n);
 }
 
-/** Buyer named by the account's most recent flow update. */
-export function latestBuyerAddress(periods: StreamPeriod[]): string | undefined {
-  let latest: StreamPeriod | undefined;
-  for (const period of periods) {
-    if (!latest || period.startedAt > latest.startedAt) latest = period;
-  }
-  return latest?.buyerAddress;
+/** Case-insensitive buyer comparison; two periods with no buyer count as the same buyer. */
+function sameBuyer(a: string | undefined, b: string | undefined): boolean {
+  return (a ?? "").toLowerCase() === (b ?? "").toLowerCase();
 }
+
+/**
+ * The next window to credit, ending at the first buyer change.
+ *
+ * `userData` on a flow update names the AntSeed buyer, and the vault stores whatever it is given
+ * (`streamBuyer[sender] = buyer` runs on update as well as creation), so one account's periods can
+ * name different buyers over time. Crediting the whole owed span to a single buyer would pay the
+ * earlier periods to whoever happens to be named last.
+ *
+ * Periods are sequential, so cutting the window at the first change is enough: every period
+ * overlapping the returned window shares one buyer. The next run continues from `through` and
+ * credits the following segment.
+ */
+export function nextBuyerWindow(
+  periods: StreamPeriod[],
+  creditedThrough: number,
+  asOf: number
+): { buyerAddress?: string; owedWei: bigint; through: number } | undefined {
+  const unpaid = periods
+    .filter((period) => Math.min(period.stoppedAt ?? asOf, asOf) > Math.max(period.startedAt, creditedThrough))
+    .sort((left, right) => left.startedAt - right.startedAt);
+  if (unpaid.length === 0) return undefined;
+
+  const buyerAddress = unpaid[0].buyerAddress;
+  let through = asOf;
+  for (const period of unpaid) {
+    if (sameBuyer(period.buyerAddress, buyerAddress)) continue;
+    through = Math.max(creditedThrough, period.startedAt);
+    break;
+  }
+  return { buyerAddress, owedWei: streamOwedWei(periods, creditedThrough, through), through };
+}
+
 
 /**
  * Earliest stop time among closed periods that still owe credit past `creditedThrough`, or undefined

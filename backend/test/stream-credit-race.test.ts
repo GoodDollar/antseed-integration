@@ -212,6 +212,88 @@ test("overlapping scheduled runs fund a stream window once", { concurrency: fals
     await Promise.all([first.settle(), second.settle()]);
 
     assert.equal(onChain.funded.size, 1, `expected one on-chain deposit, got ${[...onChain.funded.keys()].join(", ")}`);
+
+    // On-chain dedupe alone is not enough: KV has to agree with what was actually paid, or the
+    // profile drifts even though the money is right.
+    const store = new KVCreditStore(kv as never);
+    const entries = await store.getGdCredits(account);
+    const streamEntries = entries.filter((entry) => entry.source === "streamCron");
+    assert.equal(streamEntries.length, 1, "one window, one entry");
+    assert.equal(streamEntries[0].fundingStatus, "funded");
+
+    const profile = await store.getUser(account);
+    assert.equal(profile.totalGDStreamedWei, streamEntries[0].gdAmountWei, "the window is counted once, not twice");
+    assert.equal(profile.totalPrincipalUsd, streamEntries[0].principalUsd);
+    assert.equal(profile.totalOutstandingFundingUsd, "0", "nothing left owed once the deposit landed");
+    assert.equal(profile.lastStreamCreditAt, streamEntries[0].streamCreditedThrough, "the clock advanced to the settled boundary, once");
+  } finally {
+    onChain.restore();
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
+// A window cut at a buyer change never grows: `through` is pinned to the change, not to `asOf`. So
+// if the dust minimum applied to it, a small segment would be skipped on every run, the clock would
+// never advance, and nothing after the change would ever be credited. The account would be stuck.
+test("a live stream still settles a sub-minimum segment ending at a buyer change", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000b03";
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const changedAt = nowSeconds - 29 * DAY; // one day after the last credit: a small segment
+  const lastCreditAt = new Date((nowSeconds - 30 * DAY) * 1000).toISOString();
+  const kv = new MemoryKV();
+  await seedProfile(kv, account, lastCreditAt);
+
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const onChain = stubOnChainFunding();
+  try {
+    console.log = (() => {}) as typeof console.log;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (typeof body.query === "string" && body.query.includes("streamPeriods")) {
+        return Response.json({
+          data: {
+            _meta: { block: { timestamp: nowSeconds } },
+            streamPeriods: [
+              // One day under the old buyer, then 29 days still running under a new one.
+              {
+                id: `${account}-period-0`,
+                sender: { id: account },
+                flowRate: RATE.toString(),
+                startedAtTimestamp: (nowSeconds - 40 * DAY).toString(),
+                stoppedAtTimestamp: changedAt.toString(),
+                startedAtEvent: { userData: "0x" }
+              },
+              {
+                id: `${account}-period-1`,
+                sender: { id: account },
+                flowRate: RATE.toString(),
+                startedAtTimestamp: changedAt.toString(),
+                stoppedAtTimestamp: null,
+                startedAtEvent: { userData: `0x${"00".repeat(12)}${"bb".repeat(20)}` }
+              }
+            ]
+          }
+        });
+      }
+      if (body.method === "eth_call") {
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x000000000000000000000000abababababababababababababababababababab" });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
+    }) as typeof fetch;
+
+    const env = testEnv(kv);
+    const run = trackingContext();
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, env, run.ctx);
+    await run.settle();
+
+    const store = new KVCreditStore(kv as never);
+    const entries = (await store.getGdCredits(account)).filter((entry) => entry.source === "streamCron");
+    assert.equal(entries.length, 1, "the short pre-change segment is settled rather than skipped as dust");
+    const owed = RATE * BigInt(changedAt - (nowSeconds - 30 * DAY));
+    assert.equal(BigInt(entries[0].gdAmountWei), owed);
+    assert.ok(owed < 4_000n * 10n ** 18n, "and it really is below the 4000 G$ minimum");
   } finally {
     onChain.restore();
     globalThis.fetch = originalFetch;

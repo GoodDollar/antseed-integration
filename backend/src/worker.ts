@@ -8,9 +8,8 @@ import {
   StreamPeriod,
   earliestUnsettledStop,
   fetchStreamPeriods,
-  latestBuyerAddress,
   liveFlowRate,
-  streamOwedWei
+  nextBuyerWindow
 } from "./stream-periods.js";
 import { GdCreditEntry, UserCreditProfile } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
@@ -626,7 +625,6 @@ async function creditStreams(
   // Undefined is "subgraph unavailable", not "nothing streaming": skip, and leave the cursor alone.
   if (!snapshot) return { skipped: "subgraph_unavailable", closedAfter };
   const { asOf, periods } = snapshot;
-  const asOfIso = new Date(asOf * 1000).toISOString();
 
   const periodsByAccount = new Map<string, StreamPeriod[]>();
   for (const period of periods) {
@@ -692,10 +690,18 @@ async function creditStreams(
     const unsettled = earliestUnsettledStop(accountPeriods, creditedThrough);
     if (unsettled !== undefined) nextCursor = Math.min(nextCursor, unsettled - 1);
 
-    const gdAmountWei = streamOwedWei(accountPeriods, creditedThrough, asOf);
+    // Cut the window at the first buyer change, so this entry pays exactly the buyer that was named
+    // while its periods ran. The next run continues from `through` and settles the next segment.
+    const window = nextBuyerWindow(accountPeriods, creditedThrough, asOf);
+    if (!window) continue;
+    const { buyerAddress, owedWei: gdAmountWei, through } = window;
     if (gdAmountWei === 0n) continue;
     const flowRate = liveFlowRate(accountPeriods);
-    if (flowRate > 0n) {
+    // The cooldown and the minimum hold back an open-ended window on a live stream, to avoid paying
+    // out dust every run. They must not apply to a window cut short at a buyer change: that window
+    // never grows, so gating it would stall the account's clock permanently and nothing after the
+    // change would ever be credited. A cut window is a settlement boundary, like a close.
+    if (flowRate > 0n && through === asOf) {
       if (asOf - creditedThrough < STREAM_CREDIT_COOLDOWN_SECONDS) {
         counts.skippedCooldown += 1;
         continue;
@@ -706,7 +712,6 @@ async function creditStreams(
       }
     }
 
-    const buyerAddress = latestBuyerAddress(accountPeriods);
     const rootAccount = await fetchGoodIdRoot(account, cfg);
     const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerAddress || account)).isOperator : true;
     // Returns the stored entry unchanged when this window's id already exists.
@@ -723,7 +728,8 @@ async function creditStreams(
       regularBonusBps: cfg.REGULAR_BONUS_BPS,
       streamingBonusBps: cfg.STREAMING_BONUS_BPS,
       buyerAddress,
-      streamCreditedThrough: asOfIso
+      // The cut point, not `asOf`: only this segment has been settled.
+      streamCreditedThrough: new Date(through * 1000).toISOString()
     });
     if (entry.fundingStatus === "funded") {
       // Funded but the clock never moved (or a concurrent run just moved it): repair and move on.
