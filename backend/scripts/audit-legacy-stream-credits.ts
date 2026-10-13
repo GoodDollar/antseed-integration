@@ -206,7 +206,7 @@ export async function* fetchFundingLogs(
   request: typeof fetch = fetch,
   progress?: AuditDependencies["progress"]
 ) {
-  const url = new URL("https://api.blockscout.com/v2/api");
+  const url = new URL("https://api.etherscan.io/v2/api");
   const topic = id("BuyerDepositFundedWithId(address,uint256,uint256,string)");
   const hexInteger = z
     .string()
@@ -250,7 +250,12 @@ export async function* fetchFundingLogs(
       throw new Error(`Etherscan logs failed (${response.status})`);
     }
     const body = z.object({ status: z.string(), message: z.string(), result: z.unknown() }).parse(await response.json());
-    if (body.message !== "OK") throw new Error("Etherscan API rejected logs request; check API key, Base access, and rate limits");
+    // Etherscan signals an empty range with status 0 / "No records found" and a `[]` result, which is
+    // a legitimate answer, not a failure. A genuine rejection (bad key, rate limit) carries "NOTOK"
+    // and a string result, so only that must fail the audit closed.
+    const emptyRange = body.status === "0" && body.message === "No records found";
+    if (!emptyRange && body.message !== "OK")
+      throw new Error("Etherscan API rejected logs request; check API key, Base access, and rate limits");
     const logs = schema.parse(body.result);
     for (const log of logs) {
       if (log.blockNumber < fromBlock || log.blockNumber > toBlock || log.topics[0]?.toLowerCase() !== topic)
@@ -387,9 +392,10 @@ Legacy entries lack window-end timestamps: repairs must be reviewed, not guessed
       //   JSON.stringify(confirmed.topics) !== JSON.stringify(log.topics)
       // )
       //   throw new Error("Funding event block is unavailable or reorged");
-      console.log("Processing log:", log);
-      log.topics = log.topics.filter((_) => _);
-      const event = iface.parseLog(log);
+      // Etherscan pads absent topics with null; drop them so the decoder sees the real topic list.
+      // Narrowed rather than mutated, so the array is typed `string[]` for `parseLog`.
+      const topics = log.topics.filter((topic): topic is string => topic !== null);
+      const event = iface.parseLog({ topics, data: log.data });
       if (!event) throw new Error("Could not decode funding log");
       const entryId = event.args.id as string;
       if (evidence.has(entryId)) throw new Error("Duplicate deposit ID in event history");
