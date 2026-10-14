@@ -360,7 +360,16 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           flowRateWeiPerSecond: event.flowRateWeiPerSecond.toString(),
           reportedTotalFlowWei: event.totalFlowWei.toString()
         });
-        recorded.push(await fundCredit(entry, store, antseedFundingVault));
+        if (BigInt(entry.totalCreditUsd) === 0n) {
+          recorded.push(await fundCredit(entry, store, antseedFundingVault));
+        } else {
+          logWarn("celo.events.record.stream.legacy-entry-skipped", {
+            entryId: entry.id,
+            account: redactAddress(entry.account),
+            fundingStatus: entry.fundingStatus
+          });
+          recorded.push(entry);
+        }
       }
     }
     logInfo("celo.events.record.end", {
