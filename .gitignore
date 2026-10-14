@@ -26,3 +26,5 @@ coverage/
 backend/package.json
 .wrangler
 .yarn
+# repair script output (contains wallet/credit data)
+kv-bulk.json

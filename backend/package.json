@@ -13,7 +13,8 @@
     "check:worker-only": "node scripts/check-worker-only.mjs",
     "lint": "yarn run typecheck && yarn run check:worker-only",
     "audit:legacy-streams": "tsx scripts/audit-legacy-stream-credits.ts",
-    "migrate:buyer-accounting": "tsx scripts/migrate-buyer-accounting.ts"
+    "migrate:buyer-accounting": "tsx scripts/migrate-buyer-accounting.ts",
+    "repair:stream-counters": "tsx scripts/repair-stream-counters.ts"
   },
   "dependencies": {
     "@antseed/node": "^0.2.96",
