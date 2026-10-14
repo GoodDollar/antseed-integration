@@ -202,12 +202,16 @@ Both contracts use UUPS proxies. To upgrade:
 1. Implement the new logic contract (must inherit the existing storage layout).
 2. Deploy the new implementation:
 
+The vault, on Celo:
+
 ```bash
 forge create contracts/src/CeloGdAntSeedVault.sol:CeloGdAntSeedVault \
   --rpc-url "$CELO_RPC_URL" \
   --private-key "$DEPLOYER_PRIVATE_KEY" \
   --constructor-args "$GD_TOKEN"
 ```
+
+The buyer operator, on Base:
 
 ```bash
 forge create contracts/src/AntseedBuyerOperator.sol:AntseedBuyerOperator \
@@ -216,19 +220,30 @@ forge create contracts/src/AntseedBuyerOperator.sol:AntseedBuyerOperator \
   --constructor-args "$ANTSEED_REGISTRY"
 ```
 
-3. Call `upgradeToAndCall` from the owner:
+3. Call `upgradeToAndCall` from the owner. These are two independent UUPS proxies on two different
+   chains: deploying an implementation does not install it, and upgrading one leaves the other on its
+   old implementation. Run the call for each proxy you deployed in step 2.
 
 ```bash
 cast send <vaultProxy> \
-  "upgradeToAndCall(address,bytes)" <newImpl> 0x \
+  "upgradeToAndCall(address,bytes)" <newVaultImpl> 0x \
   --rpc-url "$CELO_RPC_URL" \
   --private-key "$DEPLOYER_PRIVATE_KEY"
 ```
 
-4. Run `forge test -vvv` against a fork to validate before upgrading on mainnet:
+```bash
+cast send <operatorProxy> \
+  "upgradeToAndCall(address,bytes)" <newOperatorImpl> 0x \
+  --rpc-url "$BASE_RPC_URL" \
+  --private-key "$DEPLOYER_PRIVATE_KEY"
+```
+
+4. Run `forge test -vvv` against a fork to validate before upgrading on mainnet, forking whichever
+   chain hosts the proxy you are upgrading:
 
 ```bash
 forge test -vvv --fork-url "$CELO_RPC_URL"
+forge test -vvv --fork-url "$BASE_RPC_URL"
 ```
 
 ---
