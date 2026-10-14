@@ -20,7 +20,6 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `GET /v1/accounts/:account/credit-history`
 - `GET /v1/accounts/:account/outstanding`
 - `POST /v1/analytics/refresh`
-- `POST /v1/accounts/:account/stream-credits`
 - `POST /v1/accounts/:account/operator-consent`
 - `POST /v1/accounts/:account/operator-revoke`
 - `POST /v1/accounts/:account/withdraw`

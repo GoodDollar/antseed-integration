@@ -7,9 +7,7 @@ const VAULT_EVENTS = new Interface([
   "event StreamUpdated(address indexed account,address indexed buyer,int96 flowRate,uint256 monthlyGdAmountWei,uint256 totalFlowWei)"
 ]);
 
-const GOODID_ABI = new Interface([
-  "function getWhitelistedRoot(address account) view returns (address)"
-]);
+const GOODID_ABI = new Interface(["function getWhitelistedRoot(address account) view returns (address)"]);
 
 const DEFAULT_STATIC_ORACLE_ADDRESS = "0x00851A91a3c4E9a4c1B48df827Bacc1f884bdE28";
 const DEFAULT_CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
@@ -20,23 +18,23 @@ const STATIC_ORACLE_ABI = new Interface([
 
 export type ParsedCeloVaultEvent =
   | {
-    kind: "deposit";
-    account: string;
-    buyer: string;
-    gdAmountWei: bigint;
-    txHash: string;
-    logIndex: number;
-  }
+      kind: "deposit";
+      account: string;
+      buyer: string;
+      gdAmountWei: bigint;
+      txHash: string;
+      logIndex: number;
+    }
   | {
-    kind: "stream";
-    account: string;
-    buyer: string;
-    flowRateWeiPerSecond: bigint;
-    monthlyGdAmountWei: bigint;
-    totalFlowWei: bigint;
-    txHash: string;
-    logIndex: number;
-  };
+      kind: "stream";
+      account: string;
+      buyer: string;
+      flowRateWeiPerSecond: bigint;
+      monthlyGdAmountWei: bigint;
+      totalFlowWei: bigint;
+      txHash: string;
+      logIndex: number;
+    };
 
 export async function fetchGoodIdRoot(account: string, cfg: RuntimeConfig): Promise<string | undefined> {
   if (!cfg.CELO_RPC_URL || !cfg.CELO_GOODID_ADDRESS) {
@@ -109,12 +107,14 @@ export async function fetchCeloVaultEventsForAccount(
     toBlock,
     vaultAddress: redactAddress(cfg.CELO_VAULT_ADDRESS)
   });
-  const logs = await rpc<RpcLog[]>(cfg.CELO_RPC_URL, "eth_getLogs", [{
-    address: cfg.CELO_VAULT_ADDRESS,
-    fromBlock,
-    toBlock,
-    topics: [[depositEvent.topicHash, streamEvent.topicHash], [accountTopic]]
-  }]);
+  const logs = await rpc<RpcLog[]>(cfg.CELO_RPC_URL, "eth_getLogs", [
+    {
+      address: cfg.CELO_VAULT_ADDRESS,
+      fromBlock,
+      toBlock,
+      topics: [[depositEvent.topicHash, streamEvent.topicHash], [accountTopic]]
+    }
+  ]);
   const parsed = parseCeloVaultLogs(logs, cfg.CELO_VAULT_ADDRESS);
   logInfo("celo.events.fetch.account.end", {
     account: redactAddress(account),
@@ -250,7 +250,13 @@ export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): Parsed
   return parsed;
 }
 
-export function encodeVaultEventLog(eventName: "GdDeposited" | "StreamUpdated", args: readonly unknown[], address: string, txHash: string, logIndex: number): RpcLog {
+export function encodeVaultEventLog(
+  eventName: "GdDeposited" | "StreamUpdated",
+  args: readonly unknown[],
+  address: string,
+  txHash: string,
+  logIndex: number
+): RpcLog {
   const event = VAULT_EVENTS.getEvent(eventName);
   if (!event) throw new Error(`unknown event ${eventName}`);
   const encoded = VAULT_EVENTS.encodeEventLog(event, args);

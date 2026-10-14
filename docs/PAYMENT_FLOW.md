@@ -11,7 +11,7 @@ The GoodDollar layer is not the final AntSeed payment primitive. It is an accoun
 
 ```text
 User deposits/streams G$ to CeloGdAntSeedVault on Celo
-  -> POST /v1/celo/events/record  { txHash }  (or cron every minute for streams)
+  -> POST /v1/celo/events/record  { txHash }  (streams: credited only by the 6-hourly cron from Superfluid stream periods)
   -> Worker fetches Celo receipt, parses GdDeposited / StreamUpdated events
   -> Worker calls getWhitelistedRoot(account) to resolve GoodID root and verify eligibility
   -> Worker calculates principal (G$ -> micro-USD) and bonus

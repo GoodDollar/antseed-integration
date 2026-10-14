@@ -66,7 +66,7 @@ GoodDollar AntSeed credits add a GoodDollar-native credit layer:
 
 3. **Monthly stream budget**
    - You can stream G$ continuously instead of topping up manually.
-   - Stream credits are issued by a cron job (every minute) or on demand via `POST /v1/accounts/:account/stream-credits` (24-hour cooldown per account).
+   - Stream credits are issued only by the scheduled job (every 6 hours, 24-hour cooldown per account while the stream is live).
 
 4. **On-chain proof of funding**
    - Credits come from Celo vault events, not a centralized off-chain payment button.
@@ -182,14 +182,10 @@ curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/celo/events/record" \
   -d '{"txHash":"0xYOUR_STREAM_TX_HASH"}'
 ```
 
-The Worker records a credit entry and issues the +20% streaming bonus. The credited amount is **not**
-the event's `totalFlowWei` — that figure is measured from the last on-chain flow change, which overlaps
-the window the scheduled run already credits, so counting it would double-pay. The Worker credits the
-window it actually owes instead: the time since your last stream credit, at your recorded flow rate.
-
-You do not have to submit this call for a rate change to be picked up. The scheduled run reads your
-streams from the Superfluid subgraph every 6 hours and credits the same window. Submitting the event
-simply settles it sooner.
+The Worker records a zero-amount acknowledgement entry for the stream transaction; it does not credit.
+Stream credits (+20% bonus for verified wallets) are issued by the scheduled run, which reads your
+Superfluid stream periods every 6 hours and credits exactly what flowed since your last stream credit,
+pricing each flow rate only for the time it was in force. Submitting the event is optional.
 
 ## Step 4 — Check your credit balance
 
@@ -214,12 +210,6 @@ curl "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/outstanding"
 ```
 
 This returns `outstandingFundingUsd` and the list of `failed` or `pending` credit entries. Submitting the same `txHash` to `/v1/celo/events/record` again is safe — idempotency prevents double-funding.
-
-To manually trigger stream credits outside of the cron (24-hour cooldown applies):
-
-```bash
-curl -X POST "$GOODDOLLAR_ANTSEED_API/v1/accounts/$GOODDOLLAR_ACCOUNT/stream-credits"
-```
 
 ## Step 5 — Developer tool integration (coming soon)
 

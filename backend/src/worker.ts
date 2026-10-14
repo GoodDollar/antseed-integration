@@ -1,16 +1,23 @@
 import { z } from "zod";
 import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
-import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdPrice, fetchGoodIdRoot, decodeBuyerFromUserData } from "./celo-events.js";
-import { Env, configFromEnv } from "./env.js";
+import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdPrice, fetchGoodIdRoot } from "./celo-events.js";
+import { Env, RuntimeConfig, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
-import { GdCreditEntry, UserCreditProfile } from "./types.js";
+import { fundCredit } from "./funding.js";
+import { creditStreams } from "./stream-credits.js";
+import { SUPERFLUID_CELO_SUBGRAPH_URL } from "./stream-periods.js";
+import { GdCreditEntry } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 import { getAnalyticsWindow, runAnalyticsAggregation, KVAnalyticsStore } from "./analytics.js";
+import { cors, json, notifySlackOnRequestError, parseJson, readRequestBody } from "./http.js";
+import {
+  ANALYTICS_CRON_BACKFILL_DAYS,
+  ANALYTICS_REFRESH_COOLDOWN_MS,
+  ANALYTICS_REFRESH_LAST_RUN_KEY,
+  backFillAnalytics,
+  readAnalyticsRefreshTimestamp
+} from "./analytics-cron.js";
 
-const ANALYTICS_REFRESH_COOLDOWN_MS = 60 * 60 * 1000;
-const ANALYTICS_REFRESH_LAST_RUN_KEY = "analytics:refresh:last-run-at";
-const ANALYTICS_CRON_BACKFILL_DAYS = 40;
-const ANALYTICS_CRON_BACKFILL_CURSOR_KEY = "analytics:cron:backfill-cursor";
 
 const CeloEventsRecordSchema = z
   .object({
@@ -74,36 +81,10 @@ const ChannelOpSchema = z.object({
     .regex(/^0x[0-9a-fA-F]+$/)
     .optional()
 });
-const SuperfluidStreamsResponseSchema = z.object({
-  data: z.object({
-    streams: z.array(
-      z.object({
-        sender: z.object({ id: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }),
-        currentFlowRate: z.string().regex(/^\d+$/),
-        updatedAtTimestamp: z.string().regex(/^\d+$/),
-        flowUpdatedEvents: z.array(
-          z.object({
-            userData: z.string()
-          })
-        )
-      })
-    )
-  })
-});
 const AnalyticsQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(365).default(30)
 });
 
-const SUPERFLUID_CELO_SUBGRAPH_URL = "https://subgraph-endpoints.superfluid.dev/celo-mainnet/protocol-v1";
-
-type SuperfluidIncomingStream = {
-  account: string;
-  flowRateWeiPerSecond: string;
-  /** For a closed stream this is its termination; for a live one, its last on-chain change. */
-  lastUpdateAt: string;
-  /** AntSeed buyer decoded from the most recent FlowUpdatedEvent userdata. */
-  buyerAddress?: string;
-};
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -153,138 +134,8 @@ export default {
       bridgeEnabled: antseedFundingVault.enabled
     });
 
-    const gdPrice = await fetchCurrentGdPrice(cfg);
-    // Includes closed streams: a terminated stream reports `currentFlowRate = 0`, and seeing that is
-    // the only way the backend learns it stopped. The termination event that would otherwise say so
-    // is pushed in by `POST /v1/celo/events/record` and may never arrive.
-    const streams = await fetchSuperfluidIncomingStreams(cfg);
-
-    let inactiveAccounts = 0;
-    let syncedFlowRates = 0;
-    let syncedRootFlowRates = 0;
-    let skippedCooldown = 0;
-    let skippedMinAmount = 0;
-    let processed = 0;
-    let funded = 0;
-    let failed = 0;
-    const createdAt = new Date().toISOString();
-
-    // Sync every account's recorded rate from the subgraph before crediting. Doing it here rather
-    // than inside `recordGdCredit` means it happens on every run, not only when a credit clears the
-    // cooldown and the minimum -- at a 4000 G$ minimum those can be a fortnight apart. Summed per
-    // account, because one account can hold several revisions (a closed stream and its replacement)
-    // and a closed row must not clobber the rate of the live one. All-closed sums to 0, which is
-    // how the profile stops advertising a stream that no longer exists.
-    const flowRateByAccount = new Map<string, bigint>();
-    for (const stream of streams) {
-      const account = stream.account.toLowerCase();
-      flowRateByAccount.set(account, (flowRateByAccount.get(account) ?? 0n) + BigInt(stream.flowRateWeiPerSecond));
-    }
-    // One profile read per account, reused by the crediting pass below. `getSavedUser` rather than
-    // `getUser` because syncing is a correction to state that already exists -- an account that has
-    // never been credited has no profile, and the scheduled run must not create one as a side
-    // effect. Its first credit will create it, in `recordGdCredit`.
-    const profileByAccount = new Map<string, UserCreditProfile>();
-    const flowRateByRoot = new Map<string, bigint>();
-    // The rate as it stood before this run's sync. A stream that has just closed reports 0, so its
-    // final window has to be priced at what was flowing beforehand.
-    const previousFlowRateByAccount = new Map<string, bigint>();
-    for (const [account, flowRate] of flowRateByAccount) {
-      const profile = await store.getSavedUser(account);
-      if (!profile) continue;
-      previousFlowRateByAccount.set(account, BigInt(profile.streamFlowRateWeiPerSecond));
-      if (await store.recordStreamFlowRate(profile, flowRate)) syncedFlowRates += 1;
-      profileByAccount.set(account, profile);
-      flowRateByRoot.set(profile.rootAccount, (flowRateByRoot.get(profile.rootAccount) ?? 0n) + flowRate);
-    }
-
-    // A GoodID root profile aggregates its identity's wallets. The totals get there by mirroring in
-    // `updateUser`, which works because they accumulate -- a flow rate is absolute, so it is summed
-    // here instead. A root that streams itself is part of its own sum, so this runs after the
-    // per-account pass and takes precedence over that account's own rate.
-    for (const [rootAccount, totalFlowRate] of flowRateByRoot) {
-      const rootProfile = profileByAccount.get(rootAccount) ?? (await store.getSavedUser(rootAccount));
-      if (!rootProfile) continue;
-      if (await store.recordStreamFlowRate(rootProfile, totalFlowRate)) syncedRootFlowRates += 1;
-    }
-    inactiveAccounts = [...flowRateByAccount.values()].filter((flowRate) => flowRate === 0n).length;
-
-    for (const stream of streams) {
-      const account = stream.account.toLowerCase();
-      // Falls back to the synthesized default for an account streaming for the first time, which is
-      // exactly the case the sync above skips.
-      const profile = profileByAccount.get(account) ?? (await store.getUser(stream.account));
-      const now = new Date();
-      // Closed streams are credited too, for the window between the last credit and the termination
-      // -- without this the tail of every stream is silently forfeited.
-      const { elapsedSeconds, gdAmountWei } = streamCreditAmount({
-        now,
-        lastStreamCreditAt: profile.lastStreamCreditAt,
-        stream,
-        previousFlowRateWeiPerSecond: previousFlowRateByAccount.get(account) ?? 0n
-      });
-      if (gdAmountWei === 0n) continue;
-      if (elapsedSeconds < 60 * 60 * 24) {
-        skippedCooldown += 1;
-        continue;
-      }
-      if (gdAmountWei < cfg.MIN_STREAM_BONUS_WEI) {
-        skippedMinAmount += 1;
-        continue;
-      }
-      const rootAccount = await fetchGoodIdRoot(stream.account, cfg);
-      const buyerForOperatorCheck = stream.buyerAddress || stream.account;
-      const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
-      const isValidForBonus = !!rootAccount && hasOperatorConsent;
-
-      const depositId = createStreamFundingId(stream.account, new Date(createdAt));
-      const entry = await store.recordGdCredit({
-        id: depositId,
-        account: stream.account,
-        rootAccount,
-        source: "streamCron",
-        gdAmountWei: BigInt(gdAmountWei),
-        // The account's summed rate, not this row's: an account can hold several rows, and a closed
-        // one reports 0. Also what gives a first-time streamer -- skipped by the sync above for
-        // having no profile yet -- its rate on the profile this credit creates.
-        flowRate: flowRateByAccount.get(account) ?? 0n,
-        isVerified: isValidForBonus, // if root acccount was found it is whitelisted & operator set
-        gdPrice,
-        maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
-        regularBonusBps: cfg.REGULAR_BONUS_BPS,
-        streamingBonusBps: cfg.STREAMING_BONUS_BPS,
-        buyerAddress: stream.buyerAddress
-      });
-      logInfo("streamCron.credits.entry", {
-        entryId: entry.id,
-        account: redactAddress(entry.account),
-        rootAccount: redactAddress(entry.rootAccount),
-        buyer: redactAddress(entry.buyerAddress),
-        elapsedSeconds,
-        stream,
-        entry,
-        profile
-      });
-      processed += 1;
-      ctx.waitUntil(
-        fundCredit(entry, store, antseedFundingVault).then((result) => {
-          if (result.fundingStatus === "funded") funded += 1;
-          if (result.fundingStatus === "failed") failed += 1;
-        })
-      );
-    }
-    logInfo("cron.summary", {
-      streamCount: streams.length,
-      processed,
-      skippedCooldown,
-      skippedMinAmount,
-      inactiveAccounts,
-      syncedFlowRates,
-      syncedRootFlowRates,
-      funded,
-      failed,
-      elapsedMs: Date.now() - startedAt
-    });
+    const summary = await creditStreams(cfg, env.ANTSEED_KV, store, antseedFundingVault, ctx);
+    logInfo("cron.summary", { ...summary, elapsedMs: Date.now() - startedAt });
 
     try {
       const summaries = await backFillAnalytics(env, ANALYTICS_CRON_BACKFILL_DAYS);
@@ -308,35 +159,6 @@ export default {
   }
 };
 
-async function backFillAnalytics(env: Env, maxRunsPerTick = 2) {
-  const kv = env.ANTSEED_KV;
-  const summaries: Array<{ currentDate: string; finalizedDates: string[] }> = [];
-  const runAt = new Date();
-  const todayDate = runAt.toISOString().slice(0, 10);
-  let cursorDate = await readAnalyticsBackfillCursorDate(env.ANTSEED_KV);
-  if (!cursorDate) {
-    cursorDate = dateDaysAgo(runAt, ANALYTICS_CRON_BACKFILL_DAYS);
-    await kv.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
-  }
-  // TODO: replace bounded loop with persisted backfill cursor when we need broader historical catch-up.
-  for (let i = 0; i < maxRunsPerTick; i += 1) {
-    console.log(`analytics backfill run ${i + 1} of ${maxRunsPerTick}, cursorDate=${cursorDate}`);
-    const aggregationRunAt = cursorDate === todayDate ? runAt : new Date(`${cursorDate}T23:59:59.999Z`);
-    const analyticsSummary = await runAnalyticsAggregation(env, aggregationRunAt);
-    console.log(`analytics backfill run ${i + 1} of ${maxRunsPerTick}, cursorDate=${cursorDate} completed`, analyticsSummary);
-    summaries.push({
-      currentDate: analyticsSummary.currentDate,
-      finalizedDates: analyticsSummary.finalizedDates
-    });
-    if (cursorDate === todayDate) {
-      break;
-    }
-    const nextCursorDate = nextUtcDate(cursorDate);
-    cursorDate = nextCursorDate && nextCursorDate <= todayDate ? nextCursorDate : todayDate;
-    await kv.put(ANALYTICS_CRON_BACKFILL_CURSOR_KEY, cursorDate);
-  }
-  return summaries;
-}
 async function route(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const cfg = configFromEnv(env);
@@ -470,8 +292,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     });
     const recorded = [];
     const gdPrice = await fetchCurrentGdPrice(cfg);
-    /** Per-request cache: one receipt can carry several stream events for the same account. */
-    const streamLastUpdateAtByAccount = new Map<string, string | undefined>();
     for (const event of events) {
       const rootAccount = await fetchGoodIdRoot(event.account, cfg);
 
@@ -513,68 +333,43 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         const res = await fundCredit(entry, store, antseedFundingVault);
         recorded.push(res);
       } else {
-        const depositId = `${event.txHash}:${event.logIndex}`;
-        // The event's `totalFlowWei` is `previousFlowRate * (now - last on-chain flow change)` -- a
-        // baseline the backend does not track. It overlaps whatever the scheduled run will credit
-        // from `lastStreamCreditAt`, so crediting it double-counts the overlap. Credit the window
-        // the backend actually owes instead, at the rate that applied across it: the previously
-        // recorded rate, since `event.flowRateWeiPerSecond` is the new one only taking effect now.
-        //
-        // The window is also floored at the current stream revision's creation, so a stream opening
-        // after an earlier one closed cannot bill the dormant gap between them. That floor is read
-        // from the subgraph rather than inferred: the cron only ever sees active streams, so it can
-        // never record `flowRate = 0` on a close, and the termination event that would is pushed in
-        // by `POST /v1/celo/events/record` and may never arrive. A terminated stream is absent from
-        // the query (it filters on `currentFlowRate > 0`) and the floor does not apply, so the window
-        // falls back to `lastStreamCreditAt` -- which can be weeks stale. The amount is therefore capped
-        // at `event.totalFlowWei`: the vault computes it on-chain as what actually flowed since the
-        // last flow change, so a stale clock multiplied by a remembered rate can never be credited
-        // beyond the G$ the stream really carried.
-        const profile = await store.getUser(event.account);
-        // Lowercased: ethers hands back checksummed addresses, the subgraph lowercase ones.
-        const streamCacheKey = event.account.toLowerCase();
-        if (!streamLastUpdateAtByAccount.has(streamCacheKey)) {
-          const accountStreams = await fetchSuperfluidStreamsForAccount(event.account, cfg);
-          streamLastUpdateAtByAccount.set(streamCacheKey, accountStreams[0]?.lastUpdateAt);
-        }
-        const streamLastUpdateAt = streamLastUpdateAtByAccount.get(streamCacheKey);
-        const elapsedSeconds = streamElapsedSeconds(new Date(), profile.lastStreamCreditAt, streamLastUpdateAt);
-        const owedWei = BigInt(profile.streamFlowRateWeiPerSecond) * BigInt(elapsedSeconds);
-        const gdAmountWei = owedWei < event.totalFlowWei ? owedWei : event.totalFlowWei;
-        const buyerForOperatorCheck = event.buyer || event.account;
-        const hasOperatorConsent =
-          antseedFundingVault.enabled && gdAmountWei > 0n ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
-        const isValidForBonus = !!rootAccount && hasOperatorConsent;
+        // Streams are credited by the scheduled run alone, from the subgraph's stream periods.
+        // Crediting here too let two paths price the same window from the same stale clock under
+        // different deposit ids, so both were paid. The event is still recorded, as a zero-amount
+        // acknowledgement: clients wait for an entry carrying their txHash to settle. It has no
+        // `streamCreditedThrough`, so it leaves the stream clock alone, and no flow rate -- the
+        // scheduled run syncs that from the subgraph.
         const entry = await store.recordGdCredit({
-          id: depositId,
+          id: `${event.txHash}:${event.logIndex}`,
           account: event.account,
           rootAccount,
           source: "streamUpdate",
-          gdAmountWei,
-          flowRate: event.flowRateWeiPerSecond,
+          gdAmountWei: 0n,
           txHash: event.txHash,
           logIndex: event.logIndex,
-          isVerified: isValidForBonus,
+          isVerified: false,
           gdPrice,
           maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
           regularBonusBps: cfg.REGULAR_BONUS_BPS,
           streamingBonusBps: cfg.STREAMING_BONUS_BPS,
           buyerAddress: event.buyer
         });
-        logInfo("celo.events.record.entry", {
-          kind: event.kind,
+        logInfo("celo.events.record.stream.acknowledged", {
           entryId: entry.id,
           account: redactAddress(entry.account),
-          rootAccount: redactAddress(entry.rootAccount),
-          buyer: redactAddress(entry.buyerAddress),
-          elapsedSeconds,
-          streamLastUpdateAt,
-          previousFlowRateWeiPerSecond: profile.streamFlowRateWeiPerSecond,
-          creditedGdAmountWei: gdAmountWei.toString(),
+          flowRateWeiPerSecond: event.flowRateWeiPerSecond.toString(),
           reportedTotalFlowWei: event.totalFlowWei.toString()
         });
-        const res = await fundCredit(entry, store, antseedFundingVault);
-        recorded.push(res);
+        if (BigInt(entry.totalCreditUsd) === 0n) {
+          recorded.push(await fundCredit(entry, store, antseedFundingVault));
+        } else {
+          logWarn("celo.events.record.stream.legacy-entry-skipped", {
+            entryId: entry.id,
+            account: redactAddress(entry.account),
+            fundingStatus: entry.fundingStatus
+          });
+          recorded.push(entry);
+        }
       }
     }
     logInfo("celo.events.record.end", {
@@ -601,111 +396,6 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       outstandingFundingUsd: profile.totalOutstandingFundingUsd,
       failedFundingCredits: outstandingFundingCredits
     });
-  }
-
-  const streamCreditsMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/stream-credits$/);
-  if (request.method === "POST" && streamCreditsMatch) {
-    const account = decodeURIComponent(streamCreditsMatch[1]).toLowerCase();
-    const profile = await store.getUser(account);
-    const rootAccount = await fetchGoodIdRoot(account, cfg);
-    // Closed streams included: a user whose stream has ended is still owed the window between the
-    // last credit and the termination, and the scheduled run is only every 6 hours.
-    const streams = await fetchSuperfluidStreamsForAccount(account, cfg, true);
-
-    logInfo("stream.credits.start", {
-      account: redactAddress(account),
-      rootAccount: redactAddress(rootAccount),
-      streamCount: streams.length
-    });
-    if (streams.length === 0) {
-      logInfo("stream.credits.empty", {
-        account: redactAddress(account)
-      });
-      return json({ account, streams: [], message: "no streams found" });
-    }
-
-    const gdPrice = await fetchCurrentGdPrice(cfg);
-    const now = new Date();
-    const previousFlowRateWeiPerSecond = BigInt(profile.streamFlowRateWeiPerSecond);
-    const accountFlowRateWeiPerSecond = streams.reduce((sum, stream) => sum + BigInt(stream.flowRateWeiPerSecond), 0n);
-    // The widest window any of this account's streams is owed, used only for the cooldown gate --
-    // each stream's own amount is computed per stream below.
-    const elapsedSeconds = Math.max(
-      ...streams.map(
-        (stream) => streamCreditAmount({ now, lastStreamCreditAt: profile.lastStreamCreditAt, stream, previousFlowRateWeiPerSecond }).elapsedSeconds
-      )
-    );
-
-    if (elapsedSeconds < 60 * 60 * 24) {
-      // if last credit was less than 24h ago, don't issue new credits to prevent abuse and return how many seconds are left until next credit can be issued
-      logInfo("stream.credits.cooldown", {
-        account: redactAddress(account),
-        elapsedSeconds
-      });
-      return json({
-        account,
-        streams: [],
-        message: "stream credits were issued less than 60 seconds ago"
-      });
-    }
-
-    const recorded = [];
-    let skippedMinAmount = 0;
-    for (const stream of streams) {
-      const buyerForOperatorCheck = stream.buyerAddress || account;
-      const hasOperatorConsent = antseedFundingVault.enabled ? (await antseedFundingVault.isBuyerOperator(buyerForOperatorCheck)).isOperator : true;
-      const isValidForBonus = !!rootAccount && hasOperatorConsent;
-      const isVerified = isValidForBonus;
-      const { gdAmountWei } = streamCreditAmount({ now, lastStreamCreditAt: profile.lastStreamCreditAt, stream, previousFlowRateWeiPerSecond });
-      if (gdAmountWei <= cfg.MIN_STREAM_BONUS_WEI) {
-        skippedMinAmount += 1;
-        recorded.push({
-          message: `stream credit amount ${gdAmountWei} is below minimum ${cfg.MIN_STREAM_BONUS_WEI}`
-        });
-        continue;
-      }
-
-      const depositId = createStreamFundingId(account, now);
-      const entry = await store.recordGdCredit({
-        id: depositId,
-        account,
-        rootAccount,
-        source: "streamRequest",
-        gdAmountWei,
-        // Summed across the account's rows for the same reason as the scheduled run.
-        flowRate: accountFlowRateWeiPerSecond,
-        isVerified,
-        gdPrice,
-        maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
-        regularBonusBps: cfg.REGULAR_BONUS_BPS,
-        streamingBonusBps: cfg.STREAMING_BONUS_BPS,
-        buyerAddress: stream.buyerAddress
-      });
-
-      logInfo("stream.credits.entry", {
-        entryId: entry.id,
-        account: redactAddress(entry.account),
-        rootAccount: redactAddress(entry.rootAccount),
-        buyer: redactAddress(entry.buyerAddress),
-        isValidForBonus
-      });
-      const res = await fundCredit(entry, store, antseedFundingVault);
-      recorded.push(res);
-    }
-    if (recorded.length === 0) {
-      return json({
-        account,
-        streams: [],
-        message: "stream credits already issued today"
-      });
-    }
-    logInfo("stream.credits.end", {
-      account: redactAddress(account),
-      elapsedSeconds,
-      recordedCount: recorded.length,
-      skippedMinAmount
-    });
-    return json({ account, elapsedSeconds, streams: recorded });
   }
 
   const operatorConsentMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator-consent$/);
@@ -803,422 +493,3 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   return json({ error: "not found" }, 404);
 }
 
-async function parseJson(request: Request): Promise<unknown> {
-  const contentType = request.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) throw new Error("content-type must be application/json");
-  return request.json();
-}
-
-async function notifySlackOnRequestError(env: Env, details: { method: string; path: string; body: string | undefined; message: string }): Promise<void> {
-  if (!env.SLACK_WEBHOOK_URL) return;
-
-  try {
-    const text = [
-      "Worker request exception",
-      `method: ${details.method}`,
-      `path: ${details.path}`,
-      `body: ${formatSlackBody(details.body)}`,
-      `error: ${details.message}`
-    ].join("\n");
-
-    const response = await fetch(env.SLACK_WEBHOOK_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ text })
-    });
-
-    if (!response.ok) {
-      logWarn("slack.notify.failed", {
-        status: response.status,
-        path: details.path
-      });
-    }
-  } catch (error) {
-    logWarn("slack.notify.error", {
-      path: details.path,
-      message: errorMessage(error)
-    });
-  }
-}
-
-async function readRequestBody(request: Pick<Request, "text">): Promise<string | undefined> {
-  try {
-    const body = await request.text();
-    if (!body) return undefined;
-    return truncate(body, 3000);
-  } catch (error) {
-    return `[unavailable: ${errorMessage(error)}]`;
-  }
-}
-
-function formatSlackBody(body: string | undefined): string {
-  if (body === undefined) return "[empty]";
-  return body;
-}
-
-function truncate(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-  return `${value.slice(0, maxLength)}... [truncated]`;
-}
-
-function json(body: unknown, status = 200): Response {
-  return cors(Response.json(body, { status }));
-}
-
-function cors(response: Response): Response {
-  const headers = new Headers(response.headers);
-  headers.set("access-control-allow-origin", "*");
-  headers.set("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
-  headers.set("access-control-allow-headers", "content-type,authorization,x-api-key,x-gooddollar-account");
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-}
-
-function createStreamFundingId(account: string, date: Date): string {
-  const day = date.toISOString().slice(0, 10); // YYYY-MM-DD
-  return `stream:${day}:${account.toLowerCase()}`;
-}
-
-/**
- * Seconds of stream to credit on this run: the window from the later of the account's last stream
- * credit and the current stream revision's creation, up to `now`.
- *
- * The window is deliberately not capped: a long gap means the stream really did flow for that
- * whole time (a stalled cron, a backfill), and the credit should reflect it. What must not happen
- * is inventing a window out of a baseline we never had. When neither timestamp is usable the
- * answer is 0, not "since the epoch".
- */
-export function streamElapsedSeconds(now: Date, lastStreamCreditAt: string | undefined, streamLastUpdateAt?: string): number {
-  const lastCreditMs = lastStreamCreditAt ? Date.parse(lastStreamCreditAt) : 0;
-  const lastUpdateMs = streamLastUpdateAt ? Date.parse(streamLastUpdateAt) : 0;
-  // The later of the two wins. `lastStreamCreditAt` alone is not enough: it survives a stream being
-  // closed, so a user who closes a stream and opens a new one months later would be credited for
-  // the whole dormant gap. The stream's last on-chain update is a hard floor -- it moves forward on
-  // every create, rate change and close, so a stale clock can never be reached again.
-  //
-  // The trade-off: it also moves on a plain rate change, so when the resulting `StreamUpdated`
-  // event is not ingested (that endpoint is push-only, no retry) the window between the last credit
-  // and the rate change is skipped and never paid. Chosen deliberately -- it errs towards
-  // under-crediting rather than over-crediting.
-  const baselineMs = Math.max(Number.isFinite(lastCreditMs) ? lastCreditMs : 0, Number.isFinite(lastUpdateMs) ? lastUpdateMs : 0);
-  if (baselineMs <= 0) {
-    logWarn("stream.credits.unusable-baseline", { lastStreamCreditAt, streamLastUpdateAt });
-    return 0;
-  }
-  return Math.max(0, Math.floor((now.getTime() - baselineMs) / 1000));
-}
-
-/**
- * What a stream owes credit for, and over what window.
- *
- * Live stream: from the later of the last credit and the stream's last on-chain update, up to now,
- * at the rate the subgraph reports.
- *
- * Closed stream: from the last credit up to the **termination**, at the rate that was flowing before
- * it closed. The end has to be the termination rather than `now` -- the stream stopped carrying G$
- * then, so measuring to `now` would invent time it did not flow.
- *
- * NOTE: this branch has neither a floor (a closed stream's last update *is* its termination) nor a
- * ceiling, so a stale `lastStreamCreditAt` priced at a remembered rate can over-credit. Tracked in
- * the PR notes -- reading `streamPeriods` is the fix, not another guard.
- */
-function streamCreditAmount(input: {
-  now: Date;
-  lastStreamCreditAt: string | undefined;
-  stream: SuperfluidIncomingStream;
-  /** The rate recorded before this run zeroed it; only consulted for a closed stream. */
-  previousFlowRateWeiPerSecond: bigint;
-}): { elapsedSeconds: number; gdAmountWei: bigint } {
-  const flowRateWeiPerSecond = BigInt(input.stream.flowRateWeiPerSecond);
-  if (flowRateWeiPerSecond > 0n) {
-    const elapsedSeconds = streamElapsedSeconds(input.now, input.lastStreamCreditAt, input.stream.lastUpdateAt);
-    return { elapsedSeconds, gdAmountWei: flowRateWeiPerSecond * BigInt(elapsedSeconds) };
-  }
-
-  const terminatedAtMs = Date.parse(input.stream.lastUpdateAt);
-  const lastCreditMs = input.lastStreamCreditAt ? Date.parse(input.lastStreamCreditAt) : 0;
-  if (!Number.isFinite(terminatedAtMs) || terminatedAtMs <= 0 || !Number.isFinite(lastCreditMs) || lastCreditMs <= 0) {
-    logWarn("stream.credits.unusable-final-window", {
-      lastStreamCreditAt: input.lastStreamCreditAt,
-      terminatedAt: input.stream.lastUpdateAt
-    });
-    return { elapsedSeconds: 0, gdAmountWei: 0n };
-  }
-
-  const elapsedSeconds = Math.max(0, Math.floor((terminatedAtMs - lastCreditMs) / 1000));
-  return { elapsedSeconds, gdAmountWei: input.previousFlowRateWeiPerSecond * BigInt(elapsedSeconds) };
-}
-
-async function readAnalyticsRefreshTimestamp(kv: Pick<KVNamespace, "get">): Promise<number | undefined> {
-  const raw = await kv.get(ANALYTICS_REFRESH_LAST_RUN_KEY);
-  if (!raw) return undefined;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
-  return parsed;
-}
-
-async function readAnalyticsBackfillCursorDate(kv: Pick<KVNamespace, "get">): Promise<string | undefined> {
-  const raw = await kv.get(ANALYTICS_CRON_BACKFILL_CURSOR_KEY);
-  if (!raw || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return undefined;
-  return raw;
-}
-
-function dateDaysAgo(date: Date, days: number): string {
-  const shifted = new Date(date.getTime());
-  shifted.setUTCDate(shifted.getUTCDate() - days);
-  return shifted.toISOString().slice(0, 10);
-}
-
-function nextUtcDate(date: string): string | undefined {
-  const parsed = new Date(`${date}T00:00:00.000Z`);
-  if (Number.isNaN(parsed.getTime())) return undefined;
-  parsed.setUTCDate(parsed.getUTCDate() + 1);
-  return parsed.toISOString().slice(0, 10);
-}
-
-export async function fundCredit(
-  entry: GdCreditEntry,
-  store: KVCreditStore,
-  antseedFundingVault: AntSeedFundingVaultClient
-): Promise<{ [key: string]: unknown }> {
-  const buyer = entry.buyerAddress || entry.account;
-  if (entry.fundingStatus === "funded") {
-    logInfo("funding.already-funded", {
-      entryId: entry.id,
-      source: entry.source,
-      account: redactAddress(entry.account),
-      buyer: redactAddress(buyer),
-      fundingTxHash: redactHash(entry.fundingTxHash)
-    });
-    return {
-      ...entry,
-      bridge: {
-        enabled: antseedFundingVault.enabled,
-        buyer,
-        amountUsd: entry.totalCreditUsd,
-        txHash: entry.fundingTxHash,
-        alreadyFunded: true
-      }
-    };
-  }
-  const principalUsd = BigInt(entry.principalUsd);
-  const bonusUsd = BigInt(entry.bonusUsd);
-  logInfo("funding.start", {
-    entryId: entry.id,
-    source: entry.source,
-    account: redactAddress(entry.account),
-    buyer: redactAddress(buyer),
-    principalUsd: entry.principalUsd,
-    bonusUsd: entry.bonusUsd,
-    totalCreditUsd: entry.totalCreditUsd
-  });
-  try {
-    const shouldCredit = principalUsd + bonusUsd > 0n;
-    const bridge = shouldCredit
-      ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
-      : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
-    if (!shouldCredit) {
-      logInfo("funding.skipped.zero-amount", {
-        entryId: entry.id,
-        source: entry.source,
-        account: redactAddress(entry.account),
-        buyer: redactAddress(buyer)
-      });
-    } else if (!bridge.enabled) {
-      logWarn("funding.bridge.disabled", {
-        entryId: entry.id,
-        source: entry.source,
-        buyer: redactAddress(buyer)
-      });
-    }
-    const updated = await store.markFundingResult(entry, {
-      funded: true,
-      txHash: bridge.txHash,
-      error: undefined,
-      credited: shouldCredit
-    });
-    logInfo("funding.success", {
-      entryId: entry.id,
-      source: entry.source,
-      buyer: redactAddress(buyer),
-      txHash: redactHash(bridge.txHash),
-      bridgeEnabled: bridge.enabled
-    });
-    return { ...updated, bridge };
-  } catch (error) {
-    const message = errorMessage(error);
-    logError("funding.failed", {
-      entryId: entry.id,
-      source: entry.source,
-      account: redactAddress(entry.account),
-      buyer: redactAddress(buyer),
-      message
-    });
-    const updated = await store.markFundingResult(entry, {
-      funded: false,
-      error: message
-    });
-    return {
-      ...updated,
-      depositId: entry.id,
-      bridge: {
-        enabled: antseedFundingVault.enabled,
-        buyer,
-        amountUsd: entry.totalCreditUsd,
-        error: message
-      }
-    };
-  }
-}
-
-/**
- * Every stream to the vault, closed ones included. The scheduled run needs the closed rows: a
- * terminated stream reports `currentFlowRate = 0`, which is how the backend learns it stopped.
- */
-async function fetchSuperfluidIncomingStreams(cfg: ReturnType<typeof configFromEnv>): Promise<SuperfluidIncomingStream[]> {
-  return fetchSuperfluidStreams(cfg, undefined, true);
-}
-
-/** Active streams for one account; callers here use it to answer "is this account streaming now". */
-async function fetchSuperfluidStreamsForAccount(
-  account: string,
-  cfg: ReturnType<typeof configFromEnv>,
-  includeClosed = false
-): Promise<SuperfluidIncomingStream[]> {
-  return fetchSuperfluidStreams(cfg, account, includeClosed);
-}
-
-async function fetchSuperfluidStreams(
-  cfg: ReturnType<typeof configFromEnv>,
-  senderFilter?: string,
-  includeClosed = false
-): Promise<SuperfluidIncomingStream[]> {
-  if (!cfg.CELO_VAULT_ADDRESS || !cfg.CELO_GD_SUPERTOKEN_ADDRESS) {
-    logWarn("superfluid.streams.skipped", {
-      reason: "missing_config",
-      hasVaultAddress: Boolean(cfg.CELO_VAULT_ADDRESS),
-      hasSuperTokenAddress: Boolean(cfg.CELO_GD_SUPERTOKEN_ADDRESS),
-      senderFilter: redactAddress(senderFilter)
-    });
-    return [];
-  }
-
-  const endpoint = cfg.SUPERFLUID_SUBGRAPH_URL ?? SUPERFLUID_CELO_SUBGRAPH_URL;
-  const receiver = cfg.CELO_VAULT_ADDRESS.toLowerCase();
-  const token = cfg.CELO_GD_SUPERTOKEN_ADDRESS.toLowerCase();
-  const pageSize = 500;
-  let skip = 0;
-  const streams: SuperfluidIncomingStream[] = [];
-  let pages = 0;
-
-  logInfo("superfluid.streams.fetch.start", {
-    endpoint,
-    receiver: redactAddress(receiver),
-    token: redactAddress(token),
-    senderFilter: redactAddress(senderFilter)
-  });
-
-  try {
-    while (true) {
-      const filters = ["receiver: $receiver", "token: $token"];
-      if (!includeClosed) filters.push(`currentFlowRate_gt: "0"`);
-      if (senderFilter) filters.push("sender: $sender");
-      const whereClause = `{ ${filters.join(", ")} }`;
-      const queryParams = senderFilter
-        ? `$receiver: String!, $token: String!, $first: Int!, $skip: Int!, $sender: String!`
-        : `$receiver: String!, $token: String!, $first: Int!, $skip: Int!`;
-      const variables: Record<string, unknown> = {
-        receiver,
-        token,
-        first: pageSize,
-        skip
-      };
-      if (senderFilter) variables.sender = senderFilter.toLowerCase();
-
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json"
-        },
-        body: JSON.stringify({
-          query: `
-            query ActiveIncomingStreams(${queryParams}) {
-              streams(
-                first: $first
-                skip: $skip
-                where: ${whereClause}
-                orderBy: updatedAtTimestamp
-                orderDirection: desc
-              ) {
-                sender { id }
-                currentFlowRate
-                updatedAtTimestamp
-                flowUpdatedEvents(orderBy: timestamp, orderDirection: desc, first: 1) {
-                  userData
-                }
-              }
-            }
-          `,
-          variables
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(`Superfluid subgraph HTTP ${response.status}`);
-      }
-
-      const body = await response.json();
-      const parsed = SuperfluidStreamsResponseSchema.safeParse(body);
-      if (!parsed.success) {
-        throw new Error("invalid Superfluid subgraph response shape");
-      }
-
-      const batch = parsed.data.data.streams.map((stream) => {
-        const flowRateWeiPerSecond = stream.currentFlowRate;
-        const updatedAtSeconds = Number(stream.updatedAtTimestamp);
-        // A zero `updatedAtTimestamp` must not become 1970: this is the baseline for an account's
-        // first stream credit, so a 1970 value makes that credit window decades wide.
-        const hasUsableUpdatedAt = Number.isFinite(updatedAtSeconds) && updatedAtSeconds > 0;
-        const lastUpdateAt = hasUsableUpdatedAt ? new Date(updatedAtSeconds * 1000).toISOString() : new Date().toISOString();
-        const rawUserData = stream.flowUpdatedEvents[0]?.userData;
-        const buyerAddress = decodeBuyerFromUserData(rawUserData);
-        return {
-          account: stream.sender.id.toLowerCase(),
-          flowRateWeiPerSecond,
-          lastUpdateAt,
-          buyerAddress
-        };
-      });
-
-      streams.push(...batch);
-      pages += 1;
-
-      if (batch.length < pageSize) break;
-      skip += pageSize;
-    }
-  } catch (error) {
-    const message = errorMessage(error);
-    logError("superfluid.streams.fetch.failed", {
-      endpoint,
-      receiver: redactAddress(receiver),
-      token: redactAddress(token),
-      senderFilter: redactAddress(senderFilter),
-      message
-    });
-    return [];
-  }
-
-  logInfo("superfluid.streams.fetch.end", {
-    endpoint,
-    senderFilter: redactAddress(senderFilter),
-    pages,
-    count: streams.length
-  });
-
-  return streams;
-}

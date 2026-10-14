@@ -28,6 +28,7 @@ export class KVCreditStore {
     regularBonusBps?: bigint;
     streamingBonusBps?: bigint;
     buyerAddress?: string;
+    streamCreditedThrough?: string;
   }): Promise<GdCreditEntry> {
     const account = normalizeAccount(input.account);
     const rootAccount = normalizeAccount(input.rootAccount ?? input.account);
@@ -78,7 +79,8 @@ export class KVCreditStore {
       createdAt: now,
       ...(input.buyerAddress && {
         buyerAddress: input.buyerAddress.toLowerCase()
-      })
+      }),
+      ...(input.streamCreditedThrough && { streamCreditedThrough: input.streamCreditedThrough })
     };
 
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
@@ -158,13 +160,17 @@ export class KVCreditStore {
     entry: GdCreditEntry,
     result: { funded: boolean; id?: string; txHash?: string; error?: string; credited?: boolean }
   ): Promise<GdCreditEntry> {
-    if (entry.fundingStatus === "funded" || entry.fundingStatus === "failed") {
+    // Re-read: a concurrent request for the same id may have settled it while this one was funding,
+    // and its result must not be overwritten (funded -> failed) or counted twice.
+    const stored = await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${entry.id}`);
+    const settled = entry.fundingStatus !== "pending" ? entry : stored && stored.fundingStatus !== "pending" ? stored : undefined;
+    if (settled) {
       logWarn("kv.funding.already-terminal", {
         entryId: entry.id,
         account: redactAddress(entry.account),
-        fundingStatus: entry.fundingStatus
+        fundingStatus: settled.fundingStatus
       });
-      return entry;
+      return settled;
     }
 
     entry.fundingStatus = result.funded ? "funded" : "failed";
@@ -172,19 +178,23 @@ export class KVCreditStore {
     entry.fundingError = result.error;
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
 
-    // `funded` and `failed` are both terminal -- funding is never retried for an entry -- so either
-    // way the entry stops being outstanding. Only a funded entry adds to the lifetime totals; a
-    // failed one must leave them untouched, or the G$ counters drift above the credit actually
-    // granted (what produced a 6.2M G$ "deposited" profile against a $4 balance).
+    // `funded` and `failed` both end this attempt (a failed stream window is retried only through
+    // `retryFailedFunding`), so either way the entry stops being outstanding. Only a funded entry
+    // adds to the lifetime totals; a failed one must leave them untouched, or the G$ counters drift
+    // above the credit actually granted (what produced a 6.2M G$ "deposited" profile against a $4
+    // balance).
     const now = new Date().toISOString();
     const credited = result.funded && result.credited !== false;
     await this.updateUser(entry.account, entry.rootAccount, (current) => {
       const outstanding = BigInt(current.totalOutstandingFundingUsd);
       const creditAmount = BigInt(entry.totalCreditUsd);
+      // The stream clock belongs to the streaming account alone; mirroring it onto the GoodID root
+      // would skip the root's own stream window.
+      const advancesStreamClock = result.funded && entry.streamCreditedThrough !== undefined && current.account === entry.account;
       return {
         ...current,
         updatedAt: now,
-        lastStreamCreditAt: result.funded && entry.source.startsWith("stream") ? now : current.lastStreamCreditAt,
+        lastStreamCreditAt: advancesStreamClock ? laterIso(current.lastStreamCreditAt, entry.streamCreditedThrough!) : current.lastStreamCreditAt,
         totalGdDepositedWei: credited ? addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei) : current.totalGdDepositedWei,
         totalGDStreamedWei:
           credited && entry.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
@@ -202,6 +212,41 @@ export class KVCreditStore {
       error: result.error
     });
     return entry;
+  }
+
+  /**
+   * Put a failed entry back to `pending` so it can be funded again under the same id. Safe because the
+   * id is what `depositForWithId` dedupes on: if the failed attempt actually landed, the retry is
+   * recognised as already funded rather than paid twice.
+   */
+  async retryFailedFunding(entry: GdCreditEntry): Promise<GdCreditEntry> {
+    if (entry.fundingStatus !== "failed") return entry;
+    const now = new Date().toISOString();
+    const retry: GdCreditEntry = { ...entry, fundingStatus: "pending", fundingError: undefined };
+    await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, retry);
+    await this.updateUser(entry.account, entry.rootAccount, (current) => ({
+      ...current,
+      updatedAt: now,
+      totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd)
+    }));
+    logInfo("kv.funding.retry", { entryId: entry.id, account: redactAddress(entry.account), previousError: entry.fundingError });
+    return retry;
+  }
+
+  /**
+   * Move the account's stream clock up to a funded entry's window end, if it is not there already.
+   * Repairs the case where the entry was marked funded but the profile write that follows was lost;
+   * without it the account would hit the same window id on every run and never be credited again.
+   * Returns whether a write was needed.
+   */
+  async advanceStreamClock(entry: GdCreditEntry): Promise<boolean> {
+    if (entry.fundingStatus !== "funded" || !entry.streamCreditedThrough) return false;
+    const profile = await this.getUser(entry.account);
+    const next = laterIso(profile.lastStreamCreditAt, entry.streamCreditedThrough);
+    if (next === profile.lastStreamCreditAt) return false;
+    await this.putJson(`${USER_PREFIX}${profile.account}`, { ...profile, lastStreamCreditAt: next, updatedAt: new Date().toISOString() });
+    logWarn("kv.stream.clock-repaired", { entryId: entry.id, account: redactAddress(entry.account), lastStreamCreditAt: next });
+    return true;
   }
 
   async getGdCredits(account: string): Promise<GdCreditEntry[]> {
@@ -336,6 +381,10 @@ function normalizeProfile(saved: Partial<UserCreditProfile> | undefined, account
 
 function normalizeAccount(account: string): string {
   return account.toLowerCase();
+}
+
+function laterIso(current: string | undefined, next: string): string {
+  return current && Date.parse(current) > Date.parse(next) ? current : next;
 }
 
 function addDecimalStrings(a: string, b: string): string {
