@@ -57,7 +57,7 @@ export type Entry = z.infer<typeof EntrySchema>;
  */
 export function rebuildCounters(entries: Entry[]): Record<(typeof REBUILT)[number], string> {
   const sum = (rows: Entry[], field: "gdAmountWei" | "totalCreditUsd") => rows.reduce((total, row) => total + BigInt(row[field]), 0n);
-  const funded = entries.filter((entry) => entry.fundingStatus === "funded");
+  const funded = entries.filter((entry) => entry.fundingStatus === "funded" && BigInt(entry.totalCreditUsd) > 0n);
   return {
     totalGDStreamedWei: sum(
       funded.filter((entry) => entry.source.startsWith("stream")),
