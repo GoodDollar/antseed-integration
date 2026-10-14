@@ -68,6 +68,17 @@ test("nextBuyerWindow runs to asOf when the buyer never changes", () => {
   assert.equal(window?.owedWei, 100n * 1_000n + 200n * 2_000n, "each rate priced for its own span");
 });
 
+// The window's start, which is what the cooldown must be aged from. Measuring from the clock instead
+// makes `asOf - clock` the whole Unix epoch on a first credit, so a 24h cooldown always passes.
+test("nextBuyerWindow reports where the window begins", () => {
+  const periods = [period(100n, 1_000, 2_000), period(100n, 2_000)];
+  assert.equal(nextBuyerWindow(periods, 0, 5_000)?.from, 1_000, "a first credit begins at the stream, not at the epoch");
+  assert.equal(nextBuyerWindow(periods, 3_000, 5_000)?.from, 3_000, "mid-stream it begins at the clock");
+  // A stream reopened after a long gap: the stale clock predates the new period, so the window begins
+  // at the reopen and a cooldown aged from it still holds.
+  assert.equal(nextBuyerWindow([period(100n, 9_000)], 1_000, 9_060)?.from, 9_000, "a reopen begins at the new period");
+});
+
 test("nextBuyerWindow returns undefined when nothing is owed", () => {
   const periods: StreamPeriod[] = [{ id: "p1", account: "0xabc", flowRateWeiPerSecond: 100n, startedAt: 1_000, stoppedAt: 2_000 }];
   assert.equal(nextBuyerWindow(periods, 2_000, 5_000), undefined);

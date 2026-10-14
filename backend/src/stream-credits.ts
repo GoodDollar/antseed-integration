@@ -97,7 +97,7 @@ export async function creditStreams(
     // while its periods ran. The next run continues from `through` and settles the next segment.
     const window = nextBuyerWindow(accountPeriods, creditedThrough, asOf);
     if (!window) continue;
-    const { buyerAddress, owedWei: gdAmountWei, through } = window;
+    const { buyerAddress, owedWei: gdAmountWei, from, through } = window;
     if (gdAmountWei === 0n) continue;
     const flowRate = liveFlowRate(accountPeriods);
     // The cooldown and the minimum hold back an open-ended window on a live stream, to avoid paying
@@ -105,7 +105,11 @@ export async function creditStreams(
     // never grows, so gating it would stall the account's clock permanently and nothing after the
     // change would ever be credited. A cut window is a settlement boundary, like a close.
     if (flowRate > 0n && through === asOf) {
-      if (asOf - creditedThrough < STREAM_CREDIT_COOLDOWN_SECONDS) {
+      // Aged from the window's own start, not from the clock. On a first credit the clock is 0, so
+      // `asOf - creditedThrough` is the whole Unix epoch and the cooldown always passed; a stream
+      // reopened after a long gap inherits a stale clock and passes just as trivially. Either way the
+      // gate was decorative for exactly the accounts it exists to cover.
+      if (asOf - from < STREAM_CREDIT_COOLDOWN_SECONDS) {
         counts.skippedCooldown += 1;
         continue;
       }

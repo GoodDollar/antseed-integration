@@ -137,6 +137,87 @@ function subgraphMock(account: string, scenario: ReturnType<typeof closedStreamS
   }) as typeof fetch;
 }
 
+/** A single live period, opened `ageSeconds` ago at `rate`, with no profile: the first-credit shape. */
+function liveStreamMock(account: string, nowSeconds: number, openedAt: number, rate: bigint) {
+  return (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    if (typeof body.query === "string" && body.query.includes("streamPeriods")) {
+      return Response.json({
+        data: {
+          _meta: { block: { timestamp: nowSeconds } },
+          streamPeriods: [
+            {
+              id: `${account}-period-0`,
+              sender: { id: account },
+              flowRate: rate.toString(),
+              startedAtTimestamp: openedAt.toString(),
+              stoppedAtTimestamp: null,
+              startedAtEvent: { userData: "0x" }
+            }
+          ]
+        }
+      });
+    }
+    if (body.method === "eth_call") {
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x000000000000000000000000abababababababababababababababababababab" });
+    }
+    return Response.json({ data: { streams: [] } });
+  }) as typeof fetch;
+}
+
+// A first-time streamer has no `lastStreamCreditAt`, so the clock is 0 and `asOf - clock` is the whole
+// Unix epoch -- a cooldown aged from the clock always passed. The rate here is deliberately high
+// enough (4000 G$ in an hour) to clear MIN_STREAM_BONUS_WEI, so the cooldown is the only gate left.
+test("a live stream opened an hour ago is held by the cooldown on its first credit", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000b10";
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const rate = 2_000_000_000_000_000_000n; // 2 G$/s -> 7200 G$ in an hour, well over the 4000 G$ minimum
+  const kv = new MemoryKV();
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const onChain = stubOnChainFunding();
+  try {
+    console.log = (() => {}) as typeof console.log;
+    globalThis.fetch = liveStreamMock(account, nowSeconds, nowSeconds - 3600, rate);
+    const { ctx, settle } = trackingContext();
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv(kv), ctx);
+    await settle();
+    assert.deepEqual(await new KVCreditStore(kv as never).getGdCredits(account), [], "nothing may be credited an hour in");
+    assert.equal(onChain.funded.size, 0, "and no deposit may land");
+  } finally {
+    onChain.restore();
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
+// The same stream past the cooldown must still be credited -- the gate delays a first credit, it does
+// not block one. Without this, a stall would look identical to a working cooldown.
+test("the same stream is credited once it is older than the cooldown", { concurrency: false }, async () => {
+  const account = "0x0000000000000000000000000000000000000b11";
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const rate = 2_000_000_000_000_000_000n;
+  const openedAt = nowSeconds - 2 * DAY;
+  const kv = new MemoryKV();
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const onChain = stubOnChainFunding();
+  try {
+    console.log = (() => {}) as typeof console.log;
+    globalThis.fetch = liveStreamMock(account, nowSeconds, openedAt, rate);
+    const { ctx, settle } = trackingContext();
+    await worker.scheduled({ scheduledTime: Date.now(), cron: "0 */6 * * *" } as unknown as ScheduledEvent, testEnv(kv), ctx);
+    await settle();
+    const entries = await new KVCreditStore(kv as never).getGdCredits(account);
+    assert.equal(entries.length, 1, "a stream two days old is past the cooldown");
+    assert.equal(totalFundedGdWei(entries), rate * BigInt(nowSeconds - openedAt), "and is priced from the stream, not the epoch");
+  } finally {
+    onChain.restore();
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
 function totalFundedGdWei(entries: Array<{ gdAmountWei: string; fundingStatus: string }>): bigint {
   return entries.filter((entry) => entry.fundingStatus === "funded").reduce((sum, entry) => sum + BigInt(entry.gdAmountWei), 0n);
 }

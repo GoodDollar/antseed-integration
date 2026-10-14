@@ -89,7 +89,8 @@ export function cors(response: Response): Response {
  * The deposit id is the window's start (`stream:<account>:<creditedThrough>`). Two runs that overlap
  * read the same clock, derive the same id and are funded once: `depositForWithId` dedupes on it.
  *
- * Live streams are gated by a 24h cooldown and `MIN_STREAM_BONUS_WEI`. An account whose streams have
+ * Live streams are gated by a 24h cooldown -- aged from the window's own start, so a first-time or
+ * reopened stream is held like any other -- and by `MIN_STREAM_BONUS_WEI`. An account whose streams have
  * all closed is settled in full regardless, so its final tail is paid out and the closed-periods
  * cursor can move past it.
  */

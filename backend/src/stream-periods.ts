@@ -185,12 +185,16 @@ function sameBuyer(a: string | undefined, b: string | undefined): boolean {
  * Periods are sequential, so cutting the window at the first change is enough: every period
  * overlapping the returned window shares one buyer. The next run continues from `through` and
  * credits the following segment.
+ *
+ * `from` is where the window actually begins -- the earliest unpaid period's start, or the clock when
+ * the clock is later. On a first credit the clock is 0 and the window begins at the stream, so callers
+ * that age the window must measure from `from` rather than from the clock.
  */
 export function nextBuyerWindow(
   periods: StreamPeriod[],
   creditedThrough: number,
   asOf: number
-): { buyerAddress?: string; owedWei: bigint; through: number } | undefined {
+): { buyerAddress?: string; owedWei: bigint; from: number; through: number } | undefined {
   const unpaid = periods
     .filter((period) => Math.min(period.stoppedAt ?? asOf, asOf) > Math.max(period.startedAt, creditedThrough))
     .sort((left, right) => left.startedAt - right.startedAt);
@@ -203,7 +207,11 @@ export function nextBuyerWindow(
     through = Math.max(creditedThrough, period.startedAt);
     break;
   }
-  return { buyerAddress, owedWei: streamOwedWei(periods, creditedThrough, through), through };
+  // `unpaid` is sorted, so the earliest start is the window's start. Derived here rather than in the
+  // caller: re-deriving it there would duplicate the filter above, and the two drifting apart would
+  // age a different window than the one being priced.
+  const from = Math.max(unpaid[0].startedAt, creditedThrough);
+  return { buyerAddress, owedWei: streamOwedWei(periods, creditedThrough, through), from, through };
 }
 
 
