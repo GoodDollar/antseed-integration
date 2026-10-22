@@ -4,6 +4,20 @@ pragma solidity ^0.8.24;
 import {CeloGdAntSeedVault, IERC20Like, ISuperfluidHostLike} from "../src/CeloGdAntSeedVault.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
+interface Vm {
+    struct Log {
+        bytes32[] topics;
+        bytes data;
+        address emitter;
+    }
+
+    function warp(uint256 newTimestamp) external;
+
+    function recordLogs() external;
+
+    function getRecordedLogs() external returns (Log[] memory logs);
+}
+
 contract MockGdToken is IERC20Like {
     mapping(address => uint256) public override balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
@@ -102,6 +116,13 @@ contract MockSuperfluidHost {
         registeredConfigWord = configWord;
     }
 
+    /// @dev Sends raw calldata to `target` with the Host as msg.sender; bubbles up any revert.
+    function forward(address target, bytes calldata data) external returns (bytes memory) {
+        (bool ok, bytes memory ret) = target.call(data);
+        require(ok, "FORWARD_FAILED");
+        return ret;
+    }
+
     /// @dev For testing:
     /// - stream callbacks: ctx = abi.encode(buyer) → userData only
     /// - depositFromAction: ctx = abi.encode(msgSender, userData)
@@ -127,13 +148,14 @@ contract MockSuperfluidHost {
 
     function terminateFlow(CeloGdAntSeedVault vault, address superToken, address sender, bytes calldata ctx) external returns (bytes memory) {
         bytes memory cbdata = vault.beforeAgreementTerminated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), ctx);
-        cfa.setFlowAt(sender, 0, block.timestamp);
+        // Timestamp 0: the vault must not depend on the CFA reporting a timestamp for a deleted flow.
+        cfa.setFlowAt(sender, 0, 0);
         return vault.afterAgreementTerminated(superToken, address(cfa), bytes32(0), abi.encode(sender, address(vault)), cbdata, ctx);
     }
 
-    /// @dev Simulates a Superfluid batch call: the host calls depositFrom on the vault on behalf of `sender`.
-    function callDepositFrom(CeloGdAntSeedVault vault, address sender, uint256 amount, bytes calldata data) external returns (uint256) {
-        return vault.depositFrom(sender, amount, data);
+    /// @dev Fires the termination callback with arbitrary agreement data, as the Host would for any flow.
+    function callAfterTerminated(CeloGdAntSeedVault vault, address superToken, address agreementClass, bytes calldata agreementData) external returns (bytes memory) {
+        return vault.afterAgreementTerminated(superToken, agreementClass, bytes32(0), agreementData, "", "");
     }
 
     /// @dev Simulates Host CALL_APP_ACTION → depositFromAction with injected ctx.msgSender.
@@ -266,9 +288,15 @@ contract Outsider {
     function registerSuperApp(uint256 w) external {
         vault.registerSuperApp(w);
     }
+
+    function sweepToken(address t, address to, uint256 a) external {
+        vault.sweepToken(t, to, a);
+    }
 }
 
 contract CeloGdAntSeedVaultTest {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
     MockGdToken token;
     MockCFA cfa;
     MockSuperfluidHost host;
@@ -706,33 +734,170 @@ contract CeloGdAntSeedVaultTest {
         require(vault.gdUsdPerToken(1e18) == (uint256(1e18) * 1e18) / vault.fallbackGdUsdPerToken(), "falls back when cusd not set");
     }
 
-    // --- depositFrom via Superfluid batch ---
+    // --- depositFrom removed ---
 
-    /// @dev Superfluid batch calls invoke `depositFrom(sender, amount, data)` on behalf of the user.
-    ///      The vault must record the deposit under `sender` and pull tokens from `sender`, not msg.sender (the host).
-    function testDepositFromViaSuperfluidBatch() public {
-        setUp();
-        // Pre-approve vault to pull tokens from `user`.
-        user.approveVault(75 ether);
-
-        // Route through MockSuperfluidHost so msg.sender == host (onlySuperfluidHost passes).
-        (bool ok, bytes memory retData) = address(host).call(
-            abi.encodeWithSignature("callDepositFrom(address,address,uint256,bytes)", address(vault), address(user), uint256(75 ether), abi.encode(BUYER))
-        );
-        require(ok, "depositFrom via host succeeded");
-        uint256 total = abi.decode(retData, (uint256));
-
-        require(total == 75 ether, "returned total matches");
-        require(vault.totalDepositedGd(address(user)) == 75 ether, "deposit recorded under sender");
-        require(token.balanceOf(address(vault)) == 75 ether, "vault holds transferred tokens");
-    }
-
-    function testDepositFromRejectsNonHost() public {
+    /// @dev `depositFrom` let the Host pull from any approved account; only `depositFromAction` remains.
+    function testDepositFromIsRemoved() public {
         setUp();
         user.approveVault(10 ether);
-        // Calling depositFrom directly (not from the host) must revert.
-        (bool ok, ) = address(vault).call(abi.encodeWithSignature("depositFrom(address,uint256,bytes)", address(user), uint256(10 ether), abi.encode(BUYER)));
-        require(!ok, "non-host depositFrom rejected");
+        (bool ok, ) = address(host).call(
+            abi.encodeCall(
+                MockSuperfluidHost.forward,
+                (address(vault), abi.encodeWithSignature("depositFrom(address,uint256,bytes)", address(user), uint256(10 ether), abi.encode(BUYER)))
+            )
+        );
+        require(!ok, "depositFrom not callable");
+        require(token.balanceOf(address(vault)) == 0, "nothing pulled");
+    }
+
+    // --- sweepToken ---
+
+    function testSweepTokenRecoversGdSentWithoutCallback() public {
+        setUp();
+        // Plain transfer: no callback, so the vault holds G$ it never credited.
+        token.mint(address(vault), 50 ether);
+        address recipient = address(0xCAFE);
+
+        vault.sweepToken(address(token), recipient, 50 ether);
+
+        require(token.balanceOf(recipient) == 50 ether, "recipient received");
+        require(token.balanceOf(address(vault)) == 0, "vault emptied");
+    }
+
+    function testSweepTokenRecoversUnrelatedToken() public {
+        setUp();
+        MockGdToken other = new MockGdToken();
+        other.mint(address(vault), 7 ether);
+        vault.sweepToken(address(other), address(0xCAFE), 7 ether);
+        require(other.balanceOf(address(0xCAFE)) == 7 ether, "other token swept");
+    }
+
+    function testSweepTokenOnlyOwner() public {
+        setUp();
+        token.mint(address(vault), 1 ether);
+        Outsider outsider = new Outsider(vault);
+        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(token), address(outsider), uint256(1 ether)));
+        require(!ok, "non-owner sweep rejected");
+        require(token.balanceOf(address(vault)) == 1 ether, "funds untouched");
+    }
+
+    function testSweepTokenRejectsInvalidArgs() public {
+        setUp();
+        token.mint(address(vault), 1 ether);
+
+        (bool ok, ) = address(vault).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(0), address(0xCAFE), uint256(1)));
+        require(!ok, "zero token rejected");
+
+        (ok, ) = address(vault).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(token), address(0), uint256(1)));
+        require(!ok, "zero recipient rejected");
+
+        (ok, ) = address(vault).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(token), address(0xCAFE), uint256(0)));
+        require(!ok, "zero amount rejected");
+
+        // An EOA "token" would make the low-level call succeed silently.
+        (ok, ) = address(vault).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(0xE0A), address(0xCAFE), uint256(1)));
+        require(!ok, "non-contract token rejected");
+    }
+
+    function testSweepTokenRevertsWhenTransferFails() public {
+        setUp();
+        FailingToken failToken = new FailingToken();
+        (bool ok, ) = address(vault).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(failToken), address(0xCAFE), uint256(1)));
+        require(!ok, "failed transfer reverts");
+    }
+
+    // --- stream termination must never revert (a revert gets the app jailed) ---
+
+    function testTerminationDoesNotRevertWhenBuyerWasNeverRecorded() public {
+        setUp();
+        // Stream predates `streamBuyer` tracking: no stored buyer for the sender.
+        cfa.setFlow(address(user), 0);
+        (bool ok, ) = address(host).call(
+            abi.encodeWithSignature("callAfterTerminated(address,address,address,bytes)", address(vault), address(token), address(cfa), abi.encode(address(user), address(vault)))
+        );
+        require(ok, "termination without stored buyer must not revert");
+    }
+
+    function testTerminationDoesNotRevertAfterConfigChange() public {
+        setUp();
+        host.createFlow(vault, address(token), address(user), 38580246913580, abi.encode(BUYER));
+
+        // Owner re-points the agreement while the stream is still open.
+        vault.setSuperfluidConfig(address(host), address(new MockCFA()));
+        (bool ok, ) = address(host).call(
+            abi.encodeWithSignature("terminateFlow(address,address,address,bytes)", address(vault), address(token), address(user), abi.encode(BUYER))
+        );
+        require(ok, "termination with changed agreement must not revert");
+    }
+
+    function testTerminationDoesNotRevertForWrongTokenOrReceiver() public {
+        setUp();
+        host.createFlow(vault, address(token), address(user), 38580246913580, abi.encode(BUYER));
+
+        (bool ok, ) = address(host).call(
+            abi.encodeWithSignature("callAfterTerminated(address,address,address,bytes)", address(vault), address(0xBAD), address(cfa), abi.encode(address(user), address(vault)))
+        );
+        require(ok, "wrong token must not revert");
+
+        (ok, ) = address(host).call(
+            abi.encodeWithSignature("callAfterTerminated(address,address,address,bytes)", address(vault), address(token), address(cfa), abi.encode(address(user), address(0xBEEF)))
+        );
+        require(ok, "wrong receiver must not revert");
+    }
+
+    function testTerminationReportsElapsedFlowUsingBlockTimestamp() public {
+        setUp();
+        int96 flowRate = 38580246913580;
+        uint256 start = block.timestamp;
+        host.createFlow(vault, address(token), address(user), flowRate, abi.encode(BUYER));
+
+        vm.warp(start + 1000);
+        vm.recordLogs();
+        host.terminateFlow(vault, address(token), address(user), abi.encode(BUYER));
+
+        (address buyer_, int96 reportedRate, uint256 monthly, uint256 totalFlow) = _lastStreamUpdated();
+        require(buyer_ == BUYER, "terminated stream keeps buyer");
+        require(reportedRate == 0, "flow ended");
+        require(monthly == 0, "no monthly amount");
+        require(totalFlow == uint256(uint96(flowRate)) * 1000, "elapsed flow from block.timestamp");
+    }
+
+    // --- update uses the stored buyer ---
+
+    function testUpdateIgnoresUserDataAndKeepsStoredBuyer() public {
+        setUp();
+        host.createFlow(vault, address(token), address(user), 38580246913580, abi.encode(BUYER));
+
+        vm.recordLogs();
+        host.updateFlow(vault, address(token), address(user), 77160493827160, abi.encode(address(0xFEED)));
+
+        (address buyer_, , , ) = _lastStreamUpdated();
+        require(buyer_ == BUYER, "update credits stored buyer");
+        require(vault.streamBuyer(address(user)) == BUYER, "stored buyer unchanged");
+    }
+
+    function testUpdateWithoutStoredBuyerReverts() public {
+        setUp();
+        cfa.setFlow(address(user), 0);
+        (bool ok, ) = address(host).call(
+            abi.encodeWithSignature("updateFlow(address,address,address,int96,bytes)", address(vault), address(token), address(user), int96(38580246913580), abi.encode(BUYER))
+        );
+        require(!ok, "update without a recorded buyer rejected");
+    }
+
+    /// @dev Decodes the most recent StreamUpdated log emitted by the vault.
+    function _lastStreamUpdated() internal returns (address buyer_, int96 flowRate, uint256 monthly, uint256 totalFlow) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("StreamUpdated(address,address,int96,uint256,uint256)");
+        for (uint256 i = logs.length; i > 0; i--) {
+            Vm.Log memory l = logs[i - 1];
+            if (l.emitter == address(vault) && l.topics[0] == sig) {
+                buyer_ = address(uint160(uint256(l.topics[2])));
+                (flowRate, monthly, totalFlow) = abi.decode(l.data, (int96, uint256, uint256));
+                return (buyer_, flowRate, monthly, totalFlow);
+            }
+        }
+        revert("StreamUpdated not found");
     }
 
     function testDepositFromActionViaCallAppAction() public {

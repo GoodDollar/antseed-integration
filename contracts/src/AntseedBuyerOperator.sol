@@ -37,7 +37,8 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     mapping(address => uint256) public principalRemaining;
     mapping(address => uint256) public bonusRemaining;
     mapping(address => uint256) public lastAccountedBalance;
-    mapping(address => bool) public buyerAccountingMigrated;
+    /// @dev Slot kept for upgrade-safe storage layout; the accounting migration was removed.
+    mapping(address => bool) private _deprecatedBuyerAccountingMigrated;
     mapping(address => uint256) public usedNonces;
 
     uint256[50] private __gap;
@@ -55,9 +56,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     event BuyerDepositWithdrawn(address indexed buyer, address indexed recipient, uint256 amount);
     event BuyerPrincipalWithdrawn(address indexed buyer, address indexed recipient, uint256 amount);
     event BuyerBonusWithdrawn(address indexed buyer, uint256 amount);
-    event BuyerAccountingMigrated(address indexed buyer, uint256 principalRemaining, uint256 bonusRemaining, uint256 accountedBalance);
     event BuyerOperatorRevoked(address indexed buyer);
-    event BuyerOperatorTransferred(address indexed buyer, address indexed newOperator);
     event ChannelCloseRequested(bytes32 indexed channelId, address indexed buyer, address indexed caller);
     event ChannelWithdrawn(bytes32 indexed channelId, address indexed buyer, address indexed caller);
     event TokenSwept(address indexed token, address indexed recipient, uint256 amount);
@@ -73,7 +72,6 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     error InsufficientPrincipal();
     error InvalidSignature();
     error InvalidNonce();
-    error AlreadyMigrated();
     error CloseChannelsBeforeRevoke(uint256 reserved);
 
     modifier onlyAdmin() {
@@ -297,61 +295,6 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
 
     function revokeOperator(address buyer) external {
         revokeOperator(buyer, 0, "");
-    }
-
-    function _migrateBuyerAccounting(address buyer) internal {
-        if (buyer == address(0)) revert InvalidAddress();
-        if (buyerAccountingMigrated[buyer]) revert AlreadyMigrated();
-
-        (uint256 available, uint256 reserved, ) = _deposits().getBuyerBalance(buyer);
-        uint256 currentBalance = available + reserved;
-
-        uint256 principal = totalPrincipalDeposited[buyer] - totalPrincipalWithdrawn[buyer];
-        uint256 bonus = totalBonusDeposited[buyer] - totalBonusWithdrawn[buyer];
-        uint256 totalTracked = principal + bonus;
-
-        if (totalTracked > currentBalance) {
-            uint256 used = totalTracked - currentBalance;
-            uint256 principalUsed = _min(used, principal);
-            principal -= principalUsed;
-            used -= principalUsed;
-
-            if (used > 0) {
-                bonus -= _min(used, bonus);
-            }
-        }
-
-        principalRemaining[buyer] = principal;
-        bonusRemaining[buyer] = bonus;
-        lastAccountedBalance[buyer] = currentBalance;
-        buyerAccountingMigrated[buyer] = true;
-
-        emit BuyerAccountingMigrated(buyer, principal, bonus, currentBalance);
-    }
-
-    /// @notice One-time migration helper for a single buyer funded before remaining-balance accounting existed.
-    /// @dev Computes remaining principal/bonus from tracked totals and current deposit balance.
-    function migrateBuyerAccounting(address buyer) external onlyAdmin {
-        _migrateBuyerAccounting(buyer);
-    }
-
-    /// @notice One-time migration helper for multiple buyers funded before remaining-balance accounting existed.
-    /// @dev Reverts if any buyer is invalid or already migrated.
-    function migrateBuyerAccounting(address[] calldata buyers) external onlyAdmin {
-        uint256 len = buyers.length;
-        for (uint256 i = 0; i < len; i++) {
-            _migrateBuyerAccounting(buyers[i]);
-        }
-    }
-
-    /// @notice Transfers the operator role for a buyer to a new operator address. without enforcing any bonus withdrawal or channel closure. This function is intended for administrative use only.
-    /// @param buyer The address of the buyer whose operator role is being transferred.
-    /// @param newOperator The address of the new operator to be assigned to the buyer.
-    function transferBuyerOperator(address buyer, address newOperator) external nonReentrant onlyAdmin {
-        if (buyer == address(0)) revert InvalidAddress();
-        _withdrawUnusedBonus(buyer);
-        _deposits().transferOperator(buyer, newOperator);
-        emit BuyerOperatorTransferred(buyer, newOperator);
     }
 
     function requestClose(bytes32 channelId, uint256 nonce, bytes memory buyerSig) public nonReentrant {

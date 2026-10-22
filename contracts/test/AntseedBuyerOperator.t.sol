@@ -550,93 +550,6 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "invalid nonce rejected");
     }
 
-    function testMigrateBuyerAccountingComputesRemainingFromTrackedTotals() public {
-        setUp();
-        usdc.mint(address(operator), 100_000_000);
-
-        operator.acceptBuyerOperator(buyer, 1, "");
-        operator.depositFor(buyer, 10_000_000, 2_000_000);
-        deposits.consume(buyer, 3_000_000);
-
-        operator.migrateBuyerAccounting(buyer);
-
-        require(operator.principalRemaining(buyer) == 7_000_000, "principal recomputed");
-        require(operator.bonusRemaining(buyer) == 2_000_000, "bonus recomputed");
-        require(operator.lastAccountedBalance(buyer) == 9_000_000, "accounted balance set");
-        require(operator.buyerAccountingMigrated(buyer), "migration flagged");
-
-        bool ok;
-        try operator.migrateBuyerAccounting(buyer) {
-            ok = true;
-        } catch {
-            ok = false;
-        }
-        require(!ok, "double migration rejected");
-    }
-
-    function testMigrateBuyerAccountingBatch() public {
-        setUp();
-        usdc.mint(address(operator), 100_000_000);
-
-        address buyer2 = address(0xB0C);
-
-        operator.acceptBuyerOperator(buyer, 1, "");
-        operator.acceptBuyerOperator(buyer2, 1, "");
-
-        operator.depositFor(buyer, 10_000_000, 2_000_000);
-        operator.depositFor(buyer2, 6_000_000, 1_000_000);
-
-        deposits.consume(buyer, 3_000_000);
-        deposits.consume(buyer2, 1_500_000);
-
-        address[] memory buyers = new address[](2);
-        buyers[0] = buyer;
-        buyers[1] = buyer2;
-        operator.migrateBuyerAccounting(buyers);
-
-        require(operator.principalRemaining(buyer) == 7_000_000, "buyer1 principal recomputed");
-        require(operator.bonusRemaining(buyer) == 2_000_000, "buyer1 bonus recomputed");
-        require(operator.lastAccountedBalance(buyer) == 9_000_000, "buyer1 accounted balance set");
-
-        require(operator.principalRemaining(buyer2) == 4_500_000, "buyer2 principal recomputed");
-        require(operator.bonusRemaining(buyer2) == 1_000_000, "buyer2 bonus recomputed");
-        require(operator.lastAccountedBalance(buyer2) == 5_500_000, "buyer2 accounted balance set");
-
-        require(operator.buyerAccountingMigrated(buyer), "buyer1 migration flagged");
-        require(operator.buyerAccountingMigrated(buyer2), "buyer2 migration flagged");
-    }
-
-    function testTransferBuyerOperatorWithdrawsOnlyAvailableBonus() public {
-        setUp();
-        usdc.mint(address(operator), 100_000_000);
-        operator.acceptBuyerOperator(buyer, 1, "");
-        operator.depositFor(buyer, 5_000_000, 2_000_000);
-        deposits.reserve(buyer, 2_000_000);
-
-        address newOp = address(0xC0DE);
-        operator.transferBuyerOperator(buyer, newOp);
-
-        require(deposits.getOperator(buyer) == newOp, "operator transferred");
-        require(deposits.available(buyer) == 5_000_000, "available principal preserved");
-        require(deposits.reserved(buyer) == 2_000_000, "reserved funds untouched");
-        require(operator.totalBonusWithdrawn(buyer) == 0, "reserved bonus not withdrawn");
-    }
-
-    function testTransferBuyerOperatorAfterNonOperatorFundingKeepsPrincipalIntact() public {
-        setUp();
-        usdc.mint(address(operator), 100_000_000);
-
-        operator.depositFor(buyer, 3_000_000, 1_000_000);
-
-        address newOp = address(0xA11CE);
-        operator.transferBuyerOperator(buyer, newOp);
-
-        require(deposits.getOperator(buyer) == newOp, "operator transferred");
-        require(deposits.available(buyer) == 3_000_000, "principal untouched");
-        require(operator.totalBonusDeposited(buyer) == 0, "bonus never credited");
-        require(operator.totalBonusWithdrawn(buyer) == 0, "no bonus withdrawal");
-    }
-
     function testWithdrawPrincipalRejectsWrongSigner() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
@@ -904,8 +817,6 @@ contract AntseedBuyerOperatorTest {
         (ok, ) = address(outsider).call(abi.encodeWithSignature("callApproveCurrentDeposits()"));
         require(!ok, "outsider cannot approveCurrentDeposits");
 
-        (ok, ) = address(outsider).call(abi.encodeWithSignature("callTransferBuyerOperator(address,address)", buyer, address(outsider)));
-        require(!ok, "outsider cannot transferBuyerOperator");
     }
 
     // ─── sweepToken ───
@@ -944,22 +855,41 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "outsider cannot approveCurrentDeposits");
     }
 
-    // ─── transferBuyerOperator ───
+    // ─── removed admin paths ───
 
-    function testTransferBuyerOperatorWorks() public {
+    /// @dev The admin must have no way to hand a buyer's operator role to an arbitrary address.
+    function testRemovedAdminFunctionsAreNotCallable() public {
         setUp();
         operator.acceptBuyerOperator(buyer, 1, "");
-        address newOp = address(0xC0DE);
-        operator.transferBuyerOperator(buyer, newOp);
-        require(deposits.getOperator(buyer) == newOp, "operator transferred");
+
+        (bool ok, ) = address(operator).call(abi.encodeWithSignature("transferBuyerOperator(address,address)", buyer, address(0xBAD)));
+        require(!ok, "transferBuyerOperator removed");
+        require(deposits.getOperator(buyer) == address(operator), "operator unchanged");
+
+        (ok, ) = address(operator).call(abi.encodeWithSignature("migrateBuyerAccounting(address)", buyer));
+        require(!ok, "migrateBuyerAccounting(address) removed");
+
+        address[] memory buyers = new address[](1);
+        buyers[0] = buyer;
+        (ok, ) = address(operator).call(abi.encodeWithSignature("migrateBuyerAccounting(address[])", buyers));
+        require(!ok, "migrateBuyerAccounting(address[]) removed");
+
+        (ok, ) = address(operator).call(abi.encodeWithSignature("buyerAccountingMigrated(address)", buyer));
+        require(!ok, "buyerAccountingMigrated getter removed");
     }
 
-    function testTransferBuyerOperatorOnlyAdmin() public {
+    /// @dev Revoking is the remaining way out: it must still release the buyer's operator slot and unused bonus.
+    function testRevokeOperatorStillWorksAfterAccountingRemoval() public {
         setUp();
+        usdc.mint(address(operator), 100_000_000);
         operator.acceptBuyerOperator(buyer, 1, "");
-        AdminActor outsider = new AdminActor(operator);
-        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("callTransferBuyerOperator(address,address)", buyer, address(outsider)));
-        require(!ok, "outsider cannot transferBuyerOperator");
+        operator.depositFor(buyer, 5_000_000, 2_000_000);
+
+        operator.revokeOperator(buyer);
+
+        require(deposits.getOperator(buyer) == address(0), "operator revoked");
+        require(deposits.available(buyer) == 5_000_000, "principal left in deposits");
+        require(operator.totalBonusWithdrawn(buyer) == 2_000_000, "unused bonus clawed back");
     }
 }
 
@@ -994,10 +924,6 @@ contract AdminActor {
 
     function callApproveCurrentDeposits() external {
         operator.approveCurrentDeposits();
-    }
-
-    function callTransferBuyerOperator(address buyer_, address newOp) external {
-        operator.transferBuyerOperator(buyer_, newOp);
     }
 
     function callUpgrade(address proxy, address newImpl) external {
