@@ -154,17 +154,17 @@ contract MockSuperfluidHost {
     }
 
     /// @dev Fires the termination callback with arbitrary agreement data, as the Host would for any flow.
-    function callAfterTerminated(CeloGdAntSeedVault vault, address superToken, address agreementClass, bytes calldata agreementData) external returns (bytes memory) {
+    function callAfterTerminated(
+        CeloGdAntSeedVault vault,
+        address superToken,
+        address agreementClass,
+        bytes calldata agreementData
+    ) external returns (bytes memory) {
         return vault.afterAgreementTerminated(superToken, agreementClass, bytes32(0), agreementData, "", "");
     }
 
     /// @dev Simulates Host CALL_APP_ACTION → depositFromAction with injected ctx.msgSender.
-    function callDepositFromAction(
-        CeloGdAntSeedVault vault,
-        address sender,
-        uint256 amount,
-        bytes calldata data
-    ) external returns (bytes memory) {
+    function callDepositFromAction(CeloGdAntSeedVault vault, address sender, uint256 amount, bytes calldata data) external returns (bytes memory) {
         return vault.depositFromAction(amount, data, abi.encode(sender, bytes("")));
     }
 
@@ -776,7 +776,9 @@ contract CeloGdAntSeedVaultTest {
         setUp();
         token.mint(address(vault), 1 ether);
         Outsider outsider = new Outsider(vault);
-        (bool ok, ) = address(outsider).call(abi.encodeWithSignature("sweepToken(address,address,uint256)", address(token), address(outsider), uint256(1 ether)));
+        (bool ok, ) = address(outsider).call(
+            abi.encodeWithSignature("sweepToken(address,address,uint256)", address(token), address(outsider), uint256(1 ether))
+        );
         require(!ok, "non-owner sweep rejected");
         require(token.balanceOf(address(vault)) == 1 ether, "funds untouched");
     }
@@ -813,7 +815,13 @@ contract CeloGdAntSeedVaultTest {
         // Stream predates `streamBuyer` tracking: no stored buyer for the sender.
         cfa.setFlow(address(user), 0);
         (bool ok, ) = address(host).call(
-            abi.encodeWithSignature("callAfterTerminated(address,address,address,bytes)", address(vault), address(token), address(cfa), abi.encode(address(user), address(vault)))
+            abi.encodeWithSignature(
+                "callAfterTerminated(address,address,address,bytes)",
+                address(vault),
+                address(token),
+                address(cfa),
+                abi.encode(address(user), address(vault))
+            )
         );
         require(ok, "termination without stored buyer must not revert");
     }
@@ -835,12 +843,24 @@ contract CeloGdAntSeedVaultTest {
         host.createFlow(vault, address(token), address(user), 38580246913580, abi.encode(BUYER));
 
         (bool ok, ) = address(host).call(
-            abi.encodeWithSignature("callAfterTerminated(address,address,address,bytes)", address(vault), address(0xBAD), address(cfa), abi.encode(address(user), address(vault)))
+            abi.encodeWithSignature(
+                "callAfterTerminated(address,address,address,bytes)",
+                address(vault),
+                address(0xBAD),
+                address(cfa),
+                abi.encode(address(user), address(vault))
+            )
         );
         require(ok, "wrong token must not revert");
 
         (ok, ) = address(host).call(
-            abi.encodeWithSignature("callAfterTerminated(address,address,address,bytes)", address(vault), address(token), address(cfa), abi.encode(address(user), address(0xBEEF)))
+            abi.encodeWithSignature(
+                "callAfterTerminated(address,address,address,bytes)",
+                address(vault),
+                address(token),
+                address(cfa),
+                abi.encode(address(user), address(0xBEEF))
+            )
         );
         require(ok, "wrong receiver must not revert");
     }
@@ -880,7 +900,14 @@ contract CeloGdAntSeedVaultTest {
         setUp();
         cfa.setFlow(address(user), 0);
         (bool ok, ) = address(host).call(
-            abi.encodeWithSignature("updateFlow(address,address,address,int96,bytes)", address(vault), address(token), address(user), int96(38580246913580), abi.encode(BUYER))
+            abi.encodeWithSignature(
+                "updateFlow(address,address,address,int96,bytes)",
+                address(vault),
+                address(token),
+                address(user),
+                int96(38580246913580),
+                abi.encode(BUYER)
+            )
         );
         require(!ok, "update without a recorded buyer rejected");
     }
@@ -905,13 +932,7 @@ contract CeloGdAntSeedVaultTest {
         user.approveVault(40 ether);
 
         (bool ok, bytes memory retData) = address(host).call(
-            abi.encodeWithSignature(
-                "callDepositFromAction(address,address,uint256,bytes)",
-                address(vault),
-                address(user),
-                uint256(40 ether),
-                abi.encode(BUYER)
-            )
+            abi.encodeWithSignature("callDepositFromAction(address,address,uint256,bytes)", address(vault), address(user), uint256(40 ether), abi.encode(BUYER))
         );
         require(ok, "depositFromAction via host succeeded");
         bytes memory returnedCtx = abi.decode(retData, (bytes));
@@ -924,12 +945,7 @@ contract CeloGdAntSeedVaultTest {
         setUp();
         user.approveVault(10 ether);
         (bool ok, ) = address(vault).call(
-            abi.encodeWithSignature(
-                "depositFromAction(uint256,bytes,bytes)",
-                uint256(10 ether),
-                abi.encode(BUYER),
-                abi.encode(address(user), bytes(""))
-            )
+            abi.encodeWithSignature("depositFromAction(uint256,bytes,bytes)", uint256(10 ether), abi.encode(BUYER), abi.encode(address(user), bytes("")))
         );
         require(!ok, "non-host depositFromAction rejected");
     }
@@ -938,13 +954,7 @@ contract CeloGdAntSeedVaultTest {
         setUp();
         user.approveVault(10 ether);
         (bool ok, ) = address(host).call(
-            abi.encodeWithSignature(
-                "callDepositFromAction(address,address,uint256,bytes)",
-                address(vault),
-                address(0),
-                uint256(10 ether),
-                abi.encode(BUYER)
-            )
+            abi.encodeWithSignature("callDepositFromAction(address,address,uint256,bytes)", address(vault), address(0), uint256(10 ether), abi.encode(BUYER))
         );
         require(!ok, "zero msgSender depositFromAction rejected");
     }

@@ -6,6 +6,7 @@ import {IAntseedChannels} from "../src/interfaces/IAntseedChannels.sol";
 import {IAntseedDeposits} from "../src/interfaces/IAntseedDeposits.sol";
 import {IAntseedRegistry} from "../src/interfaces/IAntseedRegistry.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 interface Vm {
     function sign(uint256 privateKey, bytes32 digest) external pure returns (uint8 v, bytes32 r, bytes32 s);
@@ -13,6 +14,22 @@ interface Vm {
     function addr(uint256 privateKey) external pure returns (address);
 
     function warp(uint256 newTimestamp) external;
+
+    function etch(address target, bytes calldata newRuntimeBytecode) external;
+}
+
+/// @dev Minimal ERC-1271 smart wallet that approves digests signed by its owner key.
+contract Mock1271Wallet {
+    address public immutable owner;
+
+    constructor(address owner_) {
+        owner = owner_;
+    }
+
+    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
+        (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecoverCalldata(hash, signature);
+        return err == ECDSA.RecoverError.NoError && recovered == owner ? bytes4(0x1626ba7e) : bytes4(0xffffffff);
+    }
 }
 
 contract TestUsdc is IERC20 {
@@ -816,7 +833,6 @@ contract AntseedBuyerOperatorTest {
 
         (ok, ) = address(outsider).call(abi.encodeWithSignature("callApproveCurrentDeposits()"));
         require(!ok, "outsider cannot approveCurrentDeposits");
-
     }
 
     // ─── sweepToken ───
@@ -890,6 +906,108 @@ contract AntseedBuyerOperatorTest {
         require(deposits.getOperator(buyer) == address(0), "operator revoked");
         require(deposits.available(buyer) == 5_000_000, "principal left in deposits");
         require(operator.totalBonusWithdrawn(buyer) == 2_000_000, "unused bonus clawed back");
+    }
+
+    // ─── ERC-1271 ───
+
+    function _requireInvalidSignature(bytes memory callData, string memory reason) internal {
+        (bool ok, bytes memory ret) = address(operator).call(callData);
+        require(!ok && bytes4(ret) == AntseedBuyerOperator.InvalidSignature.selector, reason);
+    }
+
+    function testWithdrawPrincipalWithErc1271WalletSig() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        address wallet = address(new Mock1271Wallet(vm.addr(BUYER_PK)));
+        operator.acceptBuyerOperator(wallet, 1, "");
+        operator.depositFor(wallet, 5_000_000, 1_000_000);
+
+        bytes memory sig = _signWithdraw(BUYER_PK, wallet, 2_000_000, recipient, 0);
+        operator.withdrawPrincipal(wallet, 2_000_000, recipient, 0, sig);
+
+        require(usdc.balanceOf(recipient) == 2_000_000, "recipient paid");
+        require(operator.usedNonces(wallet) == 1, "nonce consumed");
+
+        (bool ok, ) = address(operator).call(abi.encodeCall(AntseedBuyerOperator.withdrawPrincipal, (wallet, 2_000_000, recipient, 0, sig)));
+        require(!ok, "replay rejected");
+    }
+
+    function testErc1271WalletRejectsSigFromOtherKey() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        address wallet = address(new Mock1271Wallet(vm.addr(BUYER_PK)));
+        operator.acceptBuyerOperator(wallet, 1, "");
+        operator.depositFor(wallet, 5_000_000, 1_000_000);
+
+        bytes memory badSig = _signWithdraw(0xDEAD, wallet, 2_000_000, recipient, 0);
+        _requireInvalidSignature(
+            abi.encodeCall(AntseedBuyerOperator.withdrawPrincipal, (wallet, 2_000_000, recipient, 0, badSig)),
+            "wallet rejected foreign key"
+        );
+        require(operator.usedNonces(wallet) == 0, "nonce untouched");
+    }
+
+    function testRevokeOperatorWithErc1271WalletSig() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        address wallet = address(new Mock1271Wallet(vm.addr(BUYER_PK)));
+        operator.acceptBuyerOperator(wallet, 1, "");
+        operator.depositFor(wallet, 4_000_000, 1_000_000);
+
+        operator.revokeOperator(wallet, 0, _signRevokeOperator(BUYER_PK, wallet, 0));
+
+        require(deposits.getOperator(wallet) == address(0), "operator revoked");
+        require(operator.totalBonusWithdrawn(wallet) == 1_000_000, "bonus clawed back");
+        require(operator.usedNonces(wallet) == 1, "nonce consumed");
+    }
+
+    function testChannelActionsWithErc1271WalletSig() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-1271");
+        address wallet = address(new Mock1271Wallet(vm.addr(BUYER_PK)));
+        channels.setChannelBuyer(channelId, wallet);
+
+        operator.requestClose(channelId, 0, _signRequestClose(BUYER_PK, channelId, 0));
+        operator.withdrawChannel(channelId, 1, _signWithdrawChannel(BUYER_PK, channelId, 1));
+
+        require(channels.requestCloseCalls() == 1, "requestClose forwarded");
+        require(channels.withdrawCalls() == 1, "withdrawChannel forwarded");
+        require(operator.usedNonces(wallet) == 2, "both nonces consumed");
+
+        _requireInvalidSignature(
+            abi.encodeWithSignature("requestClose(bytes32,uint256,bytes)", channelId, uint256(2), _signRequestClose(0xDEAD, channelId, 2)),
+            "requestClose rejects foreign key"
+        );
+        _requireInvalidSignature(
+            abi.encodeWithSignature("withdrawChannel(bytes32,uint256,bytes)", channelId, uint256(2), _signWithdrawChannel(0xDEAD, channelId, 2)),
+            "withdrawChannel rejects foreign key"
+        );
+    }
+
+    function testContractBuyerWithoutErc1271IsRejected() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-no-1271");
+        channels.setChannelBuyer(channelId, address(new OperatorCaller(operator)));
+
+        _requireInvalidSignature(
+            abi.encodeWithSignature("requestClose(bytes32,uint256,bytes)", channelId, uint256(0), _signRequestClose(BUYER_PK, channelId, 0)),
+            "contract without isValidSignature rejected"
+        );
+        require(channels.requestCloseCalls() == 0, "nothing forwarded");
+    }
+
+    /// @dev EIP-7702 EOAs have code; their own key must still work when the delegate lacks ERC-1271.
+    function testEoaWithCodeStillAcceptsEcdsaSig() public {
+        setUp();
+        bytes32 channelId = keccak256("channel-7702");
+        address buyerAddr = vm.addr(BUYER_PK);
+        vm.etch(buyerAddr, hex"00");
+        channels.setChannelBuyer(channelId, buyerAddr);
+
+        operator.requestClose(channelId, 0, _signRequestClose(BUYER_PK, channelId, 0));
+
+        require(channels.requestCloseCalls() == 1, "requestClose forwarded");
+        require(operator.usedNonces(buyerAddr) == 1, "nonce consumed");
     }
 }
 

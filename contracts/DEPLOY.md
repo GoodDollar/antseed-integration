@@ -41,7 +41,7 @@ DEPLOYER_PRIVATE_KEY=0x<64-hex-chars>
 OWNER_ADDRESS=0x<multisig-or-owner-address>
 
 # ── Celo (CeloGdAntSeedVault) ────────────────────────────────────────────────
-GD_TOKEN=0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c14       # G$ ERC-20 on Celo mainnet
+GD_TOKEN=0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A       # G$ ERC-20 on Celo mainnet
 SUPERFLUID_HOST=0x<superfluid-host-celo>                   # Superfluid Host on Celo
 CFA_V1=0x<cfa-v1-celo>                                     # ConstantFlowAgreementV1 on Celo
 

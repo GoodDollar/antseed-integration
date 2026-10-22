@@ -27,7 +27,11 @@ interface ICfa {
 
     function deleteFlow(address token, address sender, address receiver, bytes calldata ctx) external returns (bytes memory);
 
-    function getFlow(address token, address sender, address receiver) external view returns (uint256 timestamp, int96 flowRate, uint256 deposit, uint256 owedDeposit);
+    function getFlow(
+        address token,
+        address sender,
+        address receiver
+    ) external view returns (uint256 timestamp, int96 flowRate, uint256 deposit, uint256 owedDeposit);
 }
 
 interface ISuperToken {
@@ -85,11 +89,7 @@ contract CeloGdAntSeedVaultForkTest is Test {
 
     function _createFlow(address sender, address buyer_) internal {
         vm.prank(sender);
-        HOST.callAgreement(
-            address(cfa),
-            abi.encodeCall(ICfa.createFlow, (address(GD), address(vault), FLOW_RATE, new bytes(0))),
-            abi.encode(buyer_)
-        );
+        HOST.callAgreement(address(cfa), abi.encodeCall(ICfa.createFlow, (address(GD), address(vault), FLOW_RATE, new bytes(0))), abi.encode(buyer_));
     }
 
     // --- upgrade ---
@@ -191,22 +191,14 @@ contract CeloGdAntSeedVaultForkTest is Test {
         _fund(user, 300_000 ether);
         vm.prank(user);
         vm.expectRevert();
-        HOST.callAgreement(
-            address(cfa),
-            abi.encodeCall(ICfa.createFlow, (address(GD), address(vault), FLOW_RATE, new bytes(0))),
-            ""
-        );
+        HOST.callAgreement(address(cfa), abi.encodeCall(ICfa.createFlow, (address(GD), address(vault), FLOW_RATE, new bytes(0))), "");
     }
 
     function testCfaCreateBelowMonthlyMinimumReverts() public {
         _fund(user, 300_000 ether);
         vm.prank(user);
         vm.expectRevert();
-        HOST.callAgreement(
-            address(cfa),
-            abi.encodeCall(ICfa.createFlow, (address(GD), address(vault), int96(1e9), new bytes(0))),
-            abi.encode(buyer)
-        );
+        HOST.callAgreement(address(cfa), abi.encodeCall(ICfa.createFlow, (address(GD), address(vault), int96(1e9), new bytes(0))), abi.encode(buyer));
     }
 
     // --- termination must never jail the app ---

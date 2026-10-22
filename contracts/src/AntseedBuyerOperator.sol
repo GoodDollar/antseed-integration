@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -204,17 +205,11 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     /// @param buyer The buyer whose principal is being withdrawn.
     /// @param amount The amount in USDC micro-units to withdraw.
     /// @param recipient The address to receive the withdrawn USDC.
-    /// @param buyerSig The buyer's EIP-712 signature authorizing this withdrawal.
+    /// @param buyerSig The buyer's EIP-712 signature (ECDSA, or ERC-1271 for contract wallets) authorizing this withdrawal.
     function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 nonce, bytes calldata buyerSig) external nonReentrant {
         if (buyer == address(0) || recipient == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
-        if (nonce != usedNonces[buyer]) revert InvalidNonce();
-
-        bytes32 structHash = keccak256(abi.encode(WITHDRAW_TYPEHASH, buyer, amount, recipient, nonce));
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-        address signer = ECDSA.recoverCalldata(digest, buyerSig);
-        if (signer == address(0) || signer != buyer) revert InvalidSignature();
-        usedNonces[buyer] = nonce + 1;
+        _useBuyerSig(buyer, nonce, keccak256(abi.encode(WITHDRAW_TYPEHASH, buyer, amount, recipient, nonce)), buyerSig);
 
         _requireDepositsOperator(buyer);
         _accountForUsage(buyer);
@@ -281,12 +276,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
 
     function revokeOperator(address buyer, uint256 nonce, bytes memory buyerSig) public nonReentrant {
         if (buyerSig.length > 0) {
-            if (nonce != usedNonces[buyer]) revert InvalidNonce();
-            bytes32 structHash = keccak256(abi.encode(REVOKE_OPERATOR_TYPEHASH, buyer, nonce));
-            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-            address signer = ECDSA.recover(digest, buyerSig);
-            if (signer == address(0) || signer != buyer) revert InvalidSignature();
-            usedNonces[buyer] = nonce + 1;
+            _useBuyerSig(buyer, nonce, keccak256(abi.encode(REVOKE_OPERATOR_TYPEHASH, buyer, nonce)), buyerSig);
         } else {
             _requireBuyerOrAdmin(buyer);
         }
@@ -300,12 +290,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     function requestClose(bytes32 channelId, uint256 nonce, bytes memory buyerSig) public nonReentrant {
         address buyer = _channelBuyer(channelId);
         if (buyerSig.length > 0) {
-            if (nonce != usedNonces[buyer]) revert InvalidNonce();
-            bytes32 structHash = keccak256(abi.encode(REQUEST_CLOSE_TYPEHASH, channelId, nonce));
-            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-            address signer = ECDSA.recover(digest, buyerSig);
-            if (signer == address(0) || signer != buyer) revert InvalidSignature();
-            usedNonces[buyer] = nonce + 1;
+            _useBuyerSig(buyer, nonce, keccak256(abi.encode(REQUEST_CLOSE_TYPEHASH, channelId, nonce)), buyerSig);
         } else {
             _requireBuyerOrAdmin(buyer);
         }
@@ -320,12 +305,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     function withdrawChannel(bytes32 channelId, uint256 nonce, bytes memory buyerSig) public nonReentrant {
         address buyer = _channelBuyer(channelId);
         if (buyerSig.length > 0) {
-            if (nonce != usedNonces[buyer]) revert InvalidNonce();
-            bytes32 structHash = keccak256(abi.encode(WITHDRAW_CHANNEL_TYPEHASH, channelId, nonce));
-            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-            address signer = ECDSA.recover(digest, buyerSig);
-            if (signer == address(0) || signer != buyer) revert InvalidSignature();
-            usedNonces[buyer] = nonce + 1;
+            _useBuyerSig(buyer, nonce, keccak256(abi.encode(WITHDRAW_CHANNEL_TYPEHASH, channelId, nonce)), buyerSig);
         } else {
             _requireBuyerOrAdmin(buyer);
         }
@@ -355,6 +335,21 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     function _requireBuyerOrAdmin(address buyer) internal view {
         if (msg.sender == admin || msg.sender == owner || msg.sender == buyer) return;
         revert NotBuyerOrAdmin();
+    }
+
+    /// @dev Checks `nonce`, verifies the buyer's EIP-712 signature over `structHash`, then consumes the nonce.
+    function _useBuyerSig(address buyer, uint256 nonce, bytes32 structHash, bytes memory buyerSig) internal {
+        if (nonce != usedNonces[buyer]) revert InvalidNonce();
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        if (!_isValidBuyerSig(buyer, digest, buyerSig)) revert InvalidSignature();
+        usedNonces[buyer] = nonce + 1;
+    }
+
+    /// @dev Buyer ECDSA sig, else ERC-1271 if buyer has code; ECDSA first keeps EIP-7702 EOAs working.
+    function _isValidBuyerSig(address buyer, bytes32 digest, bytes memory buyerSig) internal view returns (bool) {
+        (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(digest, buyerSig);
+        if (err == ECDSA.RecoverError.NoError && recovered == buyer) return true;
+        return buyer.code.length > 0 && SignatureChecker.isValidERC1271SignatureNow(buyer, digest, buyerSig);
     }
 
     function _channelBuyer(bytes32 channelId) internal view returns (address buyer) {
