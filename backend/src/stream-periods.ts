@@ -108,7 +108,7 @@ export async function fetchStreamPeriods(cfg: RuntimeConfig, closedAfter: number
                 flowRate
                 startedAtTimestamp
                 stoppedAtTimestamp
-                startedAtEvent { userData }
+                startedAtEvent { userData, oldFlowRate }
               }
             }
           `,
