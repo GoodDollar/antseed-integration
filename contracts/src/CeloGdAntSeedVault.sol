@@ -51,8 +51,9 @@ interface IStaticOracleLike {
 
 /// @title CeloGdAntSeedVault
 /// @notice Celo-side G$ vault for AntSeed credits. No bridge logic is included.
-/// @dev Accepts direct ERC-20 deposits, ERC677/667 transferAndCall callbacks, ERC777 callbacks,
-///      and Superfluid SuperApp stream callbacks. Backend converts G$ events into USDC-denominated credits.
+/// @dev Accepts direct ERC-20 deposits, ERC677 `transferAndCall` callbacks, Superfluid `batchCall` deposits
+///      (`depositFromAction`) and Superfluid SuperApp stream callbacks. The backend converts the emitted
+///      events into USDC-denominated credits. G$ is held here; the owner can recover it with `sweepToken`.
 contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     error NotOwner();
     error ZeroAddress();
@@ -73,12 +74,16 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     address public superfluidHost;
     address public cfaV1;
     address public staticOracle;
+    /// @notice Minimum USD value (18 decimals) of an account's first deposit.
     uint256 public minFirstDepositUsd;
+    /// @notice Minimum USD value (18 decimals) of a stream's 30-day amount.
     uint256 public minMonthlyStreamUsd;
+    /// @notice G$ wei that equal 1 USD (18 decimals); used by `gdUsdPerToken` only when the oracle is unavailable.
     uint256 public fallbackGdUsdPerToken;
 
+    /// @notice Lifetime G$ deposited per account through the deposit paths (not streams).
     mapping(address => uint256) public totalDepositedGd;
-    mapping(address => int96) private _unsued_streamFlowRate;
+    mapping(address => int96) private _unused_streamFlowRate;
     mapping(address => uint256) private _unused_streamMonthlyGdAmount;
     /// @notice AntSeed buyer account funded when stream credits are settled for each sender.
     mapping(address => address) public streamBuyer;
@@ -91,6 +96,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     event SuperfluidConfigUpdated(address indexed host, address indexed cfaV1);
     event StaticOracleUpdated(address indexed staticOracle, address indexed staticOracleCusd);
     event MinimumsUpdated(uint256 minFirstDepositUsd, uint256 minMonthlyStreamUsd, uint256 fallbackGdUsdPerToken);
+    event TokenSwept(address indexed token, address indexed recipient, uint256 amount);
     /// @dev `buyer` is the AntSeed buyer account to credit, decoded from the `data` payload (abi.encode(buyerAddress)).
     event GdDeposited(address indexed account, address indexed buyer, uint256 gdAmount, bytes data);
     /// @dev `buyer` is the AntSeed buyer account decoded from Superfluid userdata (abi.encode(buyerAddress)).
@@ -177,33 +183,15 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         return totalDepositedGd[msg.sender];
     }
 
-    /// @notice for superfluid batch calls deposit path. `data` must be `abi.encode(buyerAddress)` — the AntSeed buyer to credit.
-    /// @param sender The account sending the G$ tokens.
-    /// @param amount The G$ amount to transfer.
-    /// @param data ABI-encoded AntSeed buyer address: `abi.encode(buyerAddress)`. Required.
-    /// @return The total G$ deposited by the sender (including this callback)
-    function depositFrom(address sender, uint256 amount, bytes calldata data) external onlySuperfluidHost returns (uint256) {
-        return _executeDepositFrom(sender, amount, data);
-    }
-
-    /// @notice CALL_APP_ACTION wrapper for Host `batchCall`. Leaves `depositFrom` unchanged.
-    /// @dev Trailing `ctx` is the Superfluid placeholder the Host replaces. Depositor = `decodeCtx(ctx).msgSender`.
-    ///      `data` remains `abi.encode(buyerAddress)` (app payload — not Superfluid ctx).
-    function depositFromAction(
-        uint256 amount,
-        bytes calldata data,
-        bytes calldata ctx
-    ) external onlySuperfluidHost returns (bytes memory newCtx) {
+    /// @notice `CALL_APP_ACTION` entry point for Superfluid `batchCall` (approve + deposit in one transaction).
+    /// @dev The Host replaces the trailing `ctx` placeholder; the depositor is `decodeCtx(ctx).msgSender`.
+    ///      `data` is `abi.encode(buyerAddress)`, the AntSeed buyer to credit.
+    function depositFromAction(uint256 amount, bytes calldata data, bytes calldata ctx) external onlySuperfluidHost returns (bytes memory newCtx) {
         address sender = ISuperfluidHostLike(superfluidHost).decodeCtx(ctx).msgSender;
         if (sender == address(0)) revert ZeroAddress();
-        _executeDepositFrom(sender, amount, data);
-        return ctx;
-    }
-
-    function _executeDepositFrom(address sender, uint256 amount, bytes calldata data) private returns (uint256) {
         _recordTokenCallbackDeposit(sender, amount, data);
         _safeTransferFrom(sender, address(this), amount);
-        return totalDepositedGd[sender];
+        return ctx;
     }
 
     /// @notice ERC677 / ERC667 transferAndCall receiver.
@@ -253,7 +241,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
         bytes memory userData = ISuperfluidHostLike(superfluidHost).decodeCtx(ctx).userData;
         address buyer = _decodeBuyer(userData);
-        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer, false);
         return ctx;
     }
 
@@ -265,9 +253,9 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        bytes memory userData = ISuperfluidHostLike(superfluidHost).decodeCtx(ctx).userData;
-        address buyer = _decodeBuyer(userData);
-        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer);
+        (address sender, ) = abi.decode(agreementData, (address, address));
+        address buyer = streamBuyer[sender];
+        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer, false);
         return ctx;
     }
 
@@ -281,7 +269,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
         (address sender, ) = abi.decode(agreementData, (address, address));
         address buyer = streamBuyer[sender];
-        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer);
+        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer, true);
         return ctx;
     }
 
@@ -294,18 +282,40 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         emit GdDeposited(account, buyer, amount, data);
     }
 
-    function _recordStream(address superToken, address agreementClass, bytes calldata agreementData, bytes calldata cbdata, address buyer) private {
-        if (superToken != address(gdToken)) revert UnsupportedToken();
-        if (agreementClass != cfaV1) revert UnsupportedAgreement();
-        if (buyer == address(0)) revert MissingBuyerAddress();
+    function _recordStream(
+        address superToken,
+        address agreementClass,
+        bytes calldata agreementData,
+        bytes calldata cbdata,
+        address buyer,
+        bool skipRevert
+    ) private {
+        // A reverting termination callback gets the app jailed by Superfluid, so it must never revert.
+        if (superToken != address(gdToken)) {
+            if (skipRevert) return;
+            revert UnsupportedToken();
+        }
+        if (agreementClass != cfaV1) {
+            if (skipRevert) return;
+            revert UnsupportedAgreement();
+        }
+        if (buyer == address(0)) {
+            if (skipRevert) return;
+            revert MissingBuyerAddress();
+        }
 
         (address sender, address receiver) = abi.decode(agreementData, (address, address));
-        if (receiver != address(this)) revert WrongReceiver();
+        if (receiver != address(this)) {
+            if (skipRevert) return;
+            revert WrongReceiver();
+        }
 
         streamBuyer[sender] = buyer;
 
+        // CFA reports timestamp 0 for a deleted flow, so use the block time as the end of the elapsed window.
+        uint256 currentTimestamp = block.timestamp;
         (uint256 previousTimestamp, int96 previousFlowRate) = _decodeFlowSnapshot(cbdata);
-        (uint256 currentTimestamp, int96 flowRate, , ) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
+        (, int96 flowRate, , ) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
         if (flowRate < 0) revert NegativeFlowRate();
 
         uint256 monthlyAmount = uint256(uint96(flowRate)) * 30 days;
@@ -334,7 +344,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         return abi.encode(timestamp, flowRate);
     }
 
-    /// @dev Decodes the AntSeed buyer address from `data` (abi.encode(address)). Returns address(0) if absent/invalid.
+    /// @dev Decodes `abi.encode(address)`. Returns address(0) if `data` is shorter than 32 bytes; reverts if the word is not a valid address.
     function _decodeBuyer(bytes memory data) private pure returns (address buyer) {
         if (data.length < 32) return address(0);
         return abi.decode(data, (address));
@@ -345,13 +355,25 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         return abi.decode(cbdata, (uint256, int96));
     }
 
+    /// @notice Recovers G$ (e.g. sent without a deposit callback) or any other token held by the vault.
+    function sweepToken(address token, address recipient, uint256 amount) external onlyOwner {
+        if (token == address(0) || recipient == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        // A call to an EOA succeeds with empty returndata, which would report a sweep that moved nothing.
+        if (token.code.length == 0) revert TransferFailed();
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, recipient, amount));
+        if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
+        emit TokenSwept(token, recipient, amount);
+    }
+
     function _safeTransferFrom(address from, address to, uint256 amount) private {
         (bool ok, bytes memory data) = address(gdToken).call(abi.encodeWithSelector(IERC20Like.transferFrom.selector, from, to, amount));
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
     }
 
-    /// @notice Returns the current G$ price in USD units (same denomination as minFirstDepositUsd).
-    ///         Queries the static oracle if configured; falls back to fallbackGdUsdPerToken.
+    /// @notice Returns the USD value (18 decimals, same unit as `minFirstDepositUsd`) of `amount` G$ wei.
+    /// @dev Despite the name this is a value quote, not a unit price. Uses the 60s TWAP from the static oracle
+    ///      when configured and non-zero, otherwise `amount * 1e18 / fallbackGdUsdPerToken`.
     function gdUsdPerToken(uint128 amount) public view returns (uint256) {
         address oracle = staticOracle;
         address cusd = staticOracleCusd;

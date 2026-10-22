@@ -41,7 +41,7 @@ DEPLOYER_PRIVATE_KEY=0x<64-hex-chars>
 OWNER_ADDRESS=0x<multisig-or-owner-address>
 
 # ── Celo (CeloGdAntSeedVault) ────────────────────────────────────────────────
-GD_TOKEN=0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c14       # G$ ERC-20 on Celo mainnet
+GD_TOKEN=0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A       # G$ ERC-20 on Celo mainnet
 SUPERFLUID_HOST=0x<superfluid-host-celo>                   # Superfluid Host on Celo
 CFA_V1=0x<cfa-v1-celo>                                     # ConstantFlowAgreementV1 on Celo
 
@@ -244,6 +244,14 @@ cast send <operatorProxy> \
 ```bash
 forge test -vvv --fork-url "$CELO_RPC_URL"
 forge test -vvv --fork-url "$BASE_RPC_URL"
+```
+
+The Celo fork suite (`CeloGdAntSeedVaultForkTest`) upgrades the live vault proxy to the local implementation and exercises
+the real Superfluid Host/CFA (`batchCall` deposit, stream create/update/delete, liquidation). It is skipped unless
+`CELO_RPC_URL` is set:
+
+```bash
+CELO_RPC_URL=https://forno.celo.org forge test --match-contract CeloGdAntSeedVaultForkTest -vvv
 ```
 
 ---

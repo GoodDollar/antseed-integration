@@ -30,7 +30,7 @@ const StreamPeriodsResponseSchema = z.object({
         // 6,191,029 G$ entry once already, so the snapshot is rejected rather than priced.
         startedAtTimestamp: unixSeconds,
         stoppedAtTimestamp: unixSeconds.nullable(),
-        startedAtEvent: z.object({ userData: z.string() }).nullable()
+        startedAtEvent: z.object({ userData: z.string(), oldFlowRate: z.string().regex(/^-?\d+$/) }).nullable()
       })
     )
   })
@@ -44,7 +44,7 @@ export type StreamPeriod = {
   startedAt: number;
   /** Undefined while the period is still flowing. */
   stoppedAt?: number;
-  /** AntSeed buyer from the userData of the flow update that opened this period. */
+  /** AntSeed buyer from the flow creation that opened this stream. */
   buyerAddress?: string;
 };
 
@@ -76,6 +76,7 @@ export async function fetchStreamPeriods(cfg: RuntimeConfig, closedAfter: number
   const receiver = cfg.CELO_VAULT_ADDRESS.toLowerCase();
   const token = cfg.CELO_GD_SUPERTOKEN_ADDRESS.toLowerCase();
   const periods: StreamPeriod[] = [];
+  const updateByPeriod = new Map<string, boolean>();
   let asOf: number | undefined;
   let lastId = "";
   let pages = 0;
@@ -107,7 +108,7 @@ export async function fetchStreamPeriods(cfg: RuntimeConfig, closedAfter: number
                 flowRate
                 startedAtTimestamp
                 stoppedAtTimestamp
-                startedAtEvent { userData }
+                startedAtEvent { userData, oldFlowRate }
               }
             }
           `,
@@ -128,8 +129,12 @@ export async function fetchStreamPeriods(cfg: RuntimeConfig, closedAfter: number
           flowRateWeiPerSecond: BigInt(period.flowRate),
           startedAt: Number(period.startedAtTimestamp),
           stoppedAt: period.stoppedAtTimestamp === null ? undefined : Number(period.stoppedAtTimestamp),
-          buyerAddress: decodeBuyerFromUserData(period.startedAtEvent?.userData)
+          buyerAddress:
+            period.startedAtEvent && BigInt(period.startedAtEvent.oldFlowRate) === 0n
+              ? decodeBuyerFromUserData(period.startedAtEvent.userData)
+              : undefined
         });
+        updateByPeriod.set(period.id, Boolean(period.startedAtEvent && BigInt(period.startedAtEvent.oldFlowRate) !== 0n));
       }
       pages += 1;
       if (batch.length < PAGE_SIZE) break;
@@ -143,6 +148,15 @@ export async function fetchStreamPeriods(cfg: RuntimeConfig, closedAfter: number
       message: errorMessage(error)
     });
     return undefined;
+  }
+
+  periods.sort((left, right) => left.account.localeCompare(right.account) || left.startedAt - right.startedAt || left.id.localeCompare(right.id));
+  const lastBuyerByAccount = new Map<string, string>();
+  for (const period of periods) {
+    if (updateByPeriod.get(period.id)) {
+      period.buyerAddress = lastBuyerByAccount.get(period.account);
+    }
+    if (period.buyerAddress) lastBuyerByAccount.set(period.account, period.buyerAddress);
   }
 
   logInfo("superfluid.periods.fetch.end", { endpoint, closedAfter, asOf, pages, count: periods.length });
