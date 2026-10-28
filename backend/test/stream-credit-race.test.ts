@@ -108,7 +108,7 @@ function subgraphMock(account: string, scenario: ReturnType<typeof closedStreamS
                 flowRate: RATE.toString(),
                 startedAtTimestamp: scenario.openedAt.toString(),
                 stoppedAtTimestamp: scenario.closedAt.toString(),
-                startedAtEvent: { userData: "0x" }
+                startedAtEvent: { userData: "0x", oldFlowRate: "0" }
               }
             ]
           }
@@ -152,7 +152,7 @@ function liveStreamMock(account: string, nowSeconds: number, openedAt: number, r
               flowRate: rate.toString(),
               startedAtTimestamp: openedAt.toString(),
               stoppedAtTimestamp: null,
-              startedAtEvent: { userData: "0x" }
+              startedAtEvent: { userData: "0x", oldFlowRate: "0" }
             }
           ]
         }
@@ -314,10 +314,7 @@ test("overlapping scheduled runs fund a stream window once", { concurrency: fals
   }
 });
 
-// A window cut at a buyer change never grows: `through` is pinned to the change, not to `asOf`. So
-// if the dust minimum applied to it, a small segment would be skipped on every run, the clock would
-// never advance, and nothing after the change would ever be credited. The account would be stuck.
-test("a live stream still settles a sub-minimum segment ending at a buyer change", { concurrency: false }, async () => {
+test("a live stream update ignores changed userData and keeps the original buyer", { concurrency: false }, async () => {
   const account = "0x0000000000000000000000000000000000000b03";
   const nowSeconds = Math.floor(Date.now() / 1000);
   const changedAt = nowSeconds - 29 * DAY; // one day after the last credit: a small segment
@@ -337,14 +334,14 @@ test("a live stream still settles a sub-minimum segment ending at a buyer change
           data: {
             _meta: { block: { timestamp: nowSeconds } },
             streamPeriods: [
-              // One day under the old buyer, then 29 days still running under a new one.
+              // One day before the update, then 29 days still running; buyer changes are unsupported.
               {
                 id: `${account}-period-0`,
                 sender: { id: account },
                 flowRate: RATE.toString(),
                 startedAtTimestamp: (nowSeconds - 40 * DAY).toString(),
                 stoppedAtTimestamp: changedAt.toString(),
-                startedAtEvent: { userData: "0x" }
+                startedAtEvent: { userData: `0x${"00".repeat(12)}${"aa".repeat(20)}`, oldFlowRate: "0" }
               },
               {
                 id: `${account}-period-1`,
@@ -352,7 +349,7 @@ test("a live stream still settles a sub-minimum segment ending at a buyer change
                 flowRate: RATE.toString(),
                 startedAtTimestamp: changedAt.toString(),
                 stoppedAtTimestamp: null,
-                startedAtEvent: { userData: `0x${"00".repeat(12)}${"bb".repeat(20)}` }
+                startedAtEvent: { userData: `0x${"00".repeat(12)}${"bb".repeat(20)}`, oldFlowRate: RATE.toString() }
               }
             ]
           }
@@ -371,10 +368,10 @@ test("a live stream still settles a sub-minimum segment ending at a buyer change
 
     const store = new KVCreditStore(kv as never);
     const entries = (await store.getGdCredits(account)).filter((entry) => entry.source === "streamCron");
-    assert.equal(entries.length, 1, "the short pre-change segment is settled rather than skipped as dust");
-    const owed = RATE * BigInt(changedAt - (nowSeconds - 30 * DAY));
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].buyerAddress, `0x${"aa".repeat(20)}`);
+    const owed = RATE * BigInt(30 * DAY);
     assert.equal(BigInt(entries[0].gdAmountWei), owed);
-    assert.ok(owed < 4_000n * 10n ** 18n, "and it really is below the 4000 G$ minimum");
   } finally {
     onChain.restore();
     globalThis.fetch = originalFetch;
