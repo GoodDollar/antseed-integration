@@ -70,7 +70,7 @@ set -a && source .env && set +a
 
 ```bash
 forge script contracts/script/Deploy.s.sol:DeployCelo \
-  --rpc-url "$CELO_RPC_URL" \
+  --rpc-url https://forno.celo.org \
   --broadcast \
   --verify \
   -vvvv
@@ -200,14 +200,15 @@ cast storage <vaultProxy-celo> \
 Both contracts use UUPS proxies. To upgrade:
 
 1. Implement the new logic contract (must inherit the existing storage layout).
-2. Deploy the new implementation:
+2. set the deployer private key `cast wallet import deployer --interactive`
+3. Deploy the new implementation:
 
 The vault, on Celo:
 
 ```bash
 forge create contracts/src/CeloGdAntSeedVault.sol:CeloGdAntSeedVault \
   --rpc-url "$CELO_RPC_URL" \
-  --private-key "$DEPLOYER_PRIVATE_KEY" \
+  --account deployer  \
   --constructor-args "$GD_TOKEN"
 ```
 
@@ -216,7 +217,7 @@ The buyer operator, on Base:
 ```bash
 forge create contracts/src/AntseedBuyerOperator.sol:AntseedBuyerOperator \
   --rpc-url "$BASE_RPC_URL" \
-  --private-key "$DEPLOYER_PRIVATE_KEY" \
+  --account deployer  \
   --constructor-args "$ANTSEED_REGISTRY"
 ```
 
@@ -227,15 +228,15 @@ forge create contracts/src/AntseedBuyerOperator.sol:AntseedBuyerOperator \
 ```bash
 cast send <vaultProxy> \
   "upgradeToAndCall(address,bytes)" <newVaultImpl> 0x \
-  --rpc-url "$CELO_RPC_URL" \
-  --private-key "$DEPLOYER_PRIVATE_KEY"
+  --rpc-url https://forno.celo.org \
+  --account deployer
 ```
 
 ```bash
 cast send <operatorProxy> \
   "upgradeToAndCall(address,bytes)" <newOperatorImpl> 0x \
-  --rpc-url "$BASE_RPC_URL" \
-  --private-key "$DEPLOYER_PRIVATE_KEY"
+  --rpc-url https://mainnet.base.org \
+  --account deployer
 ```
 
 4. Run `forge test -vvv` against a fork to validate before upgrading on mainnet, forking whichever
