@@ -1980,7 +1980,7 @@ function subgraphPeriod(account: string, flowRate: bigint, startedAt: number, st
     flowRate: flowRate.toString(),
     startedAtTimestamp: startedAt.toString(),
     stoppedAtTimestamp: stoppedAt === undefined ? null : stoppedAt.toString(),
-    startedAtEvent: { userData }
+    startedAtEvent: { userData, oldFlowRate: "0" }
   };
 }
 

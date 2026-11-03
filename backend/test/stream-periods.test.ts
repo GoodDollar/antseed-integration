@@ -100,7 +100,7 @@ const rawPeriod = (overrides: Record<string, unknown> = {}) => ({
   flowRate: "1000000",
   startedAtTimestamp: "1700000000",
   stoppedAtTimestamp: null,
-  startedAtEvent: { userData: "0x" },
+  startedAtEvent: { userData: "0x", oldFlowRate: "0" },
   ...overrides
 });
 
@@ -112,6 +112,42 @@ test("fetchStreamPeriods reads a well-formed snapshot", async () => {
     assert.equal(snapshot?.periods.length, 1);
     assert.equal(snapshot?.periods[0].startedAt, 1_700_000_000);
     assert.equal(snapshot?.asOf, 1_800_000_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("fetchStreamPeriods ignores userData on flow updates and retains the creation buyer", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalBuyer = `0x${"aa".repeat(20)}`;
+  const updateBuyer = `0x${"bb".repeat(20)}`;
+  const encoded = (buyer: string) => `0x${"00".repeat(12)}${buyer.slice(2)}`;
+  try {
+    globalThis.fetch = subgraphResponding([
+      rawPeriod({
+        id: "created",
+        startedAtTimestamp: "1700000000",
+        stoppedAtTimestamp: "1700001000",
+        startedAtEvent: { userData: encoded(originalBuyer), oldFlowRate: "0" }
+      }),
+      rawPeriod({
+        id: "updated-empty",
+        startedAtTimestamp: "1700001000",
+        stoppedAtTimestamp: "1700002000",
+        startedAtEvent: { userData: "0x", oldFlowRate: "1000000" }
+      }),
+      rawPeriod({
+        id: "updated-different",
+        startedAtTimestamp: "1700002000",
+        startedAtEvent: { userData: encoded(updateBuyer), oldFlowRate: "2000000" }
+      })
+    ]);
+    const snapshot = await fetchStreamPeriods(periodsCfg, 0);
+    assert.deepEqual(snapshot?.periods.map(({ buyerAddress }) => buyerAddress), [
+      originalBuyer,
+      originalBuyer,
+      originalBuyer
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }
