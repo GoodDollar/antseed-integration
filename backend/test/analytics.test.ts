@@ -322,3 +322,202 @@ test("runAnalyticsAggregation calculates streamed G$ for streams active since be
     globalThis.fetch = originalFetch;
   }
 });
+
+test("getAnalyticsWindow returns deterministic all-time global invariant of requested days (#33 Finding 8a)", async () => {
+  const kv = new MemoryKV();
+  const testEnv = env({ ANTSEED_KV: kv as never });
+  const now = new Date("2026-07-23T12:00:00.000Z");
+
+  // State finalized through 2026-07-20 with initial 100 Wei
+  await kv.put("analytics:state", JSON.stringify({
+    finalizedThroughDate: "2026-07-20",
+    updatedAt: "2026-07-20T23:59:59.000Z"
+  }));
+  await kv.put("analytics:global", JSON.stringify({
+    gdOneTimeDepositsWei: "100",
+    gdStreamedWei: "0",
+    aiCreditsUsedWei: "0",
+    gdTotalFlowRateWeiPerSecond: "0",
+    updatedAt: "2026-07-20T23:59:59.000Z"
+  }));
+
+  // Daily records for 2026-07-20 (finalized), 2026-07-21 (middle), 2026-07-22 (middle), 2026-07-23 (today)
+  for (const [date, amount] of [["2026-07-20", "100"], ["2026-07-21", "50"], ["2026-07-22", "75"], ["2026-07-23", "25"]]) {
+    await kv.put(`analytics:daily:${date}`, JSON.stringify({
+      date,
+      gdOneTimeDepositsWei: amount,
+      gdStreamedWei: "0",
+      gdTotalFlowRateWeiPerSecond: "0",
+      aiCreditsUsedWei: "0",
+      uniqueGdBuyers: 1,
+      uniqueCreditUsers: 0,
+      updatedAt: `${date}T12:00:00.000Z`
+    }));
+  }
+
+  // 4-day request includes all middle days
+  const res4 = await getAnalyticsWindow(testEnv, 4, now);
+  assert.equal(res4.global.gdOneTimeDepositsWei, "250"); // 100 + 50 + 75 + 25
+
+  // 1-day request (today only) must still return the exact same all-time global 250
+  const res1 = await getAnalyticsWindow(testEnv, 1, now);
+  assert.equal(res1.global.gdOneTimeDepositsWei, "250");
+  assert.equal(res1.daily.length, 1);
+});
+
+test("aggregation continues past missing days, tracks repair queue, and reconciles backfill (#33 Finding 8b)", { concurrency: false }, async () => {
+  const kv = new MemoryKV();
+  const testEnv = env({
+    ANTSEED_KV: kv as never,
+    CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+    SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+  });
+
+  // Seed state finalized through 2026-07-20 with global = 100
+  await kv.put("analytics:state", JSON.stringify({
+    finalizedThroughDate: "2026-07-20",
+    updatedAt: "2026-07-20T23:59:59.000Z"
+  }));
+  await kv.put("analytics:global", JSON.stringify({
+    gdOneTimeDepositsWei: "100",
+    gdStreamedWei: "0",
+    aiCreditsUsedWei: "0",
+    gdTotalFlowRateWeiPerSecond: "0",
+    updatedAt: "2026-07-20T23:59:59.000Z"
+  }));
+
+  // 2026-07-21 will be written by aggregation run (resolveRunDate picks finalizedThroughDate + 1)
+  // Day 2026-07-22 is MISSING in KV
+  // Day 2026-07-23 has 50 Wei deposit
+  await kv.put("analytics:daily:2026-07-23", JSON.stringify({
+    date: "2026-07-23",
+    gdOneTimeDepositsWei: "50",
+    gdStreamedWei: "0",
+    gdTotalFlowRateWeiPerSecond: "0",
+    aiCreditsUsedWei: "0",
+    uniqueGdBuyers: 1,
+    uniqueCreditUsers: 0,
+    updatedAt: "2026-07-23T12:00:00.000Z"
+  }));
+
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const offline = buildOfflineAnalyticsFetchMock({
+    dayStartUnix,
+    dayEndUnix: dayStartUnix + 86_399,
+    streamPeriods: []
+  });
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = offline;
+    // Run aggregation for 2026-07-24 (runDay: 2026-07-24, yesterday: 2026-07-23)
+    // resolveRunDate picks 2026-07-21, writes it (0 Wei)
+    // finalizeClosedDays scans 2026-07-21 (0 Wei) -> 2026-07-22 (missing!) -> 2026-07-23 (50 Wei)
+    await runAnalyticsAggregation(testEnv, new Date("2026-07-24T12:00:00.000Z"));
+
+    const stateAfterMissing = (await kv.get("analytics:state", "json")) as any;
+    assert.equal(stateAfterMissing.finalizedThroughDate, "2026-07-23");
+    assert.deepEqual(stateAfterMissing.skippedDates, ["2026-07-22"]);
+
+    // Global: 100 (initial) + 0 (2026-07-21) + 50 (2026-07-23) = 150
+    const globalAfterRun1 = (await kv.get("analytics:global", "json")) as any;
+    assert.equal(globalAfterRun1.gdOneTimeDepositsWei, "150");
+
+    // Now backfill 2026-07-22 with 40 Wei
+    await kv.put("analytics:daily:2026-07-22", JSON.stringify({
+      date: "2026-07-22",
+      gdOneTimeDepositsWei: "40",
+      gdStreamedWei: "0",
+      gdTotalFlowRateWeiPerSecond: "0",
+      aiCreditsUsedWei: "0",
+      uniqueGdBuyers: 1,
+      uniqueCreditUsers: 0,
+      updatedAt: "2026-07-22T12:00:00.000Z"
+    }));
+
+    // Run aggregation again for 2026-07-25
+    await runAnalyticsAggregation(testEnv, new Date("2026-07-25T12:00:00.000Z"));
+
+    const stateAfterBackfill = (await kv.get("analytics:state", "json")) as any;
+    assert.equal(stateAfterBackfill.skippedDates, undefined); // Dequeued!
+
+    // Exactly-once accumulation: 150 + 40 (July 22 backfill) = 190
+    const globalAfterBackfill = (await kv.get("analytics:global", "json")) as any;
+    assert.equal(globalAfterBackfill.gdOneTimeDepositsWei, "190");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("re-aggregating an already-finalized day updates global totals by net difference and is idempotent (#33 Finding 8c)", { concurrency: false }, async () => {
+  const kv = new MemoryKV();
+  const testEnv = env({
+    ANTSEED_KV: kv as never,
+    CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+    SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+  });
+
+  // State finalized through 2026-07-22 with 200 Wei in global
+  await kv.put("analytics:state", JSON.stringify({
+    finalizedThroughDate: "2026-07-22",
+    updatedAt: "2026-07-22T23:59:59.000Z"
+  }));
+  await kv.put("analytics:global", JSON.stringify({
+    gdOneTimeDepositsWei: "200",
+    gdStreamedWei: "0",
+    aiCreditsUsedWei: "0",
+    gdTotalFlowRateWeiPerSecond: "0",
+    updatedAt: "2026-07-22T23:59:59.000Z"
+  }));
+
+  // Initial daily record for 2026-07-22 was 100 Wei
+  await kv.put("analytics:daily:2026-07-22", JSON.stringify({
+    date: "2026-07-22",
+    gdOneTimeDepositsWei: "100",
+    gdStreamedWei: "0",
+    gdTotalFlowRateWeiPerSecond: "0",
+    aiCreditsUsedWei: "0",
+    uniqueGdBuyers: 1,
+    uniqueCreditUsers: 0,
+    updatedAt: "2026-07-22T12:00:00.000Z"
+  }));
+
+  const dayStartUnix = Math.floor(new Date("2026-07-22T00:00:00.000Z").getTime() / 1000);
+  // Offline mock returns empty metrics (0 deposit) for the re-run
+  const offline = buildOfflineAnalyticsFetchMock({
+    dayStartUnix,
+    dayEndUnix: dayStartUnix + 86_399,
+    streamPeriods: []
+  });
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = offline;
+    // Re-run aggregation explicitly targeting 2026-07-22 (simulate date cursor)
+    // resolveRunDate will pick 2026-07-22 if state finalized is 2026-07-21 or if requested date is 2026-07-22
+    await runAnalyticsAggregation(testEnv, new Date("2026-07-22T12:00:00.000Z"));
+
+    // Daily record should now be updated to 0 Wei
+    const updatedDaily = (await kv.get("analytics:daily:2026-07-22", "json")) as any;
+    assert.equal(updatedDaily.gdOneTimeDepositsWei, "0");
+
+    // Global should be adjusted: 200 - 100 + 0 = 100 Wei
+    const updatedGlobal = (await kv.get("analytics:global", "json")) as any;
+    assert.equal(updatedGlobal.gdOneTimeDepositsWei, "100");
+
+    // Repeat run to verify idempotency (not deducted twice)
+    await runAnalyticsAggregation(testEnv, new Date("2026-07-22T12:00:00.000Z"));
+    const repeatedGlobal = (await kv.get("analytics:global", "json")) as any;
+    assert.equal(repeatedGlobal.gdOneTimeDepositsWei, "100");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
