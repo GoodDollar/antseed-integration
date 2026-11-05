@@ -236,7 +236,7 @@ test("config values exposes non-secret runtime constants", async () => {
     };
   };
   assert.equal(body.config.GD_CUSD_PRICE, 0.0001);
-  assert.equal(body.config.MAX_BONUS_CAP_USD, "100000000000000000000");
+  assert.equal(body.config.MAX_BONUS_CAP_USD, "100000000");
   assert.equal(body.config.REGULAR_BONUS_BPS, "1000");
   assert.equal(body.config.STREAMING_BONUS_BPS, "2000");
   assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
@@ -2226,4 +2226,16 @@ test("scheduled run leaves state alone when the subgraph is unavailable", { conc
     console.log = originalConsoleLog;
   }
   assert.equal(await kv.get("streams:closed-periods-cursor"), "1000");
+});
+
+
+test("configFromEnv scales MAX_BONUS_CAP_USD to 6-decimal micro-USD units", () => {
+  const defaultCfg = configFromEnv({ ANTSEED_KV: new MemoryKV() as never });
+  assert.equal(defaultCfg.MAX_BONUS_CAP_USD, 100_000_000n);
+
+  const customCfg = configFromEnv({
+    ANTSEED_KV: new MemoryKV() as never,
+    MAX_BONUS_CAP_USD: "250"
+  });
+  assert.equal(customCfg.MAX_BONUS_CAP_USD, 250_000_000n);
 });
