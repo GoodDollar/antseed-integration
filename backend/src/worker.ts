@@ -245,8 +245,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         429
       );
     }
-    await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
     const summaries = await backFillAnalytics(env);
+    await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
     return json(summaries);
   }
 

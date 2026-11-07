@@ -153,6 +153,8 @@ test("decodeBuyerFromUserData decodes abi-encoded address from Superfluid userDa
   assert.equal(decodeBuyerFromUserData(undefined), undefined);
   assert.equal(decodeBuyerFromUserData("0x"), undefined);
   assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(32)), undefined); // zero address
+  // Dirty upper 12-byte padding must be rejected to match on-chain abi.decode(data, (address))
+  assert.equal(decodeBuyerFromUserData("0x" + "01" + "00".repeat(11) + buyer.slice(2).toLowerCase()), undefined);
 });
 
 test("fetches GD price from StaticOracle quoteAllAvailablePoolsWithTimePeriod", async () => {
@@ -185,6 +187,55 @@ test("fetches GD price from StaticOracle quoteAllAvailablePoolsWithTimePeriod", 
     });
     // 1154299954649337 / 1e18 ≈ 0.001154299...
     assert.ok(price > 0.001154 && price < 0.001155, `expected ~0.001154 but got ${price}`);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("fetchCurrentGdPrice rejects manipulated oracle quotes outside [0.2x, 5x] reference price band", async () => {
+  const oracleAbi = new Interface([
+    "function quoteAllAvailablePoolsWithTimePeriod(uint128 baseAmount, address baseToken, address quoteToken, uint32 period) view returns (uint256 quoteAmount, address[] queriedPools)"
+  ]);
+  const gdToken = "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A";
+  const previousFetch = globalThis.fetch;
+  const cfg = {
+    GD_CUSD_PRICE: 0.001,
+    CELO_RPC_URL: "https://celo.example",
+    CELO_GD_SUPERTOKEN_ADDRESS: gdToken,
+    MAX_BONUS_CAP_USD: 100_000_000n,
+    REGULAR_BONUS_BPS: 1_000n,
+    STREAMING_BONUS_BPS: 2_000n,
+    MIN_STREAM_BONUS_WEI: 4_000_000_000_000_000_000_000n
+  };
+
+  try {
+    // 100x manipulated upward quote (0.1 cUSD vs 0.001 reference) -> falls back to GD_CUSD_PRICE
+    const inflatedWei = 100_000_000_000_000_000n;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      const decodedCall = oracleAbi.decodeFunctionData("quoteAllAvailablePoolsWithTimePeriod", body.params[0].data);
+      assert.equal(Number(decodedCall[3]), 3600);
+      return Response.json({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: oracleAbi.encodeFunctionResult("quoteAllAvailablePoolsWithTimePeriod", [inflatedWei, []])
+      });
+    }) as typeof fetch;
+
+    assert.equal(await fetchCurrentGdPrice(cfg), cfg.GD_CUSD_PRICE);
+
+    // 0.05x manipulated downward quote (0.00005 cUSD vs 0.001 reference) -> falls back to GD_CUSD_PRICE
+    const deflatedWei = 50_000_000_000_000n;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      return Response.json({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: oracleAbi.encodeFunctionResult("quoteAllAvailablePoolsWithTimePeriod", [deflatedWei, []])
+      });
+    }) as typeof fetch;
+
+    assert.equal(await fetchCurrentGdPrice(cfg), cfg.GD_CUSD_PRICE);
   } finally {
     globalThis.fetch = previousFetch;
   }
