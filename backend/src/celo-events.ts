@@ -11,6 +11,9 @@ const GOODID_ABI = new Interface(["function getWhitelistedRoot(address account) 
 
 const DEFAULT_STATIC_ORACLE_ADDRESS = "0x00851A91a3c4E9a4c1B48df827Bacc1f884bdE28";
 const DEFAULT_CUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a";
+const ORACLE_TWAP_PERIOD_SECONDS = 3600;
+const MIN_ORACLE_PRICE_RATIO = 0.2;
+const MAX_ORACLE_PRICE_RATIO = 5;
 
 const STATIC_ORACLE_ABI = new Interface([
   "function quoteAllAvailablePoolsWithTimePeriod(uint128 baseAmount, address baseToken, address quoteToken, uint32 period) view returns (uint256 quoteAmount, address[] queriedPools)"
@@ -130,8 +133,10 @@ export async function fetchCeloVaultEventsForAccount(
 
 /**
  * Fetch the current G$ price in cUSD as a decimal number (e.g. 0.001154).
- * Uses the StaticOracle `quoteAllAvailablePoolsWithTimePeriod` with a 60-second TWAP.
- * Falls back to `cfg.GD_CUSD_PRICE` if the oracle is unavailable or returns zero.
+ * Uses the StaticOracle `quoteAllAvailablePoolsWithTimePeriod` with a 1-hour TWAP
+ * and rejects values outside [0.2x, 5x] of `cfg.GD_CUSD_PRICE`.
+ * Falls back to `cfg.GD_CUSD_PRICE` if the oracle is unavailable, returns non-positive,
+ * or lies outside sanity bounds.
  */
 export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
   if (!cfg.CELO_RPC_URL || !cfg.CELO_GD_SUPERTOKEN_ADDRESS) {
@@ -149,7 +154,7 @@ export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
     1_000_000_000_000_000_000n,
     cfg.CELO_GD_SUPERTOKEN_ADDRESS,
     cusdAddress,
-    60
+    ORACLE_TWAP_PERIOD_SECONDS
   ]);
   try {
     const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: oracleAddress, data }, "latest"]);
@@ -164,6 +169,18 @@ export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
     const [quoteAmount] = STATIC_ORACLE_ABI.decodeFunctionResult("quoteAllAvailablePoolsWithTimePeriod", result);
     const price = Number(BigInt(quoteAmount.toString())) / 1e18;
     if (price > 0) {
+      if (
+        cfg.GD_CUSD_PRICE > 0 &&
+        (price < cfg.GD_CUSD_PRICE * MIN_ORACLE_PRICE_RATIO || price > cfg.GD_CUSD_PRICE * MAX_ORACLE_PRICE_RATIO)
+      ) {
+        logWarn("gd.price.fallback", {
+          reason: "oracle_price_out_of_bounds",
+          oracleAddress: redactAddress(oracleAddress),
+          oraclePrice: price,
+          fallbackPrice: cfg.GD_CUSD_PRICE
+        });
+        return cfg.GD_CUSD_PRICE;
+      }
       logInfo("gd.price.oracle", {
         oracleAddress: redactAddress(oracleAddress),
         quoteToken: redactAddress(cusdAddress),
@@ -279,9 +296,17 @@ export function encodeVaultEventLog(
  * Returns the lowercase checksummed address, or undefined if absent/invalid.
  */
 export function decodeBuyerFromUserData(userData: string | undefined): string | undefined {
-  // Expect "0x" + 64 hex chars (32 bytes)
+  // Expect ABI-encoded address: "0x" + 24 zero hex chars (12 bytes padding) + 40 hex chars (20 bytes address)
   if (!userData || userData === "0x" || userData.length < 66) return undefined;
   try {
+    const upperPadding = userData.slice(2, 26);
+    if (!/^0{24}$/.test(upperPadding)) {
+      logWarn("superfluid.userdata.invalid-buyer", {
+        userDataPrefix: userData.slice(0, 10),
+        userDataLength: userData.length
+      });
+      return undefined;
+    }
     // First 12 bytes (24 hex chars after "0x") are zero-padding; last 20 bytes are the address
     const addressHex = "0x" + userData.slice(26, 66);
     if (!isAddress(addressHex) || addressHex === "0x0000000000000000000000000000000000000000") {
