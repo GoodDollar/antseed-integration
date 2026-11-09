@@ -3,6 +3,8 @@ import { runAnalyticsAggregation } from "./analytics.js";
 
 export const ANALYTICS_REFRESH_COOLDOWN_MS = 60 * 60 * 1000;
 export const ANALYTICS_REFRESH_LAST_RUN_KEY = "analytics:refresh:last-run-at";
+export const ANALYTICS_REFRESH_IN_FLIGHT_KEY = "analytics:refresh:in-flight-at";
+export const ANALYTICS_REFRESH_IN_FLIGHT_TTL_MS = 10 * 60 * 1000;
 export const ANALYTICS_CRON_BACKFILL_DAYS = 40;
 const ANALYTICS_CRON_BACKFILL_CURSOR_KEY = "analytics:cron:backfill-cursor";
 
@@ -41,6 +43,14 @@ export async function readAnalyticsRefreshTimestamp(kv: Pick<KVNamespace, "get">
   if (!raw) return undefined;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return parsed;
+}
+
+export async function readAnalyticsRefreshInFlightTimestamp(kv: Pick<KVNamespace, "get">): Promise<number | undefined> {
+  const raw = await kv.get(ANALYTICS_REFRESH_IN_FLIGHT_KEY);
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
   return parsed;
 }
 

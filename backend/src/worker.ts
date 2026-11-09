@@ -13,8 +13,11 @@ import { cors, json, notifySlackOnFailure, notifySlackOnRequestError, parseJson,
 import {
   ANALYTICS_CRON_BACKFILL_DAYS,
   ANALYTICS_REFRESH_COOLDOWN_MS,
+  ANALYTICS_REFRESH_IN_FLIGHT_KEY,
+  ANALYTICS_REFRESH_IN_FLIGHT_TTL_MS,
   ANALYTICS_REFRESH_LAST_RUN_KEY,
   backFillAnalytics,
+  readAnalyticsRefreshInFlightTimestamp,
   readAnalyticsRefreshTimestamp
 } from "./analytics-cron.js";
 
@@ -233,7 +236,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   }
 
   if (request.method === "POST" && url.pathname === "/v1/analytics/refresh") {
-    const lastRefreshAt = await readAnalyticsRefreshTimestamp(env.ANTSEED_KV);
+    const [lastRefreshAt, inFlightAt] = await Promise.all([
+      readAnalyticsRefreshTimestamp(env.ANTSEED_KV),
+      readAnalyticsRefreshInFlightTimestamp(env.ANTSEED_KV)
+    ]);
     const now = Date.now();
     if (lastRefreshAt !== undefined && now - lastRefreshAt < ANALYTICS_REFRESH_COOLDOWN_MS) {
       const retryAfterSeconds = Math.ceil((ANALYTICS_REFRESH_COOLDOWN_MS - (now - lastRefreshAt)) / 1000);
@@ -245,9 +251,26 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         429
       );
     }
-    await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
-    const summaries = await backFillAnalytics(env);
-    return json(summaries);
+    if (inFlightAt !== undefined && now - inFlightAt < ANALYTICS_REFRESH_IN_FLIGHT_TTL_MS) {
+      const retryAfterSeconds = Math.ceil((ANALYTICS_REFRESH_IN_FLIGHT_TTL_MS - (now - inFlightAt)) / 1000);
+      return json(
+        {
+          error: "analytics refresh is already in progress",
+          retryAfterSeconds
+        },
+        429
+      );
+    }
+    await env.ANTSEED_KV.put(ANALYTICS_REFRESH_IN_FLIGHT_KEY, String(now));
+    try {
+      const summaries = await backFillAnalytics(env);
+      await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
+      await env.ANTSEED_KV.put(ANALYTICS_REFRESH_IN_FLIGHT_KEY, "");
+      return json(summaries);
+    } catch (error) {
+      await env.ANTSEED_KV.put(ANALYTICS_REFRESH_IN_FLIGHT_KEY, "");
+      throw error;
+    }
   }
 
   const accountMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/profile$/);

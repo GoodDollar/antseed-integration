@@ -23,7 +23,6 @@ contracts/broadcast/
 # misc
 .DS_Store
 coverage/
-backend/package.json
 .wrangler
 .yarn
 # repair script output (contains wallet/credit data)

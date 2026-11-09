@@ -39,6 +39,9 @@ jobs:
       - name: Worker-only backend guard
         working-directory: backend
         run: yarn run check:worker-only
+      - name: Typecheck
+        working-directory: backend
+        run: yarn run typecheck
       - name: Build
         working-directory: backend
         run: yarn run build
