@@ -30,6 +30,10 @@ export async function fundCredit(
       }
     };
   }
+  if (entry.fundingStatus === "failed") {
+    entry = await store.retryFailedFunding(entry);
+  }
+  const previousFundingTxHash = entry.fundingTxHash;
   const principalUsd = BigInt(entry.principalUsd);
   const bonusUsd = BigInt(entry.bonusUsd);
   logInfo("funding.start", {
@@ -60,9 +64,10 @@ export async function fundCredit(
         buyer: redactAddress(buyer)
       });
     }
+    const fundingTxHash = bridge.txHash ?? previousFundingTxHash;
     const updated = await store.markFundingResult(entry, {
       funded: true,
-      txHash: bridge.txHash,
+      txHash: fundingTxHash,
       error: undefined,
       credited: shouldCredit
     });
@@ -70,8 +75,9 @@ export async function fundCredit(
       entryId: entry.id,
       source: entry.source,
       buyer: redactAddress(buyer),
-      txHash: redactHash(bridge.txHash),
-      bridgeEnabled: bridge.enabled
+      txHash: redactHash(fundingTxHash),
+      bridgeEnabled: bridge.enabled,
+      reconciled: bridge.alreadyFunded === true
     });
     return { ...updated, bridge };
   } catch (error) {
@@ -85,8 +91,9 @@ export async function fundCredit(
       message
     });
     let updated: GdCreditEntry;
+    const fundingTxHash = error && typeof error === "object" && "fundingTxHash" in error ? String(error.fundingTxHash) : undefined;
     try {
-      updated = await store.markFundingResult(entry, { funded: false, error: message });
+      updated = await store.markFundingResult(entry, { funded: false, txHash: fundingTxHash ?? previousFundingTxHash, error: message });
     } catch (persistenceError) {
       logError("funding.failure-persistence.failed", { entryId: entry.id, message: errorMessage(persistenceError) });
       throw error;

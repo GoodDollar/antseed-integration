@@ -34,6 +34,7 @@ export type AntSeedFundingResult = {
   buyer: string;
   amountUsd: string;
   txHash?: string;
+  alreadyFunded?: boolean;
   error?: string;
 };
 
@@ -102,7 +103,13 @@ export class AntSeedFundingVaultClient {
     };
   }
 
-  async depositForBuyerWithId(buyer: string, principalUsd: bigint, bonusUsd: bigint, id: string, requireMinimumPrincipal = false): Promise<AntSeedFundingResult> {
+  async depositForBuyerWithId(
+    buyer: string,
+    principalUsd: bigint,
+    bonusUsd: bigint,
+    id: string,
+    requireMinimumPrincipal = false
+  ): Promise<AntSeedFundingResult> {
     const total = principalUsd + bonusUsd;
     logInfo("funding.bridge.deposit.start", {
       buyer: redactAddress(buyer),
@@ -133,46 +140,97 @@ export class AntSeedFundingVaultClient {
         idHash: redactHash(idHash),
         buyer: redactAddress(buyer)
       });
-      return { enabled: true, buyer, amountUsd: total.toString() };
+      return { enabled: true, buyer, amountUsd: total.toString(), alreadyFunded: true };
     }
     try {
       if (requireMinimumPrincipal) {
         const deposits = await this.getDepositsContract();
-        const [[available, reserved], minimum] = await Promise.all([
-          deposits.getBuyerBalance(buyer),
-          deposits.MIN_BUYER_DEPOSIT()
-        ]);
+        const [[available, reserved], minimum] = await Promise.all([deposits.getBuyerBalance(buyer), deposits.MIN_BUYER_DEPOSIT()]);
         if (BigInt(available) + BigInt(reserved) === 0n && principalUsd < BigInt(minimum)) {
           throw new BuyerDepositBelowMinimum(BigInt(minimum));
         }
       }
-      const tx = await this.contract.depositForWithId(buyer, principalUsd, bonusUsd, id);
-      logInfo("funding.bridge.deposit.submitted", {
-        id,
-        buyer: redactAddress(buyer),
-        txHash: redactHash(tx.hash)
-      });
-      const receipt = await tx.wait();
-      logInfo("funding.bridge.deposit.confirmed", {
-        id,
-        buyer: redactAddress(buyer),
-        txHash: redactHash(receipt?.hash)
-      });
-      return {
-        enabled: true,
-        buyer,
-        amountUsd: total.toString(),
-        txHash: receipt?.hash
-      };
+      let lastTxHash: string | undefined;
+      let lastError: Error | undefined;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        if (attempt > 1) {
+          const reconciled = await this.reconcileSubmittedDeposit(idHash, id, lastTxHash);
+          if (reconciled) {
+            return {
+              enabled: true,
+              buyer,
+              amountUsd: total.toString(),
+              txHash: lastTxHash,
+              alreadyFunded: true
+            };
+          }
+          logWarn("funding.bridge.deposit.retry", {
+            id,
+            buyer: redactAddress(buyer),
+            attempt,
+            previousTxHash: redactHash(lastTxHash),
+            previousError: lastError ? errorMessage(lastError) : "missing receipt"
+          });
+        }
+        const tx = await this.contract.depositForWithId(buyer, principalUsd, bonusUsd, id);
+        lastTxHash = String(tx.hash);
+        logInfo("funding.bridge.deposit.submitted", {
+          id,
+          buyer: redactAddress(buyer),
+          txHash: redactHash(lastTxHash),
+          attempt
+        });
+        try {
+          const receipt = await tx.wait();
+          if (receipt?.status === 1) {
+            logInfo("funding.bridge.deposit.confirmed", {
+              id,
+              buyer: redactAddress(buyer),
+              txHash: redactHash(receipt.hash),
+              attempt
+            });
+            return {
+              enabled: true,
+              buyer,
+              amountUsd: total.toString(),
+              txHash: receipt.hash
+            };
+          }
+          lastError = new Error(
+            receipt ? `Base funding transaction reverted: ${lastTxHash}` : `Base funding transaction receipt missing: ${lastTxHash}`
+          );
+        } catch (confirmationError) {
+          lastError = confirmationError instanceof Error ? confirmationError : new Error(errorMessage(confirmationError));
+        }
+      }
+      const error = lastError ?? new Error(`Base funding transaction receipt missing: ${lastTxHash ?? "unknown"}`);
+      if (lastTxHash) Object.assign(error, { fundingTxHash: lastTxHash });
+      throw error;
     } catch (error) {
       const message = errorMessage(error);
+      const fundingTxHash = error && typeof error === "object" && "fundingTxHash" in error ? String(error.fundingTxHash) : undefined;
       logError("funding.bridge.deposit.failed", {
         id,
         buyer: redactAddress(buyer),
+        txHash: redactHash(fundingTxHash),
         message
       });
       throw error;
     }
+  }
+
+  private async reconcileSubmittedDeposit(idHash: string, id: string, txHash: string | undefined): Promise<boolean> {
+    if (!this.contract) return false;
+    try {
+      const used = await this.contract.usedDepositIds(idHash);
+      if (used) {
+        logWarn("funding.bridge.deposit.reconciled-id", { id, submittedTxHash: redactHash(txHash) });
+        return true;
+      }
+    } catch (reconciliationError) {
+      logWarn("funding.bridge.deposit.reconcile-failed", { id, message: errorMessage(reconciliationError) });
+    }
+    return false;
   }
 
   /** Resolves the current deposits contract from the operator's authoritative registry. */

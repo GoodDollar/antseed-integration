@@ -40,6 +40,8 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `{ "txHash": "0x..." }`
 - `{ "account": "0x...", "fromBlock": "0x...", "toBlock": "latest" }`
 
+Reposting the original Celo transaction safely retries a failed Base funding entry. The retry first checks the operator's `usedDepositIds` mapping; if the ID is already used, the worker marks the entry funded without submitting another Base transaction. The same entry ID is always reused, so retries cannot double-fund a deposit.
+
 `GET /v1/analytics` returns daily analytics (last 30 days by default).
 
 - query: `days` (default `30`, max `365`)
@@ -80,6 +82,8 @@ Exceptions caught by the existing oracle, subgraph, and analytics RPC-discovery 
 Notifications contain operation, chain when known, outcome, an allowlisted error category, and validated credit entry/buyer/transaction identifiers when available. HTTP exception and funding-failure notifications also include the request method, full path, and body (truncated to 3,000 characters, as before). Request bodies may contain sensitive fields such as signatures, so restrict access to the Slack destination. Arbitrary remote error payloads are not forwarded. Propagated errors are deduplicated by error identity so nested handlers do not alert again. Separate funding attempts can each alert.
 
 Delivery is best effort with a five-second timeout. Failed webhook delivery is logged without recursion or a retry queue. A confirmation timeout is not proof of an on-chain revert. Wallet-only failures and user cancellations that never reach the Worker are not observable here.
+
+`funding.bridge.deposit.submitted` means the configured RPC accepted the transaction into its submission path; it is not proof that a block included it. Only `funding.bridge.deposit.confirmed` proves receipt status `1`. A missing receipt, a reverted receipt, or a confirmation wait failure triggers one bounded resend. Before resending, the Worker checks the operator's `usedDepositIds` state and records `funding.bridge.deposit.reconciled-id` when the original attempt actually funded the deposit. A known submitted hash is retained in the credit entry's `fundingTxHash`, including failed attempts, so it can be checked or correlated with a later retry.
 
 ## Buyer Deposit Minimum
 

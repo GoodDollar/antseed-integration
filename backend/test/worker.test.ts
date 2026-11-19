@@ -558,13 +558,21 @@ test("HTTP deposit funding failures notify Slack despite a successful ingestion 
         messages.push(JSON.parse(String(init?.body)).text);
         return new Response("ok");
       }
-      return Response.json({ result: { status: "0x1", logs: [0, 1].map((index) => encodeVaultEventLog("GdDeposited", [account, account, 10n ** 18n, "0x"], vault, txHash, index)) } });
+      return Response.json({
+        result: { status: "0x1", logs: [0, 1].map((index) => encodeVaultEventLog("GdDeposited", [account, account, 10n ** 18n, "0x"], vault, txHash, index)) }
+      });
     }) as typeof fetch;
-    const response = await worker.fetch(new Request("https://worker.test/v1/celo/events/record", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ txHash })
-    }), env({ CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: vault, SLACK_WEBHOOK_URL: "https://slack.test" }), makeExecutionContext());
+    const response = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      env({ CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: vault, SLACK_WEBHOOK_URL: "https://slack.test" }),
+      makeExecutionContext()
+    );
     assert.equal(response.status, 200);
-    const body = await response.json() as { events: GdCreditEntry[] };
+    const body = (await response.json()) as { events: GdCreditEntry[] };
     assert.equal(body.events[0].fundingStatus, "failed");
     assert.equal(body.events[1].fundingStatus, "failed");
     assert.equal(messages.length, 2);
@@ -590,10 +598,20 @@ test("reverted Celo receipts reach the request alert boundary", { concurrency: f
       }
       return Response.json({ result: { status: "0x0", logs: [] } });
     }) as typeof fetch;
-    const ctx = { waitUntil(promise: Promise<unknown>) { pending.push(promise); } } as ExecutionContext;
-    const response = await worker.fetch(new Request("https://worker.test/v1/celo/events/record", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ txHash: `0x${"e".repeat(64)}` })
-    }), env({ CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: "0x0000000000000000000000000000000000000abc", SLACK_WEBHOOK_URL: "https://slack.test" }), ctx);
+    const ctx = {
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      }
+    } as ExecutionContext;
+    const response = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash: `0x${"e".repeat(64)}` })
+      }),
+      env({ CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: "0x0000000000000000000000000000000000000abc", SLACK_WEBHOOK_URL: "https://slack.test" }),
+      ctx
+    );
     await Promise.all(pending);
     assert.equal(response.status, 500);
     assert.equal(messages.length, 1);
@@ -607,10 +625,16 @@ test("Slack delivery failure is best effort and does not recurse", { concurrency
   const originalFetch = globalThis.fetch;
   let attempts = 0;
   try {
-    globalThis.fetch = (async () => { attempts += 1; throw new Error("webhook offline"); }) as typeof fetch;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      throw new Error("webhook offline");
+    }) as typeof fetch;
     await notifySlackOnFailure(env({ SLACK_WEBHOOK_URL: "https://slack.test" }), { operation: "funding.deposit", error: new Error("failure") });
     assert.equal(attempts, 1);
-    globalThis.fetch = (async () => { attempts += 1; return new Response("rejected", { status: 503 }); }) as typeof fetch;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      return new Response("rejected", { status: 503 });
+    }) as typeof fetch;
     await notifySlackOnFailure(env({ SLACK_WEBHOOK_URL: "https://slack.test" }), { operation: "funding.deposit", error: new Error("failure") });
     assert.equal(attempts, 2);
   } finally {
@@ -1633,6 +1657,111 @@ test("fundCredit deposits bonus-only credits when buyer still uses operator", as
   assert.deepEqual(result.bridge, { enabled: true, buyer: buyer.toLowerCase(), amountUsd: "40", txHash: "0xfunded" });
 });
 
+test("fundCredit retries a failed entry and records idempotent on-chain recovery", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const entry = await store.recordGdCredit({
+    id: `0x${"d".repeat(64)}:0`,
+    account,
+    source: "deposit",
+    gdAmountWei: 10n ** 18n,
+    isVerified: false,
+    gdPrice: 1,
+    maxBonusCapUsd: 0n,
+    regularBonusBps: 0n,
+    streamingBonusBps: 0n
+  });
+  const submittedTxHash = `0x${"e".repeat(64)}`;
+  await store.markFundingResult(entry, { funded: false, txHash: submittedTxHash, error: "confirmation timed out" });
+
+  const failed = (await store.getGdCredits(account))[0];
+  const vault = {
+    enabled: true,
+    async depositForBuyerWithId() {
+      return { enabled: true, buyer: account, amountUsd: entry.totalCreditUsd, alreadyFunded: true };
+    }
+  };
+  const result = await fundCredit(failed, store, vault as never);
+  const recovered = (await store.getGdCredits(account))[0];
+
+  assert.equal(result.fundingStatus, "funded");
+  assert.equal(recovered.fundingStatus, "funded");
+  assert.equal(recovered.fundingError, undefined);
+  assert.equal(recovered.fundingTxHash, submittedTxHash);
+});
+
+test("funding client reconciles a submitted deposit through the contract id", async () => {
+  const client = new AntSeedFundingVaultClient(configFromEnv(env()));
+  const txHash = `0x${"f".repeat(64)}`;
+  let idChecks = 0;
+  (client as unknown as { contract: unknown }).contract = {
+    async usedDepositIds() {
+      idChecks += 1;
+      return idChecks > 1;
+    },
+    async depositForWithId() {
+      return {
+        hash: txHash,
+        async wait() {
+          throw new Error("confirmation timed out");
+        }
+      };
+    }
+  };
+
+  const result = await client.depositForBuyerWithId(
+    "0x0000000000000000000000000000000000000abc",
+    1_000_000n,
+    0n,
+    "deposit:reconcile"
+  );
+
+  assert.equal(result.enabled, true);
+  assert.equal(result.alreadyFunded, true);
+  assert.equal(result.txHash, txHash);
+  assert.equal(idChecks, 2);
+});
+
+test("funding client resends transactions with no receipt or a reverted receipt", async (context) => {
+  const scenarios = [
+    { name: "missing receipt", firstReceipt: null },
+    { name: "reverted receipt", firstReceipt: { hash: `0x${"1".repeat(64)}`, status: 0 } }
+  ];
+  for (const scenario of scenarios) {
+    await context.test(scenario.name, async () => {
+      const client = new AntSeedFundingVaultClient(configFromEnv(env()));
+      const secondTxHash = `0x${"2".repeat(64)}`;
+      let submissions = 0;
+      (client as unknown as { contract: unknown }).contract = {
+        async usedDepositIds() {
+          return false;
+        },
+        async depositForWithId() {
+          submissions += 1;
+          const currentAttempt = submissions;
+          return {
+            hash: currentAttempt === 1 ? `0x${"1".repeat(64)}` : secondTxHash,
+            async wait() {
+              return currentAttempt === 1 ? scenario.firstReceipt : { hash: secondTxHash, status: 1 };
+            }
+          };
+        }
+      };
+
+      const result = await client.depositForBuyerWithId(
+        "0x0000000000000000000000000000000000000abc",
+        1_000_000n,
+        0n,
+        `deposit:retry:${scenario.name}`
+      );
+
+      assert.equal(result.txHash, secondTxHash);
+      assert.equal(result.alreadyFunded, undefined);
+      assert.equal(submissions, 2);
+    });
+  }
+});
+
 test("direct deposit minimum follows the current buyer balance and excludes bonus", async (context) => {
   const payer = "0x0000000000000000000000000000000000000abc";
   const fundedBuyer = "0x0000000000000000000000000000000000000aaa";
@@ -1650,7 +1779,15 @@ test("direct deposit minimum follows the current buyer balance and excludes bonu
     { name: "historically funded but empty buyer", buyer: fundedBuyer, available: 0n, reserved: 0n, principal: 1n, rejected: true },
     { name: "reserved-only buyer", buyer: fundedBuyer, available: 0n, reserved: 1n, principal: 1n },
     { name: "exact minimum", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1_000_000n },
-    { name: "live minimum rather than hardcoded dollar", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1_000_000n, minimum: 2_000_000n, rejected: true },
+    {
+      name: "live minimum rather than hardcoded dollar",
+      buyer: emptyBuyer,
+      available: 0n,
+      reserved: 0n,
+      principal: 1_000_000n,
+      minimum: 2_000_000n,
+      rejected: true
+    },
     { name: "stream funding keeps existing policy", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1n, source: "streamCron" as const },
     { name: "used ID recovery skips minimum reads", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1n, used: true },
     { name: "read failure prevents submission", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1_000_000n, readFails: true, rejected: true }
@@ -1659,9 +1796,16 @@ test("direct deposit minimum follows the current buyer balance and excludes bonu
     await context.test(scenario.name, async () => {
       const store = new KVCreditStore(new MemoryKV() as never);
       const entry = await store.recordGdCredit({
-        id: `0x${"a".repeat(64)}:0`, account: payer, rootAccount: payer,
-        source: scenario.source ?? "deposit", gdAmountWei: 1n, isVerified: false,
-        gdPrice: 1, maxBonusCapUsd: 0n, regularBonusBps: 0n, streamingBonusBps: 0n,
+        id: `0x${"a".repeat(64)}:0`,
+        account: payer,
+        rootAccount: payer,
+        source: scenario.source ?? "deposit",
+        gdAmountWei: 1n,
+        isVerified: false,
+        gdPrice: 1,
+        maxBonusCapUsd: 0n,
+        regularBonusBps: 0n,
+        streamingBonusBps: 0n,
         buyerAddress: scenario.buyer
       });
       entry.principalUsd = scenario.principal.toString();
@@ -1672,8 +1816,13 @@ test("direct deposit minimum follows the current buyer balance and excludes bonu
       const cfg = configFromEnv(env());
       const client = new AntSeedFundingVaultClient(cfg);
       (client as unknown as { contract: unknown }).contract = {
-        async usedDepositIds() { return scenario.used ?? false; },
-        async registry() { registryReads += 1; return registryAddress; },
+        async usedDepositIds() {
+          return scenario.used ?? false;
+        },
+        async registry() {
+          registryReads += 1;
+          return registryAddress;
+        },
         runner: {
           async call(tx: { to: string; data: string }) {
             if (tx.to.toLowerCase() === registryAddress) return registryAbi.encodeFunctionResult("deposits", [depositsAddress]);
@@ -1686,11 +1835,18 @@ test("direct deposit minimum follows the current buyer balance and excludes bonu
         },
         async depositForWithId() {
           submissions += 1;
-          return { hash: `0x${"b".repeat(64)}`, async wait() { return { hash: `0x${"b".repeat(64)}` }; } };
+          return {
+            hash: `0x${"b".repeat(64)}`,
+            async wait() {
+              return { hash: `0x${"b".repeat(64)}`, status: 1 };
+            }
+          };
         }
       };
       const failures: unknown[] = [];
-      const result = await fundCredit(entry, store, client, async (details) => { failures.push(details.error); });
+      const result = await fundCredit(entry, store, client, async (details) => {
+        failures.push(details.error);
+      });
       assert.equal(result.fundingStatus, scenario.rejected ? "failed" : "funded");
       assert.equal(submissions, scenario.rejected || scenario.used ? 0 : 1);
       assert.equal(registryReads, scenario.used || scenario.source === "streamCron" ? 0 : 1);
@@ -1711,12 +1867,23 @@ test("fundCredit reports a caught blockchain failure and preserves failed fundin
     const cfg = configFromEnv(env({ SLACK_WEBHOOK_URL: "https://slack.test" }));
     const store = new KVCreditStore(new MemoryKV() as never);
     const entry = await store.recordGdCredit({
-      id: `0x${"c".repeat(64)}:0`, account: "0x0000000000000000000000000000000000000abc",
-      source: "deposit", gdAmountWei: 10n ** 18n, isVerified: false,
-      gdPrice: 1, maxBonusCapUsd: 0n, regularBonusBps: 0n, streamingBonusBps: 0n
+      id: `0x${"c".repeat(64)}:0`,
+      account: "0x0000000000000000000000000000000000000abc",
+      source: "deposit",
+      gdAmountWei: 10n ** 18n,
+      isVerified: false,
+      gdPrice: 1,
+      maxBonusCapUsd: 0n,
+      regularBonusBps: 0n,
+      streamingBonusBps: 0n
     });
     const error = Object.assign(new Error("transaction reverted: secret RPC details"), { code: "CALL_EXCEPTION" });
-    const vault = { enabled: true, async depositForBuyerWithId() { throw error; } };
+    const vault = {
+      enabled: true,
+      async depositForBuyerWithId() {
+        throw error;
+      }
+    };
     const result = await fundCredit(entry, store, vault as never, cfg.reportFailure);
     assert.equal(result.fundingStatus, "failed");
     assert.equal(calls.length, 1);
