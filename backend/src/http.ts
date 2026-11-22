@@ -24,11 +24,24 @@ export async function notifySlackOnFailure(env: Pick<Env, "SLACK_WEBHOOK_URL">, 
     reportedErrors.add(details.error);
   }
   const error = details.error as { code?: unknown; name?: unknown; receipt?: { hash?: unknown; status?: unknown } } | undefined;
-  const allowedCodes = new Set(["CALL_EXCEPTION", "NETWORK_ERROR", "SERVER_ERROR", "TIMEOUT", "BAD_DATA", "INSUFFICIENT_FUNDS", "NONCE_EXPIRED", "TRANSACTION_REPLACED"]);
-  const category = error?.name === "BuyerDepositBelowMinimum" ? "BUYER_DEPOSIT_BELOW_MINIMUM"
-    : error?.name === "CeloTransactionReverted" ? "TRANSACTION_REVERTED"
-    : error?.name === "CeloReceiptPending" ? "RECEIPT_PENDING"
-    : typeof error?.code === "string" && allowedCodes.has(error.code) ? error.code : "OPERATION_FAILED";
+  const allowedCodes = new Set([
+    "CALL_EXCEPTION",
+    "NETWORK_ERROR",
+    "SERVER_ERROR",
+    "TIMEOUT",
+    "BAD_DATA",
+    "INSUFFICIENT_FUNDS",
+    "NONCE_EXPIRED",
+    "TRANSACTION_REPLACED"
+  ]);
+  const category =
+    error?.name === "CeloTransactionReverted"
+      ? "TRANSACTION_REVERTED"
+      : error?.name === "CeloReceiptPending"
+        ? "RECEIPT_PENDING"
+        : typeof error?.code === "string" && allowedCodes.has(error.code)
+          ? error.code
+          : "OPERATION_FAILED";
   const txHash = details.txHash ?? error?.receipt?.hash;
   const text = [
     "Worker operation failure",
@@ -36,11 +49,13 @@ export async function notifySlackOnFailure(env: Pick<Env, "SLACK_WEBHOOK_URL">, 
     `chain: ${details.chain ?? "unspecified"}`,
     `outcome: ${details.recovered ? "recovered_with_fallback" : "failed_or_unconfirmed"}`,
     `category: ${category}`,
-    ...(details.request ? [
-      `method: ${details.request.method}`,
-      `path: ${details.request.path}`,
-      `body: ${details.request.body === undefined ? "[empty]" : truncate(details.request.body, 3000)}`
-    ] : []),
+    ...(details.request
+      ? [
+          `method: ${details.request.method}`,
+          `path: ${details.request.path}`,
+          `body: ${details.request.body === undefined ? "[empty]" : truncate(details.request.body, 3000)}`
+        ]
+      : []),
     ...(details.entryId && /^(?:0x[a-fA-F0-9]{64}:\d+|stream:0x[a-fA-F0-9]{40}:\d+)$/.test(details.entryId) ? [`entryId: ${details.entryId}`] : []),
     ...(details.buyer && /^0x[a-fA-F0-9]{40}$/.test(details.buyer) ? [`buyer: ${details.buyer}`] : []),
     ...(typeof txHash === "string" && /^0x[a-fA-F0-9]{64}$/.test(txHash) ? [`txHash: ${txHash}`] : [])
@@ -66,7 +81,10 @@ export async function parseJson(request: Request): Promise<unknown> {
   return JSON.parse(text);
 }
 
-export async function notifySlackOnRequestError(env: Env, details: { method: string; path: string; body: string | undefined; message: string; error?: unknown }): Promise<void> {
+export async function notifySlackOnRequestError(
+  env: Env,
+  details: { method: string; path: string; body: string | undefined; message: string; error?: unknown }
+): Promise<void> {
   await notifySlackOnFailure(env, { operation: `${details.method}:${details.path.split("?")[0]}`, request: details, error: details.error });
 }
 

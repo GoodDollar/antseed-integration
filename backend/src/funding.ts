@@ -64,6 +64,20 @@ export async function fundCredit(
         buyer: redactAddress(buyer)
       });
     }
+    if (bridge.skipped) {
+      const updated = await store.markFundingResult(entry, {
+        funded: false,
+        txHash: previousFundingTxHash,
+        error: bridge.skipReason
+      });
+      logInfo("funding.skipped", {
+        entryId: entry.id,
+        source: entry.source,
+        buyer: redactAddress(buyer),
+        reason: bridge.skipReason
+      });
+      return { ...updated, bridge };
+    }
     const fundingTxHash = bridge.txHash ?? previousFundingTxHash;
     const updated = await store.markFundingResult(entry, {
       funded: true,

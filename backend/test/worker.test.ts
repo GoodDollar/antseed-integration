@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Interface, Wallet } from "ethers";
 import worker from "../src/worker.js";
 import { fundCredit } from "../src/funding.js";
-import { AntSeedFundingVaultClient, BuyerDepositBelowMinimum } from "../src/antseed-funding-vault.js";
+import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
 import { Env, configFromEnv } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
 import { encodeVaultEventLog } from "../src/celo-events.js";
@@ -1882,8 +1882,9 @@ test("deposit minimum follows the current buyer balance for every credit source"
       assert.equal(result.fundingStatus, scenario.rejected ? "failed" : "funded");
       assert.equal(submissions, scenario.rejected || scenario.used ? 0 : 1);
       assert.equal(registryReads, scenario.used ? 0 : 1);
-      assert.equal(failures.length, scenario.rejected ? 1 : 0);
-      if (scenario.rejected && !scenario.readFails) assert.ok(failures[0] instanceof BuyerDepositBelowMinimum);
+      assert.equal(failures.length, scenario.readFails ? 1 : 0);
+      const bridge = (result as { bridge?: { skipped?: boolean } }).bridge;
+      assert.equal(bridge?.skipped, scenario.rejected && !scenario.readFails ? true : undefined);
     });
   }
 });
@@ -2426,7 +2427,6 @@ test("scheduled run leaves state alone when the subgraph is unavailable", { conc
   }
   assert.equal(await kv.get("streams:closed-periods-cursor"), "1000");
 });
-
 
 test("configFromEnv scales MAX_BONUS_CAP_USD to 6-decimal micro-USD units", () => {
   const defaultCfg = configFromEnv({ ANTSEED_KV: new MemoryKV() as never });

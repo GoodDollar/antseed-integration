@@ -20,21 +20,14 @@ const DEPOSITS_ABI = [
   "function MIN_BUYER_DEPOSIT() view returns (uint256)"
 ] as const;
 
-/** A deposit must meet the protocol minimum when the buyer has no AntSeed balance. */
-export class BuyerDepositBelowMinimum extends Error {
-  override readonly name = "BuyerDepositBelowMinimum";
-
-  constructor(readonly minimumUsd: bigint) {
-    super(`Buyer has zero AntSeed balance; total deposit must be at least ${minimumUsd} micro-USD`);
-  }
-}
-
 export type AntSeedFundingResult = {
   enabled: boolean;
   buyer: string;
   amountUsd: string;
   txHash?: string;
   alreadyFunded?: boolean;
+  skipped?: boolean;
+  skipReason?: string;
   error?: string;
 };
 
@@ -141,7 +134,15 @@ export class AntSeedFundingVaultClient {
         const deposits = await this.getDepositsContract();
         const [[available, reserved], minimum] = await Promise.all([deposits.getBuyerBalance(buyer), deposits.MIN_BUYER_DEPOSIT()]);
         if (BigInt(available) + BigInt(reserved) === 0n && total < BigInt(minimum)) {
-          throw new BuyerDepositBelowMinimum(BigInt(minimum));
+          const skipReason = `Buyer has zero AntSeed balance; total deposit ${total} is below minimum ${minimum} micro-USD`;
+          logWarn("funding.bridge.deposit.skipped", {
+            reason: "below_minimum",
+            id,
+            buyer: redactAddress(buyer),
+            amountUsd: total.toString(),
+            minimumUsd: minimum.toString()
+          });
+          return { enabled: true, buyer, amountUsd: total.toString(), skipped: true, skipReason };
         }
       }
       let lastTxHash: string | undefined;

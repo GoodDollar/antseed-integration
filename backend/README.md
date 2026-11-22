@@ -91,7 +91,7 @@ Before submitting a new Base funding transaction for a direct G$ deposit, the Wo
 
 Every funding source uses the same buyer-balance preflight. If available plus reserved balance is zero, the Worker submits only when the total credit (principal plus bonus) meets the on-chain minimum, regardless of whether it came from a direct deposit or a stream. Existing nonzero balances allow smaller top-ups.
 
-A total below the applicable minimum or a failed preflight read prevents Base submission, retains the entry as failed funding, and generates an alert. Already-used deposit IDs bypass this guard so recovery never resubmits funding. Disabled bridging and zero-credit acknowledgements are unchanged.
+A total below the applicable minimum prevents Base submission and retains the entry as failed funding so it can be retried, but it is logged as a normal skip and does not generate a failure alert. A failed preflight read retains the entry as failed and generates an alert. Already-used deposit IDs bypass this guard so recovery never resubmits funding. Disabled bridging and zero-credit acknowledgements are unchanged.
 
 This is a backend funding guard, **not a Celo payment preflight**: ingestion happens after the user has deposited G$ on Celo, so the Worker cannot prevent or undo that transfer. AntSeed remains authoritative if buyer balance or minimum changes between the read and Base execution. No contract or widget behavior changes are included.
 
