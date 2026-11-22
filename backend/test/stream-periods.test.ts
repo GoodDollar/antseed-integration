@@ -182,11 +182,18 @@ test("fetchStreamPeriods refuses a timestamp beyond safe-integer range", async (
 test("fetchStreamPeriods only reports exceptions caught by the existing handler", async () => {
   const originalFetch = globalThis.fetch;
   const failures: string[] = [];
-  const cfg = { ...periodsCfg, reportFailure: async (details: { operation: string }) => { failures.push(details.operation); } };
+  const cfg = {
+    ...periodsCfg,
+    reportFailure: async (details: { operation: string }) => {
+      failures.push(details.operation);
+    }
+  };
   try {
     const responses = [
       async () => new Response("unavailable", { status: 503 }),
-      async () => { throw new Error("network offline"); },
+      async () => {
+        throw new Error("network offline");
+      },
       async () => Response.json({ data: {} })
     ];
     for (const response of responses) {
@@ -194,7 +201,11 @@ test("fetchStreamPeriods only reports exceptions caught by the existing handler"
       assert.equal(await fetchStreamPeriods(cfg, 42), undefined);
     }
     assert.deepEqual(failures, new Array(3).fill("celo.streams.subgraph"));
-    globalThis.fetch = (async () => Response.json({ errors: [{ message: "partial indexing error" }], data: { _meta: { block: { timestamp: 1_800_000_000 } }, streamPeriods: [rawPeriod()] } })) as typeof fetch;
+    globalThis.fetch = (async () =>
+      Response.json({
+        errors: [{ message: "partial indexing error" }],
+        data: { _meta: { block: { timestamp: 1_800_000_000 } }, streamPeriods: [rawPeriod()] }
+      })) as typeof fetch;
     assert.equal((await fetchStreamPeriods(cfg, 42))?.periods.length, 1, "no new GraphQL validation is introduced");
     globalThis.fetch = subgraphResponding([]);
     assert.deepEqual((await fetchStreamPeriods(cfg, 42))?.periods, []);

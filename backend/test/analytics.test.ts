@@ -144,16 +144,27 @@ test("analytics skips malformed events and empty RPC discovery without new alert
       if (["forno.celo.org", "rpc.ankr.com", "mainnet.base.org"].includes(url.host)) {
         const body = JSON.parse(String(init?.body));
         if (body.method === "eth_getLogs" && body.params[0].address.toLowerCase() === vault) {
-          return Response.json({ jsonrpc: "2.0", id: body.id, result: [{ ...log, data: "0x" }, { ...log, data: "0x" }] });
+          return Response.json({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: [
+              { ...log, data: "0x" },
+              { ...log, data: "0x" }
+            ]
+          });
         }
         return offline(url.host === "mainnet.base.org" ? "https://base.rpc.test" : "https://celo.rpc.test", init);
       }
       return offline(input, init);
     }) as typeof fetch;
-    await runAnalyticsAggregation(env({
-      SLACK_WEBHOOK_URL: "https://slack.test", CELO_VAULT_ADDRESS: vault,
-      CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api"
-    }), now);
+    await runAnalyticsAggregation(
+      env({
+        SLACK_WEBHOOK_URL: "https://slack.test",
+        CELO_VAULT_ADDRESS: vault,
+        CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api"
+      }),
+      now
+    );
     assert.equal(messages.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -174,7 +185,8 @@ test("analytics retains existing missing-data fallbacks and GraphQL error handli
       const testEnv = env({
         CELO_VAULT_ADDRESS: "0x0000000000000000000000000000000000000abc",
         CELO_GD_SUPERTOKEN_ADDRESS: "0x0000000000000000000000000000000000000def",
-        CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api", SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test"
+        CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+        SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test"
       });
       globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         if (String(input).startsWith("https://superfluid.test")) return Response.json(payload);

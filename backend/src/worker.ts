@@ -18,7 +18,6 @@ import {
   readAnalyticsRefreshTimestamp
 } from "./analytics-cron.js";
 
-
 const CeloEventsRecordSchema = z
   .object({
     txHash: z
@@ -81,7 +80,6 @@ const ChannelOpSchema = z.object({
 const AnalyticsQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(365).default(30)
 });
-
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -160,10 +158,11 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
   const cfg = configFromEnv(env);
   const requestClone = request.clone();
   let requestBody: Promise<string | undefined> | undefined;
-  cfg.reportFailure = async (details) => notifySlackOnFailure(env, {
-    ...details,
-    request: { method: request.method, path: `${url.pathname}${url.search}`, body: await (requestBody ??= readRequestBody(requestClone)) }
-  });
+  cfg.reportFailure = async (details) =>
+    notifySlackOnFailure(env, {
+      ...details,
+      request: { method: request.method, path: `${url.pathname}${url.search}`, body: await (requestBody ??= readRequestBody(requestClone)) }
+    });
   const store = new KVCreditStore(env.ANTSEED_KV);
   const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
 
@@ -494,4 +493,3 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
 
   return json({ error: "not found" }, 404);
 }
-

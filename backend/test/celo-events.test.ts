@@ -1,7 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface } from "ethers";
-import { encodeVaultEventLog, fetchCeloVaultEvents, fetchCurrentGdPrice, fetchGoodIdRoot, parseCeloVaultLogs, decodeBuyerFromUserData } from "../src/celo-events.js";
+import {
+  encodeVaultEventLog,
+  fetchCeloVaultEvents,
+  fetchCurrentGdPrice,
+  fetchGoodIdRoot,
+  parseCeloVaultLogs,
+  decodeBuyerFromUserData
+} from "../src/celo-events.js";
 import { configFromEnv } from "../src/env.js";
 import type { FailureDetails } from "../src/http.js";
 
@@ -31,7 +38,9 @@ test("vault ingestion does not report skipped malformed or unrelated logs", asyn
   const originalFetch = globalThis.fetch;
   const failures: FailureDetails[] = [];
   const cfg = configFromEnv({ ANTSEED_KV: {} as KVNamespace, CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: vault });
-  cfg.reportFailure = async (details) => { failures.push(details); };
+  cfg.reportFailure = async (details) => {
+    failures.push(details);
+  };
   const goodLog = encodeVaultEventLog("GdDeposited", [account, account, 1n, "0x"], vault, txHash, 1);
   const badLog = { ...goodLog, data: "0x" };
   const unrelated = { ...badLog, topics: [`0x${"ff".repeat(32)}`] };
@@ -51,14 +60,18 @@ test("oracle only reports exceptions caught by the existing fallback handler", a
   const originalFetch = globalThis.fetch;
   const failures: FailureDetails[] = [];
   const cfg = configFromEnv({ ANTSEED_KV: {} as KVNamespace, CELO_RPC_URL: "https://celo.test", CELO_GD_SUPERTOKEN_ADDRESS: account });
-  cfg.reportFailure = async (details) => { failures.push(details); };
+  cfg.reportFailure = async (details) => {
+    failures.push(details);
+  };
   const oracle = new Interface(["function quoteAllAvailablePoolsWithTimePeriod(uint128,address,address,uint32) view returns (uint256,address[])"]);
   try {
     for (const result of ["0x", "0x12", oracle.encodeFunctionResult("quoteAllAvailablePoolsWithTimePeriod", [0n, []])]) {
       globalThis.fetch = (async () => Response.json({ result })) as typeof fetch;
       assert.equal(await fetchCurrentGdPrice(cfg), cfg.GD_CUSD_PRICE);
     }
-    globalThis.fetch = (async () => { throw new Error("RPC offline"); }) as typeof fetch;
+    globalThis.fetch = (async () => {
+      throw new Error("RPC offline");
+    }) as typeof fetch;
     assert.equal(await fetchCurrentGdPrice(cfg), cfg.GD_CUSD_PRICE);
     assert.equal(failures.length, 2);
     assert.ok(failures.every((failure) => failure.operation === "celo.oracle.price" && failure.recovered));
