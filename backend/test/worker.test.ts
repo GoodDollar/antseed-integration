@@ -1709,12 +1709,7 @@ test("funding client reconciles a submitted deposit through the contract id", as
     }
   };
 
-  const result = await client.depositForBuyerWithId(
-    "0x0000000000000000000000000000000000000abc",
-    1_000_000n,
-    0n,
-    "deposit:reconcile"
-  );
+  const result = await client.depositForBuyerWithId("0x0000000000000000000000000000000000000abc", 1_000_000n, 0n, "deposit:reconcile", false);
 
   assert.equal(result.enabled, true);
   assert.equal(result.alreadyFunded, true);
@@ -1748,12 +1743,7 @@ test("funding client resends transactions with no receipt or a reverted receipt"
         }
       };
 
-      const result = await client.depositForBuyerWithId(
-        "0x0000000000000000000000000000000000000abc",
-        1_000_000n,
-        0n,
-        `deposit:retry:${scenario.name}`
-      );
+      const result = await client.depositForBuyerWithId("0x0000000000000000000000000000000000000abc", 1_000_000n, 0n, `deposit:retry:${scenario.name}`, false);
 
       assert.equal(result.txHash, secondTxHash);
       assert.equal(result.alreadyFunded, undefined);
@@ -1762,7 +1752,7 @@ test("funding client resends transactions with no receipt or a reverted receipt"
   }
 });
 
-test("direct deposit minimum follows the current buyer balance and excludes bonus", async (context) => {
+test("deposit minimum follows the current buyer balance for every credit source", async (context) => {
   const payer = "0x0000000000000000000000000000000000000abc";
   const fundedBuyer = "0x0000000000000000000000000000000000000aaa";
   const emptyBuyer = "0x0000000000000000000000000000000000000bbb";
@@ -1774,7 +1764,7 @@ test("direct deposit minimum follows the current buyer balance and excludes bonu
     "function MIN_BUYER_DEPOSIT() view returns (uint256)"
   ]);
   const scenarios = [
-    { name: "old payer to empty new buyer", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 999_999n, bonus: 100_000n, rejected: true },
+    { name: "empty buyer accepts direct total above minimum", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 999_999n, bonus: 100_000n },
     { name: "switch back to funded buyer", buyer: fundedBuyer, available: 1n, reserved: 0n, principal: 1n },
     { name: "historically funded but empty buyer", buyer: fundedBuyer, available: 0n, reserved: 0n, principal: 1n, rejected: true },
     { name: "reserved-only buyer", buyer: fundedBuyer, available: 0n, reserved: 1n, principal: 1n },
@@ -1788,7 +1778,26 @@ test("direct deposit minimum follows the current buyer balance and excludes bonu
       minimum: 2_000_000n,
       rejected: true
     },
-    { name: "stream funding keeps existing policy", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1n, source: "streamCron" as const },
+    {
+      name: "empty buyer blocks small stream deposit",
+      buyer: emptyBuyer,
+      available: 0n,
+      reserved: 0n,
+      principal: 999_999n,
+      source: "streamCron" as const,
+      rejected: true
+    },
+    {
+      name: "empty buyer accepts stream total at minimum",
+      buyer: emptyBuyer,
+      available: 0n,
+      reserved: 0n,
+      principal: 900_000n,
+      bonus: 100_000n,
+      source: "streamCron" as const
+    },
+    { name: "funded buyer accepts small stream deposit", buyer: fundedBuyer, available: 1n, reserved: 0n, principal: 1n, source: "streamCron" as const },
+    { name: "reserved buyer accepts small stream deposit", buyer: fundedBuyer, available: 0n, reserved: 1n, principal: 1n, source: "streamCron" as const },
     { name: "used ID recovery skips minimum reads", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1n, used: true },
     { name: "read failure prevents submission", buyer: emptyBuyer, available: 0n, reserved: 0n, principal: 1_000_000n, readFails: true, rejected: true }
   ];
@@ -1849,7 +1858,7 @@ test("direct deposit minimum follows the current buyer balance and excludes bonu
       });
       assert.equal(result.fundingStatus, scenario.rejected ? "failed" : "funded");
       assert.equal(submissions, scenario.rejected || scenario.used ? 0 : 1);
-      assert.equal(registryReads, scenario.used || scenario.source === "streamCron" ? 0 : 1);
+      assert.equal(registryReads, scenario.used ? 0 : 1);
       assert.equal(failures.length, scenario.rejected ? 1 : 0);
       if (scenario.rejected && !scenario.readFails) assert.ok(failures[0] instanceof BuyerDepositBelowMinimum);
     });

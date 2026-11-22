@@ -48,7 +48,7 @@ export async function fundCredit(
   try {
     const shouldCredit = principalUsd + bonusUsd > 0n;
     const bridge = shouldCredit
-      ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id, entry.source === "deposit")
+      ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id, true)
       : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };
     if (!shouldCredit) {
       logInfo("funding.skipped.zero-amount", {

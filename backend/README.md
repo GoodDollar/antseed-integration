@@ -89,7 +89,9 @@ Delivery is best effort with a five-second timeout. Failed webhook delivery is l
 
 Before submitting a new Base funding transaction for a direct G$ deposit, the Worker resolves the current AntSeed deposits contract through the funding operator's registry and reads the selected buyer's balance and `MIN_BUYER_DEPOSIT`. If available plus reserved balance is zero, the deposit **principal alone** must meet that minimum (currently $1 / 1,000,000 micro-USDC); bonus does not count. A payer's earlier deposits to another buyer do not waive this requirement. Buyers whose balance has been emptied need the minimum again; reserved-only positive balances still allow smaller top-ups.
 
-Insufficient principal or failed preflight reads prevent Base submission, retain the entry as failed funding, and generate an alert. Already-used deposit IDs bypass this guard so recovery never resubmits funding. Disabled bridging, zero-credit acknowledgements, and the existing stream funding policy are unchanged.
+Every funding source uses the same buyer-balance preflight. If available plus reserved balance is zero, the Worker submits only when the total credit (principal plus bonus) meets the on-chain minimum, regardless of whether it came from a direct deposit or a stream. Existing nonzero balances allow smaller top-ups.
+
+A total below the applicable minimum or a failed preflight read prevents Base submission, retains the entry as failed funding, and generates an alert. Already-used deposit IDs bypass this guard so recovery never resubmits funding. Disabled bridging and zero-credit acknowledgements are unchanged.
 
 This is a backend funding guard, **not a Celo payment preflight**: ingestion happens after the user has deposited G$ on Celo, so the Worker cannot prevent or undo that transfer. AntSeed remains authoritative if buyer balance or minimum changes between the read and Base execution. No contract or widget behavior changes are included.
 

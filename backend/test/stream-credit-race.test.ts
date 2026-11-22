@@ -106,12 +106,14 @@ test("background stream funding failures alert and retain the same retry window"
     await seedProfile(kv, account, scenario.lastCreditAt);
     globalThis.fetch = subgraphMock(account, scenario, null);
     AntSeedFundingVaultClient.prototype.depositForBuyerWithId = async function (_buyer, _principal, _bonus, id, requireMinimum) {
-      assert.equal(requireMinimum, false, "direct-deposit guard must not alter stream policy");
+      assert.equal(requireMinimum, true, "all funding sources use the buyer balance guard");
       ids.push(id);
       throw Object.assign(new Error("BelowMinDeposit"), { code: "CALL_EXCEPTION" });
     };
     const cfg = configFromEnv(testEnv(kv));
-    cfg.reportFailure = async (details) => { failures.push(details); };
+    cfg.reportFailure = async (details) => {
+      failures.push(details);
+    };
     const store = new KVCreditStore(kv as never);
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const { ctx, settle } = trackingContext();

@@ -20,12 +20,12 @@ const DEPOSITS_ABI = [
   "function MIN_BUYER_DEPOSIT() view returns (uint256)"
 ] as const;
 
-/** A direct deposit must fund an empty buyer with sufficient principal, independently of bonuses. */
+/** A deposit must meet the protocol minimum when the buyer has no AntSeed balance. */
 export class BuyerDepositBelowMinimum extends Error {
   override readonly name = "BuyerDepositBelowMinimum";
 
   constructor(readonly minimumUsd: bigint) {
-    super(`Buyer has zero AntSeed balance; deposit principal must be at least ${minimumUsd} micro-USD (bonus excluded)`);
+    super(`Buyer has zero AntSeed balance; total deposit must be at least ${minimumUsd} micro-USD`);
   }
 }
 
@@ -103,13 +103,7 @@ export class AntSeedFundingVaultClient {
     };
   }
 
-  async depositForBuyerWithId(
-    buyer: string,
-    principalUsd: bigint,
-    bonusUsd: bigint,
-    id: string,
-    requireMinimumPrincipal = false
-  ): Promise<AntSeedFundingResult> {
+  async depositForBuyerWithId(buyer: string, principalUsd: bigint, bonusUsd: bigint, id: string, requireMinimum = true): Promise<AntSeedFundingResult> {
     const total = principalUsd + bonusUsd;
     logInfo("funding.bridge.deposit.start", {
       buyer: redactAddress(buyer),
@@ -143,10 +137,10 @@ export class AntSeedFundingVaultClient {
       return { enabled: true, buyer, amountUsd: total.toString(), alreadyFunded: true };
     }
     try {
-      if (requireMinimumPrincipal) {
+      if (requireMinimum) {
         const deposits = await this.getDepositsContract();
         const [[available, reserved], minimum] = await Promise.all([deposits.getBuyerBalance(buyer), deposits.MIN_BUYER_DEPOSIT()]);
-        if (BigInt(available) + BigInt(reserved) === 0n && principalUsd < BigInt(minimum)) {
+        if (BigInt(available) + BigInt(reserved) === 0n && total < BigInt(minimum)) {
           throw new BuyerDepositBelowMinimum(BigInt(minimum));
         }
       }
@@ -196,9 +190,7 @@ export class AntSeedFundingVaultClient {
               txHash: receipt.hash
             };
           }
-          lastError = new Error(
-            receipt ? `Base funding transaction reverted: ${lastTxHash}` : `Base funding transaction receipt missing: ${lastTxHash}`
-          );
+          lastError = new Error(receipt ? `Base funding transaction reverted: ${lastTxHash}` : `Base funding transaction receipt missing: ${lastTxHash}`);
         } catch (confirmationError) {
           lastError = confirmationError instanceof Error ? confirmationError : new Error(errorMessage(confirmationError));
         }
