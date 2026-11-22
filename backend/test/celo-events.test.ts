@@ -166,6 +166,8 @@ test("decodeBuyerFromUserData decodes abi-encoded address from Superfluid userDa
   assert.equal(decodeBuyerFromUserData(undefined), undefined);
   assert.equal(decodeBuyerFromUserData("0x"), undefined);
   assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(32)), undefined); // zero address
+  // Non-zero upper padding is rejected, matching the vault's on-chain `_decodeBuyer`.
+  assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(11) + "01" + buyer.slice(2).toLowerCase()), undefined);
 });
 
 test("fetches GD price from StaticOracle quoteAllAvailablePoolsWithTimePeriod", async () => {

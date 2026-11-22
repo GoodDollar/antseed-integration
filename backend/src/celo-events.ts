@@ -275,16 +275,18 @@ export function encodeVaultEventLog(
 
 /**
  * Decode an AntSeed buyer address from ABI-encoded Superfluid userdata.
- * userdata is expected to be `abi.encode(address)` — 32 bytes, address right-aligned.
+ * userdata is expected to be `abi.encode(address)` — 32 bytes, address right-aligned, upper 12 bytes zero.
  * Returns the lowercase checksummed address, or undefined if absent/invalid.
  */
 export function decodeBuyerFromUserData(userData: string | undefined): string | undefined {
   // Expect "0x" + 64 hex chars (32 bytes)
   if (!userData || userData === "0x" || userData.length < 66) return undefined;
   try {
-    // First 12 bytes (24 hex chars after "0x") are zero-padding; last 20 bytes are the address
+    // First 12 bytes (24 hex chars after "0x") must be zero-padding; last 20 bytes are the address.
+    // Non-zero padding is rejected, matching the vault's `_decodeBuyer`, which then treats the buyer as missing.
+    const paddingHex = userData.slice(2, 26);
     const addressHex = "0x" + userData.slice(26, 66);
-    if (!isAddress(addressHex) || addressHex === "0x0000000000000000000000000000000000000000") {
+    if (!/^0+$/.test(paddingHex) || !isAddress(addressHex) || addressHex === "0x0000000000000000000000000000000000000000") {
       logWarn("superfluid.userdata.invalid-buyer", {
         userDataPrefix: userData.slice(0, 10),
         userDataLength: userData.length

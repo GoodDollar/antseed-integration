@@ -172,7 +172,7 @@ flowRate = token-wei per second
 userData = abi.encode(YOUR_ANTSEED_BUYER_ADDRESS)   ← required
 ```
 
-The vault's SuperApp callback decodes the buyer from `ctx.userData`. A missing or zero buyer causes `MissingBuyerAddress` revert. On stream termination the stored buyer is used automatically; you do not need to re-supply it.
+The vault's SuperApp callback decodes the buyer from `ctx.userData`. A missing or zero buyer, or one whose upper 12 padding bytes are non-zero, causes `MissingBuyerAddress` revert. On stream termination the stored buyer is used automatically; you do not need to re-supply it.
 
 When the stream is created or updated, the vault emits `StreamUpdated(account, buyer, flowRate, monthlyGdAmountWei, totalFlowWei)`, where `totalFlowWei = previousFlowRate * secondsSincePreviousUpdate`. Record the stream update through the Worker the same way:
 

@@ -882,6 +882,97 @@ contract CeloGdAntSeedVaultTest {
         require(totalFlow == uint256(uint96(flowRate)) * 1000, "elapsed flow from block.timestamp");
     }
 
+    function testTerminationIgnoresNonCfaAgreementDataWithoutDecoding() public {
+        setUp();
+        // Non-CFA agreement data with a dirty first word: decoding it as (address, address) would revert.
+        bytes memory foreignData = abi.encode(type(uint256).max, uint256(1), uint256(2));
+        vm.recordLogs();
+        (bool ok, bytes memory ret) = address(host).call(
+            abi.encodeWithSignature(
+                "callAfterTerminated(address,address,address,bytes)",
+                address(vault),
+                address(token),
+                address(0xA11CE),
+                foreignData
+            )
+        );
+        require(ok, "non-CFA termination must not revert");
+        require(keccak256(abi.decode(ret, (bytes))) == keccak256(""), "ctx returned unchanged");
+        (address account, bytes4 reason) = _lastTerminationIgnored();
+        require(account == address(0), "no sender decoded");
+        require(reason == CeloGdAntSeedVault.UnsupportedAgreement.selector, "unsupported agreement reported");
+    }
+
+    function testTerminationIgnoresMalformedCfaAgreementData() public {
+        setUp();
+        bytes[2] memory malformed = [bytes(hex"1234"), abi.encode(type(uint256).max, address(vault))];
+        for (uint256 i = 0; i < malformed.length; i++) {
+            vm.recordLogs();
+            (bool ok, ) = address(host).call(
+                abi.encodeWithSignature(
+                    "callAfterTerminated(address,address,address,bytes)",
+                    address(vault),
+                    address(token),
+                    address(cfa),
+                    malformed[i]
+                )
+            );
+            require(ok, "malformed agreement data must not revert");
+            (, bytes4 reason) = _lastTerminationIgnored();
+            require(reason == CeloGdAntSeedVault.InvalidAgreementData.selector, "invalid agreement data reported");
+        }
+    }
+
+    function testTerminationWithoutStoredBuyerEmitsDiagnostic() public {
+        setUp();
+        cfa.setFlow(address(user), 0);
+        vm.recordLogs();
+        host.callAfterTerminated(vault, address(token), address(cfa), abi.encode(address(user), address(vault)));
+        (address account, bytes4 reason) = _lastTerminationIgnored();
+        require(account == address(user), "sender reported");
+        require(reason == CeloGdAntSeedVault.MissingBuyerAddress.selector, "missing buyer reported");
+    }
+
+    function testCreateRejectsDirtyPaddedBuyerWithMissingBuyerAddress() public {
+        setUp();
+        // Valid address in the low 20 bytes, non-zero upper 12 bytes: the backend treats this as no buyer too.
+        bytes memory dirtyBuyer = abi.encode((uint256(1) << 200) | uint256(uint160(BUYER)));
+        (bool ok, bytes memory err) = address(host).call(
+            abi.encodeWithSignature(
+                "createFlow(address,address,address,int96,bytes)",
+                address(vault),
+                address(token),
+                address(user),
+                int96(38580246913580),
+                dirtyBuyer
+            )
+        );
+        require(!ok, "dirty buyer rejected");
+        require(bytes4(err) == CeloGdAntSeedVault.MissingBuyerAddress.selector, "rejected as missing buyer");
+    }
+
+    function testDepositRejectsDirtyPaddedBuyerWithMissingBuyerAddress() public {
+        setUp();
+        user.approveVault(1 ether);
+        bytes memory dirtyBuyer = abi.encode((uint256(1) << 200) | uint256(uint160(BUYER)));
+        (bool ok, bytes memory err) = address(vault).call(abi.encodeWithSignature("deposit(uint256,bytes)", uint256(1 ether), dirtyBuyer));
+        require(!ok, "dirty buyer rejected");
+        require(bytes4(err) == CeloGdAntSeedVault.MissingBuyerAddress.selector, "rejected as missing buyer");
+    }
+
+    /// @dev Decodes the most recent StreamTerminationIgnored log emitted by the vault.
+    function _lastTerminationIgnored() internal returns (address account, bytes4 reason) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("StreamTerminationIgnored(address,address,address,bytes4)");
+        for (uint256 i = logs.length; i > 0; i--) {
+            Vm.Log memory l = logs[i - 1];
+            if (l.emitter == address(vault) && l.topics[0] == sig) {
+                return (address(uint160(uint256(l.topics[1]))), abi.decode(l.data, (bytes4)));
+            }
+        }
+        revert("StreamTerminationIgnored not found");
+    }
+
     // --- update uses the stored buyer ---
 
     function testUpdateIgnoresUserDataAndKeepsStoredBuyer() public {

@@ -68,6 +68,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     error StreamRateBelowMinimum();
     error InvalidPriceConfig();
     error MissingBuyerAddress();
+    error InvalidAgreementData();
 
     IERC20Like public immutable gdToken;
     address public owner;
@@ -101,6 +102,10 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     event GdDeposited(address indexed account, address indexed buyer, uint256 gdAmount, bytes data);
     /// @dev `buyer` is the AntSeed buyer account decoded from Superfluid userdata (abi.encode(buyerAddress)).
     event StreamUpdated(address indexed account, address indexed buyer, int96 flowRate, uint256 monthlyGdAmountWei, uint256 totalFlowWei);
+    /// @dev Diagnostic for a termination callback that was ignored instead of reverting (a revert would jail the app).
+    ///      `account` is the stream sender, or address(0) when `agreementData` could not be decoded.
+    ///      `reason` is the selector of the custom error that create/update would have reverted with.
+    event StreamTerminationIgnored(address indexed account, address indexed superToken, address indexed agreementClass, bytes4 reason);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -231,6 +236,8 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         return _currentFlowSnapshot(superToken, agreementClass, agreementData);
     }
 
+    /// @notice Records a new stream. Reverting here only rejects the flow creation (Superfluid jails apps solely
+    ///         for reverting termination callbacks), so invalid streams are refused.
     function afterAgreementCreated(
         address superToken,
         address agreementClass,
@@ -239,12 +246,14 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        bytes memory userData = ISuperfluidHostLike(superfluidHost).decodeCtx(ctx).userData;
-        address buyer = _decodeBuyer(userData);
-        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer, false);
+        address sender = _requireValidStream(superToken, agreementClass, agreementData);
+        address buyer = _decodeBuyer(ISuperfluidHostLike(superfluidHost).decodeCtx(ctx).userData);
+        if (buyer == address(0)) revert MissingBuyerAddress();
+        _recordStream(superToken, sender, buyer, cbdata, false);
         return ctx;
     }
 
+    /// @notice Records a flow-rate change against the buyer stored at creation. Reverting rejects the update.
     function afterAgreementUpdated(
         address superToken,
         address agreementClass,
@@ -253,12 +262,17 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        (address sender, ) = abi.decode(agreementData, (address, address));
+        address sender = _requireValidStream(superToken, agreementClass, agreementData);
         address buyer = streamBuyer[sender];
-        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer, false);
+        if (buyer == address(0)) revert MissingBuyerAddress();
+        _recordStream(superToken, sender, buyer, cbdata, false);
         return ctx;
     }
 
+    /// @notice Records the final elapsed flow of a deleted stream.
+    /// @dev Must never revert: Superfluid jails a SuperApp whose termination callback reverts, after which no
+    ///      callback (and no `StreamUpdated`) is ever delivered again. Rejections emit `StreamTerminationIgnored`
+    ///      and return `ctx` unchanged.
     function afterAgreementTerminated(
         address superToken,
         address agreementClass,
@@ -267,9 +281,14 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         bytes calldata cbdata,
         bytes calldata ctx
     ) external onlySuperfluidHost returns (bytes memory newCtx) {
-        (address sender, ) = abi.decode(agreementData, (address, address));
+        (bytes4 rejection, address sender) = _validateStream(superToken, agreementClass, agreementData);
         address buyer = streamBuyer[sender];
-        _recordStream(superToken, agreementClass, agreementData, cbdata, buyer, true);
+        if (rejection == bytes4(0) && buyer == address(0)) rejection = MissingBuyerAddress.selector;
+        if (rejection != bytes4(0)) {
+            emit StreamTerminationIgnored(sender, superToken, agreementClass, rejection);
+            return ctx;
+        }
+        _recordStream(superToken, sender, buyer, cbdata, true);
         return ctx;
     }
 
@@ -282,41 +301,50 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         emit GdDeposited(account, buyer, amount, data);
     }
 
-    function _recordStream(
+    /// @dev Checks token, agreement class and receiver without reverting. The agreement class is checked before
+    ///      `agreementData` is decoded, since non-CFA agreements use a different data layout.
+    /// @return rejection Selector of the matching custom error, or zero when the stream is valid.
+    /// @return sender Stream sender; address(0) when `agreementData` could not be decoded.
+    function _validateStream(
         address superToken,
         address agreementClass,
-        bytes calldata agreementData,
-        bytes calldata cbdata,
-        address buyer,
-        bool skipRevert
-    ) private {
-        // A reverting termination callback gets the app jailed by Superfluid, so it must never revert.
-        if (superToken != address(gdToken)) {
-            if (skipRevert) return;
-            revert UnsupportedToken();
-        }
-        if (agreementClass != cfaV1) {
-            if (skipRevert) return;
-            revert UnsupportedAgreement();
-        }
-        if (buyer == address(0)) {
-            if (skipRevert) return;
-            revert MissingBuyerAddress();
-        }
+        bytes calldata agreementData
+    ) private view returns (bytes4 rejection, address sender) {
+        if (superToken != address(gdToken)) return (UnsupportedToken.selector, address(0));
+        if (agreementClass != cfaV1) return (UnsupportedAgreement.selector, address(0));
+        (bool decoded, address flowSender, address receiver) = _decodeFlowParties(agreementData);
+        if (!decoded) return (InvalidAgreementData.selector, address(0));
+        if (receiver != address(this)) return (WrongReceiver.selector, flowSender);
+        return (bytes4(0), flowSender);
+    }
 
-        (address sender, address receiver) = abi.decode(agreementData, (address, address));
-        if (receiver != address(this)) {
-            if (skipRevert) return;
-            revert WrongReceiver();
+    /// @dev Reverting variant of `_validateStream` for the create/update callbacks.
+    function _requireValidStream(address superToken, address agreementClass, bytes calldata agreementData) private view returns (address sender) {
+        bytes4 rejection;
+        (rejection, sender) = _validateStream(superToken, agreementClass, agreementData);
+        if (rejection != bytes4(0)) {
+            // Revert with the selected custom error (no arguments).
+            assembly {
+                mstore(0, rejection)
+                revert(0, 4)
+            }
         }
+    }
 
+    /// @dev Stores the stream buyer and emits `StreamUpdated`. Inputs must already be validated.
+    ///      On termination the flow is gone, so the rate is 0 and neither the CFA nor the oracle is queried,
+    ///      leaving no reachable revert in the termination path.
+    function _recordStream(address superToken, address sender, address buyer, bytes calldata cbdata, bool terminated) private {
         streamBuyer[sender] = buyer;
 
         // CFA reports timestamp 0 for a deleted flow, so use the block time as the end of the elapsed window.
         uint256 currentTimestamp = block.timestamp;
         (uint256 previousTimestamp, int96 previousFlowRate) = _decodeFlowSnapshot(cbdata);
-        (, int96 flowRate, , ) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
-        if (flowRate < 0) revert NegativeFlowRate();
+        int96 flowRate = 0;
+        if (!terminated) {
+            (, flowRate, , ) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
+            if (flowRate < 0) revert NegativeFlowRate();
+        }
 
         uint256 monthlyAmount = uint256(uint96(flowRate)) * 30 days;
         if (monthlyAmount > 0 && gdUsdPerToken(uint128(monthlyAmount)) < minMonthlyStreamUsd) revert StreamRateBelowMinimum();
@@ -335,8 +363,8 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
             return abi.encode(uint256(0), int96(0));
         }
 
-        (address sender, address receiver) = abi.decode(agreementData, (address, address));
-        if (receiver != address(this)) {
+        (bool decoded, address sender, address receiver) = _decodeFlowParties(agreementData);
+        if (!decoded || receiver != address(this)) {
             return abi.encode(uint256(0), int96(0));
         }
 
@@ -344,10 +372,26 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         return abi.encode(timestamp, flowRate);
     }
 
-    /// @dev Decodes `abi.encode(address)`. Returns address(0) if `data` is shorter than 32 bytes; reverts if the word is not a valid address.
+    /// @dev Decodes `abi.encode(address)` from the first 32-byte word without reverting. Returns address(0) if
+    ///      `data` is shorter than 32 bytes or the upper 12 bytes are non-zero (same rule as the backend's
+    ///      `decodeBuyerFromUserData`). Bytes after the first word are ignored.
     function _decodeBuyer(bytes memory data) private pure returns (address buyer) {
         if (data.length < 32) return address(0);
-        return abi.decode(data, (address));
+        uint256 word;
+        assembly {
+            word := mload(add(data, 32))
+        }
+        if (word >> 160 != 0) return address(0);
+        return address(uint160(word));
+    }
+
+    /// @dev Decodes CFA `agreementData` (`abi.encode(sender, receiver)`) without reverting on malformed input.
+    function _decodeFlowParties(bytes calldata agreementData) private pure returns (bool decoded, address sender, address receiver) {
+        if (agreementData.length < 64) return (false, address(0), address(0));
+        uint256 senderWord = uint256(bytes32(agreementData[0:32]));
+        uint256 receiverWord = uint256(bytes32(agreementData[32:64]));
+        if (senderWord >> 160 != 0 || receiverWord >> 160 != 0) return (false, address(0), address(0));
+        return (true, address(uint160(senderWord)), address(uint160(receiverWord)));
     }
 
     function _decodeFlowSnapshot(bytes calldata cbdata) private pure returns (uint256 previousTimestamp, int96 previousFlowRate) {
