@@ -204,7 +204,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
       service: "gooddollar-antseed-integration",
       runtime: "cloudflare-worker",
       config: {
-        GD_CUSD_PRICE: cfg.GD_CUSD_PRICE,
+        GD_USD_PRICE: cfg.GD_USD_PRICE,
         MAX_BONUS_CAP_USD: cfg.MAX_BONUS_CAP_USD.toString(),
         REGULAR_BONUS_BPS: cfg.REGULAR_BONUS_BPS.toString(),
         STREAMING_BONUS_BPS: cfg.STREAMING_BONUS_BPS.toString(),
@@ -212,7 +212,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         CELO_VAULT_ADDRESS: cfg.CELO_VAULT_ADDRESS,
         CELO_GOODID_ADDRESS: cfg.CELO_GOODID_ADDRESS,
         CELO_STATIC_ORACLE_ADDRESS: cfg.CELO_STATIC_ORACLE_ADDRESS,
-        CELO_CUSD_ADDRESS: cfg.CELO_CUSD_ADDRESS,
+        CELO_USD_ADDRESS: cfg.CELO_USD_ADDRESS,
         CELO_GD_SUPERTOKEN_ADDRESS: cfg.CELO_GD_SUPERTOKEN_ADDRESS,
         SUPERFLUID_SUBGRAPH_URL: cfg.SUPERFLUID_SUBGRAPH_URL ?? SUPERFLUID_CELO_SUBGRAPH_URL
       }

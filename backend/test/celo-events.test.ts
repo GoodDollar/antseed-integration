@@ -67,12 +67,12 @@ test("oracle only reports exceptions caught by the existing fallback handler", a
   try {
     for (const result of ["0x", "0x12", oracle.encodeFunctionResult("quoteAllAvailablePoolsWithTimePeriod", [0n, []])]) {
       globalThis.fetch = (async () => Response.json({ result })) as typeof fetch;
-      assert.equal(await fetchCurrentGdPrice(cfg), cfg.GD_CUSD_PRICE);
+      assert.equal(await fetchCurrentGdPrice(cfg), cfg.GD_USD_PRICE);
     }
     globalThis.fetch = (async () => {
       throw new Error("RPC offline");
     }) as typeof fetch;
-    assert.equal(await fetchCurrentGdPrice(cfg), cfg.GD_CUSD_PRICE);
+    assert.equal(await fetchCurrentGdPrice(cfg), cfg.GD_USD_PRICE);
     assert.equal(failures.length, 2);
     assert.ok(failures.every((failure) => failure.operation === "celo.oracle.price" && failure.recovered));
   } finally {
@@ -124,7 +124,7 @@ test("fetches GoodID root with eth_call for root aggregation", async () => {
 
   try {
     const fetchedRoot = await fetchGoodIdRoot(account, {
-      GD_CUSD_PRICE: 1.0,
+      GD_USD_PRICE: 1.0,
       CELO_RPC_URL: "https://celo.example",
       CELO_GOODID_ADDRESS: "0x0000000000000000000000000000000000000abc",
       MAX_BONUS_CAP_USD: 100_000_000n,
@@ -188,7 +188,7 @@ test("fetches GD price from StaticOracle quoteAllAvailablePoolsWithTimePeriod", 
 
   try {
     const price = await fetchCurrentGdPrice({
-      GD_CUSD_PRICE: 0.001,
+      GD_USD_PRICE: 0.001,
       CELO_RPC_URL: "https://celo.example",
       CELO_GD_SUPERTOKEN_ADDRESS: gdToken,
       MAX_BONUS_CAP_USD: 100_000_000n,

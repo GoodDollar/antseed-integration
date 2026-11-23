@@ -77,13 +77,13 @@ Update the `[vars]` section with production values:
 | `CELO_VAULT_ADDRESS` | `CeloGdAntSeedVault` proxy address on Celo | `0x…` |
 | `CELO_GOODID_ADDRESS` | GoodID root resolver on Celo | `0xC361A6E67822a0EDc17D899227dd9FC50BD62F42` |
 | `CELO_STATIC_ORACLE_ADDRESS` | Celo static price oracle | `0x00851A91a3c4E9a4c1B48df827Bacc1f884bdE28` |
-| `CELO_CUSD_ADDRESS` | cUSD ERC-20 on Celo | `0x765DE816845861e75A25fCA122bb6898B8B1282a` |
+| `CELO_USD_ADDRESS` | cUSD ERC-20 on Celo | `0x765DE816845861e75A25fCA122bb6898B8B1282a` |
 | `CELO_GD_SUPERTOKEN_ADDRESS` | G$ SuperToken (Superfluid) on Celo | `0x…` |
 | `SUPERFLUID_SUBGRAPH_URL` | Superfluid subgraph endpoint for stream data | `https://…` |
-| `GD_CUSD_PRICE` | Current G$/cUSD exchange rate (decimal) | `0.001154` |
+| `GD_USD_PRICE` | Current G$/cUSD exchange rate (decimal) | `0.001154` |
 | `MAX_BONUS_CAP_USD` | Monthly per-root bonus cap in micro-USD | `100000000` (= $100) |
 
-> **Note:** `GD_CUSD_PRICE` should be updated whenever the G$ price drifts significantly. A future cron-based price update is planned.
+> **Note:** `GD_USD_PRICE` should be updated whenever the G$ price drifts significantly. A future cron-based price update is planned.
 
 ---
 

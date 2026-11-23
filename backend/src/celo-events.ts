@@ -131,7 +131,7 @@ export async function fetchCeloVaultEventsForAccount(
 /**
  * Fetch the current G$ price in cUSD as a decimal number (e.g. 0.001154).
  * Uses the StaticOracle `quoteAllAvailablePoolsWithTimePeriod` with a 60-second TWAP.
- * Falls back to `cfg.GD_CUSD_PRICE` if the oracle is unavailable or returns zero.
+ * Falls back to `cfg.GD_USD_PRICE` if the oracle is unavailable or returns zero.
  */
 export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
   if (!cfg.CELO_RPC_URL || !cfg.CELO_GD_SUPERTOKEN_ADDRESS) {
@@ -139,17 +139,17 @@ export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
       reason: "missing_config",
       hasRpcUrl: Boolean(cfg.CELO_RPC_URL),
       hasGdSuperToken: Boolean(cfg.CELO_GD_SUPERTOKEN_ADDRESS),
-      fallbackPrice: cfg.GD_CUSD_PRICE
+      fallbackPrice: cfg.GD_USD_PRICE
     });
-    return cfg.GD_CUSD_PRICE;
+    return cfg.GD_USD_PRICE;
   }
   const oracleAddress = cfg.CELO_STATIC_ORACLE_ADDRESS ?? DEFAULT_STATIC_ORACLE_ADDRESS;
-  const cusdAddress = cfg.CELO_CUSD_ADDRESS ?? DEFAULT_CUSD_ADDRESS;
+  const cusdAddress = cfg.CELO_USD_ADDRESS ?? DEFAULT_CUSD_ADDRESS;
   const data = STATIC_ORACLE_ABI.encodeFunctionData("quoteAllAvailablePoolsWithTimePeriod", [
     1_000_000_000_000_000_000n,
     cfg.CELO_GD_SUPERTOKEN_ADDRESS,
     cusdAddress,
-    60
+    60 * 60
   ]);
   try {
     const result = await rpc<string>(cfg.CELO_RPC_URL, "eth_call", [{ to: oracleAddress, data }, "latest"]);
@@ -157,9 +157,9 @@ export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
       logWarn("gd.price.fallback", {
         reason: "empty_oracle_result",
         oracleAddress: redactAddress(oracleAddress),
-        fallbackPrice: cfg.GD_CUSD_PRICE
+        fallbackPrice: cfg.GD_USD_PRICE
       });
-      return cfg.GD_CUSD_PRICE;
+      return cfg.GD_USD_PRICE;
     }
     const [quoteAmount] = STATIC_ORACLE_ABI.decodeFunctionResult("quoteAllAvailablePoolsWithTimePeriod", result);
     const price = Number(BigInt(quoteAmount.toString())) / 1e18;
@@ -174,18 +174,18 @@ export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
     logWarn("gd.price.fallback", {
       reason: "non_positive_oracle_price",
       oracleAddress: redactAddress(oracleAddress),
-      fallbackPrice: cfg.GD_CUSD_PRICE
+      fallbackPrice: cfg.GD_USD_PRICE
     });
-    return cfg.GD_CUSD_PRICE;
+    return cfg.GD_USD_PRICE;
   } catch (error) {
     await cfg.reportFailure?.({ operation: "celo.oracle.price", chain: "celo", recovered: true, error });
     logWarn("gd.price.fallback", {
       reason: "oracle_call_failed",
       oracleAddress: redactAddress(oracleAddress),
-      fallbackPrice: cfg.GD_CUSD_PRICE,
+      fallbackPrice: cfg.GD_USD_PRICE,
       message: errorMessage(error)
     });
-    return cfg.GD_CUSD_PRICE;
+    return cfg.GD_USD_PRICE;
   }
 }
 

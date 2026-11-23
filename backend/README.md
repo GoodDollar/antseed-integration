@@ -99,7 +99,7 @@ This is a backend funding guard, **not a Celo payment preflight**: ingestion hap
 
 The Worker reads constants from Wrangler env vars and derives runtime values in `src/env.ts`.
 
-- `GD_CUSD_PRICE`
+- `GD_USD_PRICE`
   - Decimal cUSD price per 1 G$ used as fallback pricing.
   - Default: `0.0001`.
 - `MAX_BONUS_CAP_USD`
@@ -130,7 +130,7 @@ curl "$GOODDOLLAR_ANTSEED_API/config/values"
 
 Important response fields:
 
-- `config.GD_CUSD_PRICE`
+- `config.GD_USD_PRICE`
 - `config.MAX_BONUS_CAP_USD`
 - `config.REGULAR_BONUS_BPS`
 - `config.STREAMING_BONUS_BPS`
