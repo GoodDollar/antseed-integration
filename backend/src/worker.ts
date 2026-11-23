@@ -3,7 +3,7 @@ import { AntSeedFundingVaultClient } from "./antseed-funding-vault.js";
 import { fetchCeloVaultEvents, fetchCeloVaultEventsForAccount, fetchCurrentGdPrice, fetchGoodIdRoot } from "./celo-events.js";
 import { Env, RuntimeConfig, configFromEnv } from "./env.js";
 import { KVCreditStore } from "./kv-credit-store.js";
-import { fundCredit } from "./funding.js";
+import { fundCredit, retryFailedDeposits } from "./funding.js";
 import { creditStreams } from "./stream-credits.js";
 import { SUPERFLUID_CELO_SUBGRAPH_URL } from "./stream-periods.js";
 import { GdCreditEntry } from "./types.js";
@@ -126,6 +126,8 @@ export default {
       const store = new KVCreditStore(env.ANTSEED_KV);
       const antseedFundingVault = new AntSeedFundingVaultClient(cfg);
       logInfo("cron.start", { bridgeEnabled: antseedFundingVault.enabled });
+      const depositRetries = await retryFailedDeposits(store, antseedFundingVault, cfg.reportFailure, cfg);
+      logInfo("cron.deposit-retries.summary", depositRetries);
       const summary = await creditStreams(cfg, env.ANTSEED_KV, store, antseedFundingVault, ctx);
       logInfo("cron.summary", { ...summary, elapsedMs: Date.now() - startedAt });
     } catch (error) {
@@ -331,7 +333,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           rootAccount: redactAddress(entry.rootAccount),
           buyer: redactAddress(entry.buyerAddress)
         });
-        const res = await fundCredit(entry, store, antseedFundingVault, cfg.reportFailure);
+        const retryCfg = { ...cfg, GD_USD_PRICE: gdPrice };
+        const res = await fundCredit(entry, store, antseedFundingVault, cfg.reportFailure, retryCfg);
         recorded.push(res);
       } else {
         // Streams are credited by the scheduled run alone, from the subgraph's stream periods.
@@ -362,7 +365,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           reportedTotalFlowWei: event.totalFlowWei.toString()
         });
         if (BigInt(entry.totalCreditUsd) === 0n) {
-          recorded.push(await fundCredit(entry, store, antseedFundingVault, cfg.reportFailure));
+          recorded.push(await fundCredit(entry, store, antseedFundingVault, cfg.reportFailure, cfg));
         } else {
           logWarn("celo.events.record.stream.legacy-entry-skipped", {
             entryId: entry.id,

@@ -191,6 +191,61 @@ test("recordGdCredit enforces monthly bonus cap per root account", async () => {
   assert.equal(third.bonusUsd, "0");
 });
 
+test("recalculateFundingAmounts uses current price and bonus settings for a retry", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const entry = await store.recordGdCredit({
+    id: "deposit:retry-recalculate",
+    account: "0xABC",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    gdPrice: 1,
+    isVerified: true,
+    maxBonusCapUsd: 100_000_000n,
+    regularBonusBps: 1_000n,
+    streamingBonusBps: 2_000n
+  });
+  await store.markFundingResult(entry, { funded: false, error: "confirmation timed out" });
+
+  const recalculated = await store.recalculateFundingAmounts(
+    (await store.getGdCredit(entry.id))!,
+    {
+      GD_USD_PRICE: 2,
+      REGULAR_BONUS_BPS: 2_000n,
+      STREAMING_BONUS_BPS: 2_000n,
+      MAX_BONUS_CAP_USD: 100_000_000n
+    } as never
+  );
+
+  assert.equal(recalculated.principalUsd, "2000000");
+  assert.equal(recalculated.bonusUsd, "400000");
+  assert.equal(recalculated.totalCreditUsd, "2400000");
+});
+
+test("failed deposit IDs are tracked and removed after a successful retry", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  const entry = await store.recordGdCredit({
+    id: "deposit:tracked-failure",
+    account: "0xABC",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 1_000_000_000_000_000_000n,
+    gdPrice: 1,
+    isVerified: false,
+    maxBonusCapUsd: 0n,
+    regularBonusBps: 0n,
+    streamingBonusBps: 0n
+  });
+
+  await store.markFundingResult(entry, { funded: false, error: "rpc unavailable" });
+  assert.equal((await store.getFailedDeposits()).length, 1);
+
+  const failed = (await store.getGdCredit(entry.id))!;
+  const pending = await store.retryFailedFunding(failed);
+  await store.markFundingResult(pending, { funded: true, txHash: "0xsuccess" });
+  assert.equal((await store.getFailedDeposits()).length, 0);
+});
+
 test("markFundingResult updates entry status and user profile on success", async () => {
   const store = new KVCreditStore(new MemoryKV() as never);
   const entry = await store.recordGdCredit({

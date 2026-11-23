@@ -157,7 +157,7 @@ export async function creditStreams(
       gdAmountWei: entry.gdAmountWei
     });
     counts.processed += 1;
-    const funding = fundCredit(entry, store, antseedFundingVault, cfg.reportFailure).catch(async (error) => {
+    const funding = fundCredit(entry, store, antseedFundingVault, cfg.reportFailure, cfg).catch(async (error) => {
       await cfg.reportFailure?.({ operation: "funding.background", chain: "base", error, entryId: entry.id, buyer: buyerAddress || account });
       return { fundingStatus: "failed" };
     });

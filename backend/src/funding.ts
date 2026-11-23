@@ -3,13 +3,50 @@ import { KVCreditStore } from "./kv-credit-store.js";
 import { GdCreditEntry } from "./types.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } from "./logging.js";
 import type { FailureReporter } from "./http.js";
+import type { RuntimeConfig } from "./env.js";
+
+export async function retryFailedDeposits(
+  store: KVCreditStore,
+  antseedFundingVault: AntSeedFundingVaultClient,
+  reportFailure?: FailureReporter,
+  cfg?: RuntimeConfig
+): Promise<{ found: number; retried: number; funded: number; failed: number }> {
+  const failedDeposits = await store.getFailedDeposits();
+  let retried = 0;
+  let funded = 0;
+  let failed = 0;
+
+  for (const failedDeposit of failedDeposits) {
+    retried += 1;
+
+    try {
+      const result = await fundCredit(failedDeposit, store, antseedFundingVault, reportFailure, cfg);
+      if (result.fundingStatus === "funded") funded += 1;
+      else failed += 1;
+    } catch (error) {
+      failed += 1;
+      await reportFailure?.({
+        operation: "funding.deposit.retry",
+        chain: "base",
+        error,
+        entryId: failedDeposit.id,
+        buyer: failedDeposit.buyerAddress || failedDeposit.account
+      });
+    }
+  }
+
+  return { found: failedDeposits.length, retried, funded, failed };
+}
 
 export async function fundCredit(
   entry: GdCreditEntry,
   store: KVCreditStore,
   antseedFundingVault: AntSeedFundingVaultClient,
-  reportFailure?: FailureReporter
+  reportFailureOrConfig?: FailureReporter | RuntimeConfig,
+  cfg?: RuntimeConfig
 ): Promise<{ [key: string]: unknown }> {
+  const reportFailure = typeof reportFailureOrConfig === "function" ? reportFailureOrConfig : reportFailureOrConfig?.reportFailure;
+  const runtimeConfig = cfg ?? (typeof reportFailureOrConfig === "object" ? reportFailureOrConfig : undefined);
   const buyer = entry.buyerAddress || entry.account;
   if (entry.fundingStatus === "funded") {
     logInfo("funding.already-funded", {
@@ -31,6 +68,9 @@ export async function fundCredit(
     };
   }
   if (entry.fundingStatus === "failed") {
+    if (runtimeConfig) {
+      entry = await store.recalculateFundingAmounts(entry, runtimeConfig);
+    }
     entry = await store.retryFailedFunding(entry);
   }
   const previousFundingTxHash = entry.fundingTxHash;

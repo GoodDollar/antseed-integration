@@ -41,6 +41,8 @@ export type GdCreditEntry = {
   principalUsd: string;
   bonusUsd: string;
   totalCreditUsd: string;
+  /** Whether GoodID and buyer-operator checks were satisfied when the entry was recorded. */
+  isVerified?: boolean;
   txHash?: string;
   logIndex?: number;
   fundingStatus: "pending" | "funded" | "failed";

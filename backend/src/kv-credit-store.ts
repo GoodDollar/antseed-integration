@@ -1,13 +1,17 @@
 import { calculateCreditWithBonus, monthKey } from "./credit-bonus.js";
 import { GdCreditEntry, UserCreditProfile } from "./types.js";
 import { logInfo, logWarn, redactAddress } from "./logging.js";
+import type { RuntimeConfig } from "./env.js";
 
-type KV = Pick<KVNamespace, "get" | "put">;
+type KV = Pick<KVNamespace, "get" | "put"> & {
+  list?: (options?: KVNamespaceListOptions) => Promise<KVNamespaceListResult<unknown>>;
+};
 
 const USER_PREFIX = "user:";
 const GD_CREDIT_PREFIX = "gd-credit:";
 const USER_GD_CREDITS_PREFIX = "user-gd-credits:";
 const MONTHLY_BONUS_PREFIX = "monthly-bonus:";
+const FAILED_DEPOSIT_RECORDS_KEY = "failRecords";
 
 export class KVCreditStore {
   constructor(private readonly kv: KV) {}
@@ -35,13 +39,22 @@ export class KVCreditStore {
     const entryId = input.id;
     const existing = await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${entryId}`);
     if (existing) {
+      let updated = existing;
+      if (existing.isVerified !== input.isVerified || (input.buyerAddress && existing.buyerAddress !== input.buyerAddress.toLowerCase())) {
+        updated = {
+          ...existing,
+          isVerified: input.isVerified,
+          ...(input.buyerAddress && { buyerAddress: input.buyerAddress.toLowerCase() })
+        };
+        await this.putJson(`${GD_CREDIT_PREFIX}${entryId}`, updated);
+      }
       logWarn("kv.credit.idempotent-hit", {
         entryId,
         account: redactAddress(account),
         source: input.source,
         existingStatus: existing.fundingStatus
       });
-      return existing;
+      return updated;
     }
     const month = monthKey(input.date ?? new Date());
     const bonus = calculateCreditWithBonus(input.gdAmountWei, input.source, input.isVerified, input.gdPrice, input.regularBonusBps, input.streamingBonusBps);
@@ -72,6 +85,7 @@ export class KVCreditStore {
       principalUsd: bonus.principalUsd.toString(),
       bonusUsd: effectiveBonusUsd.toString(),
       totalCreditUsd: (bonus.principalUsd + effectiveBonusUsd).toString(),
+      isVerified: input.isVerified,
       streamUpdateMonth: month,
       ...(input.txHash !== undefined && { txHash: input.txHash }),
       ...(input.logIndex !== undefined && { logIndex: input.logIndex }),
@@ -177,6 +191,9 @@ export class KVCreditStore {
     entry.fundingTxHash = result.txHash;
     entry.fundingError = result.error;
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, entry);
+    if (entry.source === "deposit") {
+      await this.updateFailedDepositRecords(entry.id, !result.funded);
+    }
 
     // `funded` and `failed` both end this attempt (a failed stream window is retried only through
     // `retryFailedFunding`), so either way the entry stops being outstanding. Only a funded entry
@@ -219,11 +236,63 @@ export class KVCreditStore {
    * id is what `depositForWithId` dedupes on: if the failed attempt actually landed, the retry is
    * recognised as already funded rather than paid twice.
    */
+  /** Recalculate stored USD amounts when a failed entry is retried. */
+  async recalculateFundingAmounts(entry: GdCreditEntry, cfg: RuntimeConfig): Promise<GdCreditEntry> {
+    const gdAmountWei = BigInt(entry.gdAmountWei);
+    const isVerified = entry.isVerified ?? BigInt(entry.bonusUsd) > 0n;
+    const recalculated = calculateCreditWithBonus(
+      gdAmountWei,
+      entry.source,
+      isVerified,
+      cfg.GD_USD_PRICE,
+      cfg.REGULAR_BONUS_BPS,
+      cfg.STREAMING_BONUS_BPS
+    );
+
+    let effectiveBonusUsd = recalculated.bonusUsd;
+    const month = entry.streamUpdateMonth;
+    const monthlyBonusUsed = await this.getMonthlyBonusUsed(entry.rootAccount, month);
+    const previousBonusUsd = BigInt(entry.bonusUsd);
+    const monthlyBonusUsedExcludingEntry = monthlyBonusUsed > previousBonusUsd ? monthlyBonusUsed - previousBonusUsd : 0n;
+
+    if (effectiveBonusUsd > 0n && cfg.MAX_BONUS_CAP_USD > 0n) {
+      const remainingCap = cfg.MAX_BONUS_CAP_USD > monthlyBonusUsedExcludingEntry
+        ? cfg.MAX_BONUS_CAP_USD - monthlyBonusUsedExcludingEntry
+        : 0n;
+      effectiveBonusUsd = effectiveBonusUsd > remainingCap ? remainingCap : effectiveBonusUsd;
+    }
+
+    const next: GdCreditEntry = {
+      ...entry,
+      principalUsd: recalculated.principalUsd.toString(),
+      bonusUsd: effectiveBonusUsd.toString(),
+      totalCreditUsd: (recalculated.principalUsd + effectiveBonusUsd).toString(),
+      isVerified
+    };
+
+    await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, next);
+    const key = `${MONTHLY_BONUS_PREFIX}${entry.rootAccount}:${month}`;
+    await this.putJson(key, (monthlyBonusUsedExcludingEntry + effectiveBonusUsd).toString());
+
+    logInfo("kv.funding.recalculated", {
+      entryId: entry.id,
+      source: entry.source,
+      previousPrincipalUsd: entry.principalUsd,
+      previousBonusUsd: entry.bonusUsd,
+      principalUsd: next.principalUsd,
+      bonusUsd: next.bonusUsd,
+      totalCreditUsd: next.totalCreditUsd,
+      gdPrice: cfg.GD_USD_PRICE
+    });
+    return next;
+  }
+
   async retryFailedFunding(entry: GdCreditEntry): Promise<GdCreditEntry> {
     if (entry.fundingStatus !== "failed") return entry;
     const now = new Date().toISOString();
     const retry: GdCreditEntry = { ...entry, fundingStatus: "pending", fundingError: undefined };
     await this.putJson(`${GD_CREDIT_PREFIX}${entry.id}`, retry);
+    await this.updateFailedDepositRecords(entry.id, entry.source === "deposit");
     await this.updateUser(entry.account, entry.rootAccount, (current) => ({
       ...current,
       updatedAt: now,
@@ -247,6 +316,18 @@ export class KVCreditStore {
     await this.putJson(`${USER_PREFIX}${profile.account}`, { ...profile, lastStreamCreditAt: next, updatedAt: new Date().toISOString() });
     logWarn("kv.stream.clock-repaired", { entryId: entry.id, account: redactAddress(entry.account), lastStreamCreditAt: next });
     return true;
+  }
+
+  async getGdCredit(id: string): Promise<GdCreditEntry | undefined> {
+    return await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${id}`);
+  }
+
+  async getFailedDeposits(): Promise<GdCreditEntry[]> {
+    const ids = await this.getJson<string[]>(FAILED_DEPOSIT_RECORDS_KEY) ?? [];
+    const entries = await Promise.all(ids.map((id) => this.getGdCredit(id)));
+    return entries.filter((entry): entry is GdCreditEntry =>
+      Boolean(entry && entry.source === "deposit" && entry.fundingStatus === "failed")
+    );
   }
 
   async getGdCredits(account: string): Promise<GdCreditEntry[]> {
@@ -320,6 +401,14 @@ export class KVCreditStore {
     const ids = (await this.getJson<string[]>(key)) ?? [];
     if (!ids.includes(entryId)) ids.push(entryId);
     await this.putJson(key, ids.slice(-500));
+  }
+
+  private async updateFailedDepositRecords(entryId: string, shouldContain: boolean): Promise<void> {
+    const ids = await this.getJson<string[]>(FAILED_DEPOSIT_RECORDS_KEY) ?? [];
+    const nextIds = shouldContain
+      ? ids.includes(entryId) ? ids : [...ids, entryId]
+      : ids.filter((id) => id !== entryId);
+    await this.putJson(FAILED_DEPOSIT_RECORDS_KEY, nextIds);
   }
 
   private async getMonthlyBonusUsed(rootAccount: string, month: string): Promise<bigint> {
