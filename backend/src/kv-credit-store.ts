@@ -40,7 +40,10 @@ export class KVCreditStore {
     const existing = await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${entryId}`);
     if (existing) {
       let updated = existing;
-      if (existing.isVerified !== input.isVerified || (input.buyerAddress && existing.buyerAddress !== input.buyerAddress.toLowerCase())) {
+      if (
+        existing.isVerified !== input.isVerified ||
+        (input.buyerAddress && existing.buyerAddress !== input.buyerAddress.toLowerCase())
+      ) {
         updated = {
           ...existing,
           isVerified: input.isVerified,
@@ -57,7 +60,14 @@ export class KVCreditStore {
       return updated;
     }
     const month = monthKey(input.date ?? new Date());
-    const bonus = calculateCreditWithBonus(input.gdAmountWei, input.source, input.isVerified, input.gdPrice, input.regularBonusBps, input.streamingBonusBps);
+    const bonus = calculateCreditWithBonus(
+      input.gdAmountWei,
+      input.source,
+      input.isVerified,
+      input.gdPrice,
+      input.regularBonusBps,
+      input.streamingBonusBps
+    );
 
     // Enforce per-root-account monthly bonus cap
     let effectiveBonusUsd = bonus.bonusUsd;
@@ -177,7 +187,12 @@ export class KVCreditStore {
     // Re-read: a concurrent request for the same id may have settled it while this one was funding,
     // and its result must not be overwritten (funded -> failed) or counted twice.
     const stored = await this.getJson<GdCreditEntry>(`${GD_CREDIT_PREFIX}${entry.id}`);
-    const settled = entry.fundingStatus !== "pending" ? entry : stored && stored.fundingStatus !== "pending" ? stored : undefined;
+    const settled =
+      entry.fundingStatus !== "pending"
+        ? entry
+        : stored && stored.fundingStatus !== "pending"
+          ? stored
+          : undefined;
     if (settled) {
       logWarn("kv.funding.already-terminal", {
         entryId: entry.id,
@@ -207,15 +222,26 @@ export class KVCreditStore {
       const creditAmount = BigInt(entry.totalCreditUsd);
       // The stream clock belongs to the streaming account alone; mirroring it onto the GoodID root
       // would skip the root's own stream window.
-      const advancesStreamClock = result.funded && entry.streamCreditedThrough !== undefined && current.account === entry.account;
+      const advancesStreamClock =
+        result.funded &&
+        entry.streamCreditedThrough !== undefined &&
+        current.account === entry.account;
       return {
         ...current,
         updatedAt: now,
-        lastStreamCreditAt: advancesStreamClock ? laterIso(current.lastStreamCreditAt, entry.streamCreditedThrough!) : current.lastStreamCreditAt,
-        totalGdDepositedWei: credited ? addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei) : current.totalGdDepositedWei,
+        lastStreamCreditAt: advancesStreamClock
+          ? laterIso(current.lastStreamCreditAt, entry.streamCreditedThrough!)
+          : current.lastStreamCreditAt,
+        totalGdDepositedWei: credited
+          ? addDecimalStrings(current.totalGdDepositedWei, entry.gdAmountWei)
+          : current.totalGdDepositedWei,
         totalGDStreamedWei:
-          credited && entry.source.startsWith("stream") ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei) : current.totalGDStreamedWei,
-        totalPrincipalUsd: (BigInt(current.totalPrincipalUsd) + (credited ? BigInt(entry.principalUsd) : 0n)).toString(),
+          credited && entry.source.startsWith("stream")
+            ? addDecimalStrings(current.totalGDStreamedWei, entry.gdAmountWei)
+            : current.totalGDStreamedWei,
+        totalPrincipalUsd: (
+          BigInt(current.totalPrincipalUsd) + (credited ? BigInt(entry.principalUsd) : 0n)
+        ).toString(),
         totalBonusUsd: (BigInt(current.totalBonusUsd) + (credited ? BigInt(entry.bonusUsd) : 0n)).toString(),
         totalOutstandingFundingUsd: (outstanding > creditAmount ? outstanding - creditAmount : 0n).toString()
       };
@@ -253,12 +279,14 @@ export class KVCreditStore {
     const month = entry.streamUpdateMonth;
     const monthlyBonusUsed = await this.getMonthlyBonusUsed(entry.rootAccount, month);
     const previousBonusUsd = BigInt(entry.bonusUsd);
-    const monthlyBonusUsedExcludingEntry = monthlyBonusUsed > previousBonusUsd ? monthlyBonusUsed - previousBonusUsd : 0n;
+    const monthlyBonusUsedExcludingEntry =
+      monthlyBonusUsed > previousBonusUsd ? monthlyBonusUsed - previousBonusUsd : 0n;
 
     if (effectiveBonusUsd > 0n && cfg.MAX_BONUS_CAP_USD > 0n) {
-      const remainingCap = cfg.MAX_BONUS_CAP_USD > monthlyBonusUsedExcludingEntry
-        ? cfg.MAX_BONUS_CAP_USD - monthlyBonusUsedExcludingEntry
-        : 0n;
+      const remainingCap =
+        cfg.MAX_BONUS_CAP_USD > monthlyBonusUsedExcludingEntry
+          ? cfg.MAX_BONUS_CAP_USD - monthlyBonusUsedExcludingEntry
+          : 0n;
       effectiveBonusUsd = effectiveBonusUsd > remainingCap ? remainingCap : effectiveBonusUsd;
     }
 
@@ -298,7 +326,11 @@ export class KVCreditStore {
       updatedAt: now,
       totalOutstandingFundingUsd: addDecimalStrings(current.totalOutstandingFundingUsd, entry.totalCreditUsd)
     }));
-    logInfo("kv.funding.retry", { entryId: entry.id, account: redactAddress(entry.account), previousError: entry.fundingError });
+    logInfo("kv.funding.retry", {
+      entryId: entry.id,
+      account: redactAddress(entry.account),
+      previousError: entry.fundingError
+    });
     return retry;
   }
 
@@ -313,8 +345,16 @@ export class KVCreditStore {
     const profile = await this.getUser(entry.account);
     const next = laterIso(profile.lastStreamCreditAt, entry.streamCreditedThrough);
     if (next === profile.lastStreamCreditAt) return false;
-    await this.putJson(`${USER_PREFIX}${profile.account}`, { ...profile, lastStreamCreditAt: next, updatedAt: new Date().toISOString() });
-    logWarn("kv.stream.clock-repaired", { entryId: entry.id, account: redactAddress(entry.account), lastStreamCreditAt: next });
+    await this.putJson(`${USER_PREFIX}${profile.account}`, {
+      ...profile,
+      lastStreamCreditAt: next,
+      updatedAt: new Date().toISOString()
+    });
+    logWarn("kv.stream.clock-repaired", {
+      entryId: entry.id,
+      account: redactAddress(entry.account),
+      lastStreamCreditAt: next
+    });
     return true;
   }
 
@@ -323,10 +363,11 @@ export class KVCreditStore {
   }
 
   async getFailedDeposits(): Promise<GdCreditEntry[]> {
-    const ids = await this.getJson<string[]>(FAILED_DEPOSIT_RECORDS_KEY) ?? [];
+    const ids = (await this.getJson<string[]>(FAILED_DEPOSIT_RECORDS_KEY)) ?? [];
     const entries = await Promise.all(ids.map((id) => this.getGdCredit(id)));
-    return entries.filter((entry): entry is GdCreditEntry =>
-      Boolean(entry && entry.source === "deposit" && entry.fundingStatus === "failed")
+    return entries.filter(
+      (entry): entry is GdCreditEntry =>
+        Boolean(entry && entry.source === "deposit" && entry.fundingStatus === "failed")
     );
   }
 
@@ -404,9 +445,11 @@ export class KVCreditStore {
   }
 
   private async updateFailedDepositRecords(entryId: string, shouldContain: boolean): Promise<void> {
-    const ids = await this.getJson<string[]>(FAILED_DEPOSIT_RECORDS_KEY) ?? [];
+    const ids = (await this.getJson<string[]>(FAILED_DEPOSIT_RECORDS_KEY)) ?? [];
     const nextIds = shouldContain
-      ? ids.includes(entryId) ? ids : [...ids, entryId]
+      ? ids.includes(entryId)
+        ? ids
+        : [...ids, entryId]
       : ids.filter((id) => id !== entryId);
     await this.putJson(FAILED_DEPOSIT_RECORDS_KEY, nextIds);
   }
@@ -423,7 +466,11 @@ export class KVCreditStore {
     await this.putJson(key, (current + amount).toString());
   }
 
-  private async updateUser(account: string, rootAccount: string | undefined, mutate: (profile: UserCreditProfile) => UserCreditProfile): Promise<void> {
+  private async updateUser(
+    account: string,
+    rootAccount: string | undefined,
+    mutate: (profile: UserCreditProfile) => UserCreditProfile
+  ): Promise<void> {
     const normalized = normalizeAccount(account);
     const normalizedRoot = normalizeAccount(rootAccount ?? account);
     const current = await this.getUser(normalized);

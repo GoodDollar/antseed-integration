@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Interface, Wallet } from "ethers";
 import worker from "../src/worker.js";
-import { fundCredit } from "../src/funding.js";
+import { fundCredit, retryFailedDeposits } from "../src/funding.js";
 import { AntSeedFundingVaultClient } from "../src/antseed-funding-vault.js";
 import { Env, configFromEnv } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
@@ -1711,6 +1711,52 @@ test("fundCredit retries a failed entry and records idempotent on-chain recovery
   assert.equal(recovered.fundingStatus, "funded");
   assert.equal(recovered.fundingError, undefined);
   assert.equal(recovered.fundingTxHash, submittedTxHash);
+});
+
+test("cron retry helper retries only failed deposit entries", async () => {
+  const account = "0x0000000000000000000000000000000000000def";
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  const failedDeposit = await store.recordGdCredit({
+    id: `0x${"1".repeat(64)}:0`,
+    account,
+    source: "deposit",
+    gdAmountWei: 10n ** 18n,
+    isVerified: false,
+    gdPrice: 1,
+    maxBonusCapUsd: 0n,
+    regularBonusBps: 0n,
+    streamingBonusBps: 0n
+  });
+  await store.markFundingResult(failedDeposit, { funded: false, error: "vault unavailable" });
+
+  const fundedStream = await store.recordGdCredit({
+    id: "stream:failed-stream:0",
+    account,
+    source: "streamCron",
+    gdAmountWei: 10n ** 18n,
+    isVerified: false,
+    gdPrice: 1,
+    maxBonusCapUsd: 0n,
+    regularBonusBps: 0n,
+    streamingBonusBps: 0n
+  });
+  await store.markFundingResult(fundedStream, { funded: false, error: "vault unavailable" });
+
+  let retryCalls = 0;
+  const vault = {
+    enabled: true,
+    async depositForBuyerWithId() {
+      retryCalls += 1;
+      return { enabled: true, buyer: account, amountUsd: failedDeposit.totalCreditUsd, txHash: `0x${"2".repeat(64)}` };
+    }
+  };
+
+  const summary = await retryFailedDeposits(store, vault as never);
+  assert.equal(summary.found, 1);
+  assert.equal(summary.retried, 1);
+  assert.equal(summary.funded, 1);
+  assert.equal(retryCalls, 1);
 });
 
 test("funding client reconciles a submitted deposit through the contract id", async () => {

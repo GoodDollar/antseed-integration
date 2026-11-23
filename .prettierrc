@@ -1,5 +1,5 @@
 {
-  "printWidth": 160,
+  "printWidth": 120,
   "objectWrap": "preserve",
   "trailingComma": "none",
   "overrides": [{ "files": "*.sol", "options": { "printWidth": 160, "tabWidth": 4 } }]
