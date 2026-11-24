@@ -87,6 +87,11 @@ contract MockGdToken is IERC20Like {
 contract MockCFA {
     mapping(address => int96) public flowRates;
     mapping(address => uint256) public flowUpdatedAt;
+    bool public revertGetFlow;
+
+    function setRevertGetFlow(bool shouldRevert) external {
+        revertGetFlow = shouldRevert;
+    }
 
     function setFlow(address sender, int96 flowRate) external {
         setFlowAt(sender, flowRate, block.timestamp);
@@ -98,6 +103,7 @@ contract MockCFA {
     }
 
     function getFlow(address, address sender, address) external view returns (uint256, int96, uint256, uint256) {
+        if (revertGetFlow) revert("cfa failure");
         return (flowUpdatedAt[sender], flowRates[sender], 0, 0);
     }
 }
@@ -880,6 +886,332 @@ contract CeloGdAntSeedVaultTest {
         require(reportedRate == 0, "flow ended");
         require(monthly == 0, "no monthly amount");
         require(totalFlow == uint256(uint96(flowRate)) * 1000, "elapsed flow from block.timestamp");
+    }
+
+    function testTerminationIgnoresNonCfaAgreementDataWithoutDecoding() public {
+        setUp();
+        // Non-CFA agreement data with a dirty first word: decoding it as (address, address) would revert.
+        bytes memory foreignData = abi.encode(type(uint256).max, uint256(1), uint256(2));
+        vm.recordLogs();
+        (bool ok, bytes memory ret) = address(host).call(
+            abi.encodeWithSignature(
+                "callAfterTerminated(address,address,address,bytes)",
+                address(vault),
+                address(token),
+                address(0xA11CE),
+                foreignData
+            )
+        );
+        require(ok, "non-CFA termination must not revert");
+        require(keccak256(abi.decode(ret, (bytes))) == keccak256(""), "ctx returned unchanged");
+        (address account, bytes4 reason) = _lastTerminationIgnored();
+        require(account == address(0), "no sender decoded");
+        require(reason == CeloGdAntSeedVault.UnsupportedAgreement.selector, "unsupported agreement reported");
+    }
+
+    function testTerminationIgnoresMalformedCfaAgreementData() public {
+        setUp();
+        bytes[3] memory malformed = [
+            bytes(hex"1234"),
+            abi.encode(type(uint256).max, address(vault)),
+            abi.encode(address(user), type(uint256).max)
+        ];
+        for (uint256 i = 0; i < malformed.length; i++) {
+            vm.recordLogs();
+            (bool ok, ) = address(host).call(
+                abi.encodeWithSignature(
+                    "callAfterTerminated(address,address,address,bytes)",
+                    address(vault),
+                    address(token),
+                    address(cfa),
+                    malformed[i]
+                )
+            );
+            require(ok, "malformed agreement data must not revert");
+            (, bytes4 reason) = _lastTerminationIgnored();
+            require(reason == CeloGdAntSeedVault.InvalidAgreementData.selector, "invalid agreement data reported");
+        }
+    }
+
+    function testBeforeAgreementTerminatedNeverRevertsOnInvalidInputs() public {
+        setUp();
+        bytes memory emptySnapshot = abi.encode(uint256(0), int96(0));
+
+        // Wrong token
+        bytes memory cbdata = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(
+                    CeloGdAntSeedVault.beforeAgreementTerminated,
+                    (address(0xBAD), address(cfa), bytes32(0), abi.encode(address(user), address(vault)), "")
+                )
+            ),
+            (bytes)
+        );
+        require(keccak256(cbdata) == keccak256(emptySnapshot), "wrong token returns empty snapshot");
+
+        // Non-CFA agreement class with dirty agreementData
+        cbdata = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(
+                    CeloGdAntSeedVault.beforeAgreementTerminated,
+                    (address(token), address(0xA11CE), bytes32(0), abi.encode(type(uint256).max, uint256(1)), "")
+                )
+            ),
+            (bytes)
+        );
+        require(keccak256(cbdata) == keccak256(emptySnapshot), "non-CFA returns empty snapshot");
+
+        // Malformed CFA agreementData: short, dirty sender, dirty receiver
+        bytes[3] memory malformed = [
+            bytes(hex"1234"),
+            abi.encode(type(uint256).max, address(vault)),
+            abi.encode(address(user), type(uint256).max)
+        ];
+        for (uint256 i = 0; i < malformed.length; i++) {
+            cbdata = abi.decode(
+                host.forward(
+                    address(vault),
+                    abi.encodeCall(
+                        CeloGdAntSeedVault.beforeAgreementTerminated,
+                        (address(token), address(cfa), bytes32(0), malformed[i], "")
+                    )
+                ),
+                (bytes)
+            );
+            require(keccak256(cbdata) == keccak256(emptySnapshot), "malformed data returns empty snapshot");
+        }
+
+        // Wrong receiver
+        cbdata = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(
+                    CeloGdAntSeedVault.beforeAgreementTerminated,
+                    (address(token), address(cfa), bytes32(0), abi.encode(address(user), address(0xBEEF)), "")
+                )
+            ),
+            (bytes)
+        );
+        require(keccak256(cbdata) == keccak256(emptySnapshot), "wrong receiver returns empty snapshot");
+    }
+
+    function testTerminationPreservesNonEmptyCtxAndEmitsDiagnosticReasons() public {
+        setUp();
+        bytes memory ctx = abi.encode(BUYER);
+
+        // Wrong token
+        vm.recordLogs();
+        bytes memory retCtx = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(
+                    CeloGdAntSeedVault.afterAgreementTerminated,
+                    (address(0xBAD), address(cfa), bytes32(0), abi.encode(address(user), address(vault)), "", ctx)
+                )
+            ),
+            (bytes)
+        );
+        require(keccak256(retCtx) == keccak256(ctx), "wrong token preserves ctx");
+        (address account, bytes4 reason) = _lastTerminationIgnored();
+        require(account == address(0), "wrong token does not decode sender");
+        require(reason == CeloGdAntSeedVault.UnsupportedToken.selector, "unsupported token reported");
+
+        // Wrong receiver
+        vm.recordLogs();
+        retCtx = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(
+                    CeloGdAntSeedVault.afterAgreementTerminated,
+                    (address(token), address(cfa), bytes32(0), abi.encode(address(user), address(0xBEEF)), "", ctx)
+                )
+            ),
+            (bytes)
+        );
+        require(keccak256(retCtx) == keccak256(ctx), "wrong receiver preserves ctx");
+        (account, reason) = _lastTerminationIgnored();
+        require(account == address(user), "wrong receiver reports sender");
+        require(reason == CeloGdAntSeedVault.WrongReceiver.selector, "wrong receiver reported");
+    }
+
+    function testTerminationDoesNotRevertWhenCfaNegativeOrOracleReverts() public {
+        setUp();
+        int96 flowRate = 38580246913580;
+        uint256 start = block.timestamp;
+        host.createFlow(vault, address(token), address(user), flowRate, abi.encode(BUYER));
+
+        // Even if CFA reports a negative flow rate, the oracle reverts, and the minimum is max,
+        // termination must not query them or revert.
+        cfa.setFlow(address(user), -1);
+        MockRevertingOracle revertingOracle = new MockRevertingOracle();
+        vault.setStaticOracleConfig(address(revertingOracle), address(0xC05D), 1e18);
+        vault.setMinimumUsdThresholds(type(uint256).max, type(uint256).max);
+
+        vm.warp(start + 500);
+        bytes memory ctx = abi.encode(BUYER);
+        bytes memory cbdata = abi.encode(start, flowRate);
+        vm.recordLogs();
+        bytes memory retCtx = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(
+                    CeloGdAntSeedVault.afterAgreementTerminated,
+                    (address(token), address(cfa), bytes32(0), abi.encode(address(user), address(vault)), cbdata, ctx)
+                )
+            ),
+            (bytes)
+        );
+        require(keccak256(retCtx) == keccak256(ctx), "ctx preserved");
+        (address buyer_, int96 reportedRate, uint256 monthly, uint256 totalFlow) = _lastStreamUpdated();
+        require(buyer_ == BUYER, "stored buyer kept");
+        require(reportedRate == 0, "flow rate is zero");
+        require(monthly == 0, "monthly amount is zero");
+        require(totalFlow == uint256(uint96(flowRate)) * 500, "elapsed flow recorded");
+    }
+
+    /// @dev Fuzzes both termination callbacks with arbitrary inputs from the Host to guarantee they never revert.
+    function testFuzzTerminationCallbacksNeverRevert(
+        address superToken,
+        address agreementClass,
+        bytes32 agreementId,
+        bytes calldata agreementData,
+        bytes calldata ctx
+    ) public {
+        bytes memory cbdata = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(CeloGdAntSeedVault.beforeAgreementTerminated, (superToken, agreementClass, agreementId, agreementData, ctx))
+            ),
+            (bytes)
+        );
+        bytes memory retCtx = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(CeloGdAntSeedVault.afterAgreementTerminated, (superToken, agreementClass, agreementId, agreementData, cbdata, ctx))
+            ),
+            (bytes)
+        );
+        require(keccak256(retCtx) == keccak256(ctx), "termination must return ctx unchanged");
+    }
+
+    /// @dev Fuzzes the accepted termination path with a stored buyer, valid positive rate, and varying elapsed time.
+    function testFuzzAcceptedTerminationNeverRevertsAndRecordsElapsedFlow(
+        uint96 rawFlowRate,
+        uint64 elapsedSeconds,
+        bytes calldata ctx
+    ) public {
+        // Bound to positive flow rates that pass createFlow's minimum (1 USD/mo) without overflowing uint128(monthly) * 1e18.
+        int96 flowRate = int96(385_802_469_136 + (rawFlowRate % (131_000_000_000_000 - 385_802_469_136 + 1)));
+        host.createFlow(vault, address(token), address(user), flowRate, abi.encode(BUYER));
+
+        vm.warp(block.timestamp + uint256(elapsedSeconds));
+        vm.recordLogs();
+        bytes memory retCtx = host.terminateFlow(vault, address(token), address(user), ctx);
+
+        require(keccak256(retCtx) == keccak256(ctx), "accepted termination must return ctx unchanged");
+        (address buyer_, int96 reportedRate, uint256 monthly, uint256 totalFlow) = _lastStreamUpdated();
+        require(buyer_ == BUYER, "stored buyer preserved");
+        require(reportedRate == 0, "terminated flow rate is zero");
+        require(monthly == 0, "terminated monthly amount is zero");
+        require(totalFlow == uint256(uint96(flowRate)) * uint256(elapsedSeconds), "elapsed flow matches");
+    }
+
+    function testTerminationDoesNotRevertWhenCfaGetFlowRevertsOrCbdataMalformed() public {
+        setUp();
+        int96 flowRate = 38580246913580;
+        host.createFlow(vault, address(token), address(user), flowRate, abi.encode(BUYER));
+
+        // 1. CFA getFlow reverts during beforeAgreementTerminated: falls back to empty snapshot without reverting.
+        cfa.setRevertGetFlow(true);
+        bytes memory agreementData = abi.encode(address(user), address(vault));
+        bytes memory ctx = abi.encode(BUYER);
+        bytes memory cbdata = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(CeloGdAntSeedVault.beforeAgreementTerminated, (address(token), address(cfa), bytes32(0), agreementData, ctx))
+            ),
+            (bytes)
+        );
+        require(keccak256(cbdata) == keccak256(abi.encode(uint256(0), int96(0))), "reverting CFA falls back to empty snapshot");
+
+        vm.recordLogs();
+        bytes memory retCtx = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(CeloGdAntSeedVault.afterAgreementTerminated, (address(token), address(cfa), bytes32(0), agreementData, cbdata, ctx))
+            ),
+            (bytes)
+        );
+        require(keccak256(retCtx) == keccak256(ctx), "ctx preserved when CFA reverts");
+        (address buyer_, int96 reportedRate, uint256 monthly, uint256 totalFlow) = _lastStreamUpdated();
+        require(buyer_ == BUYER, "stored buyer kept");
+        require(reportedRate == 0 && monthly == 0 && totalFlow == 0, "fallback snapshot emits zero elapsed flow");
+
+        // 2. Malformed 64-byte cbdata with dirty int96 upper bits must not revert in afterAgreementTerminated.
+        bytes memory dirtyCbdata = abi.encode(block.timestamp, (uint256(1) << 200) | uint256(uint96(flowRate)));
+        vm.recordLogs();
+        retCtx = abi.decode(
+            host.forward(
+                address(vault),
+                abi.encodeCall(CeloGdAntSeedVault.afterAgreementTerminated, (address(token), address(cfa), bytes32(0), agreementData, dirtyCbdata, ctx))
+            ),
+            (bytes)
+        );
+        require(keccak256(retCtx) == keccak256(ctx), "ctx preserved on dirty cbdata");
+        (buyer_, reportedRate, monthly, totalFlow) = _lastStreamUpdated();
+        require(buyer_ == BUYER && reportedRate == 0 && monthly == 0 && totalFlow == 0, "dirty cbdata falls back to zero flow");
+    }
+
+    function testTerminationWithoutStoredBuyerEmitsDiagnostic() public {
+        setUp();
+        cfa.setFlow(address(user), 0);
+        vm.recordLogs();
+        host.callAfterTerminated(vault, address(token), address(cfa), abi.encode(address(user), address(vault)));
+        (address account, bytes4 reason) = _lastTerminationIgnored();
+        require(account == address(user), "sender reported");
+        require(reason == CeloGdAntSeedVault.MissingBuyerAddress.selector, "missing buyer reported");
+    }
+
+    function testCreateRejectsDirtyPaddedBuyerWithMissingBuyerAddress() public {
+        setUp();
+        // Valid address in the low 20 bytes, non-zero upper 12 bytes: the backend treats this as no buyer too.
+        bytes memory dirtyBuyer = abi.encode((uint256(1) << 200) | uint256(uint160(BUYER)));
+        (bool ok, bytes memory err) = address(host).call(
+            abi.encodeWithSignature(
+                "createFlow(address,address,address,int96,bytes)",
+                address(vault),
+                address(token),
+                address(user),
+                int96(38580246913580),
+                dirtyBuyer
+            )
+        );
+        require(!ok, "dirty buyer rejected");
+        require(bytes4(err) == CeloGdAntSeedVault.MissingBuyerAddress.selector, "rejected as missing buyer");
+    }
+
+    function testDepositRejectsDirtyPaddedBuyerWithMissingBuyerAddress() public {
+        setUp();
+        user.approveVault(1 ether);
+        bytes memory dirtyBuyer = abi.encode((uint256(1) << 200) | uint256(uint160(BUYER)));
+        (bool ok, bytes memory err) = address(vault).call(abi.encodeWithSignature("deposit(uint256,bytes)", uint256(1 ether), dirtyBuyer));
+        require(!ok, "dirty buyer rejected");
+        require(bytes4(err) == CeloGdAntSeedVault.MissingBuyerAddress.selector, "rejected as missing buyer");
+    }
+
+    /// @dev Decodes the most recent StreamTerminationIgnored log emitted by the vault.
+    function _lastTerminationIgnored() internal returns (address account, bytes4 reason) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("StreamTerminationIgnored(address,address,address,bytes4)");
+        for (uint256 i = logs.length; i > 0; i--) {
+            Vm.Log memory l = logs[i - 1];
+            if (l.emitter == address(vault) && l.topics[0] == sig) {
+                return (address(uint160(uint256(l.topics[1]))), abi.decode(l.data, (bytes4)));
+            }
+        }
+        revert("StreamTerminationIgnored not found");
     }
 
     // --- update uses the stored buyer ---

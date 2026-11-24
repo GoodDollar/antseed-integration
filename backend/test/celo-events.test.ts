@@ -4,6 +4,7 @@ import { Interface } from "ethers";
 import {
   encodeVaultEventLog,
   fetchCeloVaultEvents,
+  fetchCeloVaultEventsForAccount,
   fetchCurrentGdPrice,
   fetchGoodIdRoot,
   parseCeloVaultLogs,
@@ -156,6 +157,51 @@ test("parses Celo vault StreamUpdated logs", () => {
   }
 });
 
+test("parses and logs StreamTerminationIgnored without emitting a credit event and includes its topic in account queries", async () => {
+  const superToken = "0x0000000000000000000000000000000000000ccc";
+  const agreementClass = "0x0000000000000000000000000000000000000ddd";
+  const reason = "0x12345678";
+  const log = encodeVaultEventLog("StreamTerminationIgnored", [account, superToken, agreementClass, reason], vault, txHash, 4);
+
+  const warns: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warns.push(args);
+  };
+  try {
+    const events = parseCeloVaultLogs([log], vault);
+    assert.deepEqual(events, []);
+    const serializedWarns = warns.map((args) => args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+    assert.ok(
+      serializedWarns.some((entry) => entry.includes("celo.events.stream-termination-ignored") && entry.includes(reason)),
+      `expected structured stream-termination-ignored warning, got: ${serializedWarns.join(" | ")}`
+    );
+    assert.ok(
+      !serializedWarns.some((entry) => entry.includes("decodeFailures")),
+      "StreamTerminationIgnored should not be counted as a decode failure"
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const originalFetch = globalThis.fetch;
+  let capturedTopics: unknown;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    capturedTopics = body.params?.[0]?.topics;
+    return Response.json({ jsonrpc: "2.0", id: body.id, result: [log] });
+  }) as typeof fetch;
+  try {
+    const cfg = configFromEnv({ ANTSEED_KV: {} as KVNamespace, CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: vault });
+    const events = await fetchCeloVaultEventsForAccount(account, cfg, "0x1");
+    assert.deepEqual(events, []);
+    assert.ok(Array.isArray(capturedTopics) && Array.isArray(capturedTopics[0]));
+    assert.ok(capturedTopics[0].includes(log.topics[0]), "account log filter must include StreamTerminationIgnored topic");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("decodeBuyerFromUserData decodes abi-encoded address from Superfluid userData", () => {
   const buyer = "0x000000000000000000000000000000000000bEEF";
   // Simulate abi.encode(address): 12 bytes padding + 20 bytes address = 32 bytes
@@ -166,6 +212,8 @@ test("decodeBuyerFromUserData decodes abi-encoded address from Superfluid userDa
   assert.equal(decodeBuyerFromUserData(undefined), undefined);
   assert.equal(decodeBuyerFromUserData("0x"), undefined);
   assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(32)), undefined); // zero address
+  // Non-zero upper padding is rejected, matching the vault's on-chain `_decodeBuyer`.
+  assert.equal(decodeBuyerFromUserData("0x" + "00".repeat(11) + "01" + buyer.slice(2).toLowerCase()), undefined);
 });
 
 test("fetches GD price from StaticOracle quoteAllAvailablePoolsWithTimePeriod", async () => {
