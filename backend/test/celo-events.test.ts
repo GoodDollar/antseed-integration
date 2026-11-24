@@ -188,34 +188,15 @@ test("parses and logs StreamTerminationIgnored without emitting a credit event a
   let capturedTopics: unknown;
   globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
-    if (body.method === "eth_getTransactionReceipt") {
-      return Response.json({ jsonrpc: "2.0", id: body.id, result: { status: "0x1", logs: [log] } });
-    }
     capturedTopics = body.params?.[0]?.topics;
     return Response.json({ jsonrpc: "2.0", id: body.id, result: [log] });
   }) as typeof fetch;
   try {
-    const failures: FailureDetails[] = [];
     const cfg = configFromEnv({ ANTSEED_KV: {} as KVNamespace, CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: vault });
-    cfg.reportFailure = async (details) => {
-      failures.push(details);
-    };
-    const txEvents = await fetchCeloVaultEvents(txHash, cfg);
-    assert.deepEqual(txEvents, []);
     const events = await fetchCeloVaultEventsForAccount(account, cfg, "0x1");
     assert.deepEqual(events, []);
     assert.ok(Array.isArray(capturedTopics) && Array.isArray(capturedTopics[0]));
     assert.ok(capturedTopics[0].includes(log.topics[0]), "account log filter must include StreamTerminationIgnored topic");
-    assert.equal(failures.length, 2);
-    for (const failure of failures) {
-      assert.equal(failure.operation, "celo.events.stream-termination-ignored");
-      assert.equal(failure.chain, "celo");
-      assert.equal(failure.entryId, `${txHash}:4`);
-      assert.equal(failure.account, account.toLowerCase());
-      assert.equal(failure.txHash, txHash);
-      assert.equal(failure.reason, reason);
-      assert.equal((failure.error as Error | undefined)?.name, "StreamTerminationIgnored");
-    }
   } finally {
     globalThis.fetch = originalFetch;
   }

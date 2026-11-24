@@ -7,10 +7,8 @@ export type FailureDetails = {
   error?: unknown;
   recovered?: boolean;
   entryId?: string;
-  account?: string;
   buyer?: string;
   txHash?: string;
-  reason?: string;
   request?: { method: string; path: string; body: string | undefined };
 };
 
@@ -30,7 +28,6 @@ export async function notifySlackOnFailure(env: Pick<Env, "SLACK_WEBHOOK_URL">, 
   const category = error?.name === "BuyerDepositBelowMinimum" ? "BUYER_DEPOSIT_BELOW_MINIMUM"
     : error?.name === "CeloTransactionReverted" ? "TRANSACTION_REVERTED"
     : error?.name === "CeloReceiptPending" ? "RECEIPT_PENDING"
-    : error?.name === "StreamTerminationIgnored" ? "STREAM_TERMINATION_IGNORED"
     : typeof error?.code === "string" && allowedCodes.has(error.code) ? error.code : "OPERATION_FAILED";
   const txHash = details.txHash ?? error?.receipt?.hash;
   const text = [
@@ -45,10 +42,8 @@ export async function notifySlackOnFailure(env: Pick<Env, "SLACK_WEBHOOK_URL">, 
       `body: ${details.request.body === undefined ? "[empty]" : truncate(details.request.body, 3000)}`
     ] : []),
     ...(details.entryId && /^(?:0x[a-fA-F0-9]{64}:\d+|stream:0x[a-fA-F0-9]{40}:\d+)$/.test(details.entryId) ? [`entryId: ${details.entryId}`] : []),
-    ...(details.account && /^0x[a-fA-F0-9]{40}$/.test(details.account) ? [`account: ${details.account}`] : []),
     ...(details.buyer && /^0x[a-fA-F0-9]{40}$/.test(details.buyer) ? [`buyer: ${details.buyer}`] : []),
-    ...(typeof txHash === "string" && /^0x[a-fA-F0-9]{64}$/.test(txHash) ? [`txHash: ${txHash}`] : []),
-    ...(details.reason && /^0x[a-fA-F0-9]{8}$/.test(details.reason) ? [`reason: ${details.reason}`] : [])
+    ...(typeof txHash === "string" && /^0x[a-fA-F0-9]{64}$/.test(txHash) ? [`txHash: ${txHash}`] : [])
   ].join("\n");
   try {
     const response = await fetch(env.SLACK_WEBHOOK_URL, {
