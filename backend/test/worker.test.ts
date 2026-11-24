@@ -621,6 +621,49 @@ test("reverted Celo receipts reach the request alert boundary", { concurrency: f
   }
 });
 
+test("StreamTerminationIgnored events notify Slack with diagnostic details", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  const messages: string[] = [];
+  const account = "0x0000000000000000000000000000000000000abc";
+  const vault = "0x0000000000000000000000000000000000000def";
+  const superToken = "0x0000000000000000000000000000000000000111";
+  const agreementClass = "0x0000000000000000000000000000000000000222";
+  const reason = "0xdeadbeef";
+  const txHash = `0x${"f".repeat(64)}`;
+  const ignoredLog = encodeVaultEventLog("StreamTerminationIgnored", [account, superToken, agreementClass, reason], vault, txHash, 3);
+  try {
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      if (String(url) === "https://slack.test") {
+        messages.push(JSON.parse(String(init?.body)).text);
+        return new Response("ok");
+      }
+      return Response.json({ result: { status: "0x1", logs: [ignoredLog] } });
+    }) as typeof fetch;
+    const response = await worker.fetch(
+      new Request("https://worker.test/v1/celo/events/record", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ txHash })
+      }),
+      env({ CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: vault, SLACK_WEBHOOK_URL: "https://slack.test" }),
+      makeExecutionContext()
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as { events: GdCreditEntry[] };
+    assert.deepEqual(body.events, []);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0], /operation: celo\.events\.stream-termination-ignored/);
+    assert.match(messages[0], /chain: celo/);
+    assert.match(messages[0], /category: STREAM_TERMINATION_IGNORED/);
+    assert.match(messages[0], new RegExp(`entryId: ${txHash}:3`));
+    assert.match(messages[0], new RegExp(`account: ${account}`));
+    assert.match(messages[0], new RegExp(`txHash: ${txHash}`));
+    assert.match(messages[0], new RegExp(`reason: ${reason}`));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Slack delivery failure is best effort and does not recurse", { concurrency: false }, async () => {
   const originalFetch = globalThis.fetch;
   let attempts = 0;

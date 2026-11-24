@@ -17,6 +17,15 @@ const STATIC_ORACLE_ABI = new Interface([
   "function quoteAllAvailablePoolsWithTimePeriod(uint128 baseAmount, address baseToken, address quoteToken, uint32 period) view returns (uint256 quoteAmount, address[] queriedPools)"
 ]);
 
+export type StreamTerminationIgnoredEvent = {
+  account: string;
+  superToken: string;
+  agreementClass: string;
+  reason: string;
+  txHash: string;
+  logIndex: number;
+};
+
 export type ParsedCeloVaultEvent =
   | {
       kind: "deposit";
@@ -85,7 +94,9 @@ export async function fetchCeloVaultEvents(txHash: string, cfg: RuntimeConfig): 
   if (receipt.status === "0x0" || receipt.status === 0) {
     throw Object.assign(new Error(`Celo transaction reverted: ${txHash}`), { name: "CeloTransactionReverted", receipt: { hash: txHash, status: 0 } });
   }
-  const parsed = parseCeloVaultLogs(receipt.logs, cfg.CELO_VAULT_ADDRESS);
+  const ignoredTerminations: StreamTerminationIgnoredEvent[] = [];
+  const parsed = parseCeloVaultLogs(receipt.logs, cfg.CELO_VAULT_ADDRESS, (event) => ignoredTerminations.push(event));
+  await reportIgnoredTerminations(ignoredTerminations, cfg);
   logInfo("celo.events.fetch.tx.end", {
     txHash: redactHash(txHash),
     count: parsed.length
@@ -120,7 +131,9 @@ export async function fetchCeloVaultEventsForAccount(
       topics: [[depositEvent.topicHash, streamEvent.topicHash, terminationIgnoredEvent.topicHash], [accountTopic]]
     }
   ]);
-  const parsed = parseCeloVaultLogs(logs, cfg.CELO_VAULT_ADDRESS);
+  const ignoredTerminations: StreamTerminationIgnoredEvent[] = [];
+  const parsed = parseCeloVaultLogs(logs, cfg.CELO_VAULT_ADDRESS, (event) => ignoredTerminations.push(event));
+  await reportIgnoredTerminations(ignoredTerminations, cfg);
   logInfo("celo.events.fetch.account.end", {
     account: redactAddress(account),
     fromBlock,
@@ -191,7 +204,29 @@ export async function fetchCurrentGdPrice(cfg: RuntimeConfig): Promise<number> {
   }
 }
 
-export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): ParsedCeloVaultEvent[] {
+/** Reports ignored stream termination diagnostics to the configured failure notifier (e.g. Slack). */
+async function reportIgnoredTerminations(events: StreamTerminationIgnoredEvent[], cfg: RuntimeConfig): Promise<void> {
+  for (const event of events) {
+    const error = Object.assign(new Error(`Stream termination ignored: ${event.reason}`), {
+      name: "StreamTerminationIgnored"
+    });
+    await cfg.reportFailure?.({
+      operation: "celo.events.stream-termination-ignored",
+      chain: "celo",
+      error,
+      entryId: `${event.txHash}:${event.logIndex}`,
+      account: event.account,
+      txHash: event.txHash,
+      reason: event.reason
+    });
+  }
+}
+
+export function parseCeloVaultLogs(
+  logs: RpcLog[],
+  vaultAddress: string,
+  onTerminationIgnored?: (event: StreamTerminationIgnoredEvent) => void
+): ParsedCeloVaultEvent[] {
   const normalizedVault = getAddress(vaultAddress);
   const parsed: ParsedCeloVaultEvent[] = [];
   let skippedWrongAddress = 0;
@@ -237,14 +272,23 @@ export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): Parsed
     }
 
     if (decoded.name === "StreamTerminationIgnored") {
-      logWarn("celo.events.stream-termination-ignored", {
-        account: redactAddress(decoded.args.account),
-        superToken: redactAddress(decoded.args.superToken),
-        agreementClass: redactAddress(decoded.args.agreementClass),
+      const ignoredEvent: StreamTerminationIgnoredEvent = {
+        account: getAddress(decoded.args.account).toLowerCase(),
+        superToken: getAddress(decoded.args.superToken).toLowerCase(),
+        agreementClass: getAddress(decoded.args.agreementClass).toLowerCase(),
         reason: String(decoded.args.reason),
-        txHash: redactHash(log.transactionHash),
+        txHash: log.transactionHash,
         logIndex: Number(log.logIndex)
+      };
+      logWarn("celo.events.stream-termination-ignored", {
+        account: redactAddress(ignoredEvent.account),
+        superToken: redactAddress(ignoredEvent.superToken),
+        agreementClass: redactAddress(ignoredEvent.agreementClass),
+        reason: ignoredEvent.reason,
+        txHash: redactHash(ignoredEvent.txHash),
+        logIndex: ignoredEvent.logIndex
       });
+      onTerminationIgnored?.(ignoredEvent);
     }
   }
 
