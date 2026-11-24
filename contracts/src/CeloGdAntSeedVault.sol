@@ -360,6 +360,8 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         emit StreamUpdated(sender, buyer, flowRate, monthlyAmount, totalFlow);
     }
 
+    /// @dev Snapshots `(timestamp, flowRate)` from the CFA without reverting, so `beforeAgreementTerminated`
+    ///      cannot jail the SuperApp even if `cfaV1.getFlow` reverts or returns malformed data.
     function _currentFlowSnapshot(address superToken, address agreementClass, bytes calldata agreementData) private view returns (bytes memory cbdata) {
         if (superToken != address(gdToken) || agreementClass != cfaV1) {
             return abi.encode(uint256(0), int96(0));
@@ -370,8 +372,23 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
             return abi.encode(uint256(0), int96(0));
         }
 
-        (uint256 timestamp, int96 flowRate, , ) = IConstantFlowAgreementV1Like(cfaV1).getFlow(superToken, sender, address(this));
-        return abi.encode(timestamp, flowRate);
+        (bool ok, bytes memory data) = cfaV1.staticcall(
+            abi.encodeWithSelector(IConstantFlowAgreementV1Like.getFlow.selector, superToken, sender, address(this))
+        );
+        if (!ok || data.length < 64) {
+            return abi.encode(uint256(0), int96(0));
+        }
+
+        uint256 updatedAt;
+        int256 rawFlowRate;
+        assembly {
+            updatedAt := mload(add(data, 32))
+            rawFlowRate := mload(add(data, 64))
+        }
+        if (rawFlowRate < type(int96).min || rawFlowRate > type(int96).max) {
+            return abi.encode(uint256(0), int96(0));
+        }
+        return abi.encode(updatedAt, int96(rawFlowRate));
     }
 
     /// @dev Decodes `abi.encode(address)` from the first 32-byte word without reverting. Returns address(0) if
@@ -396,9 +413,13 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         return (true, address(uint160(senderWord)), address(uint160(receiverWord)));
     }
 
+    /// @dev Decodes `(previousTimestamp, previousFlowRate)` from `cbdata` without reverting on malformed words.
     function _decodeFlowSnapshot(bytes calldata cbdata) private pure returns (uint256 previousTimestamp, int96 previousFlowRate) {
         if (cbdata.length != 64) return (0, 0);
-        return abi.decode(cbdata, (uint256, int96));
+        uint256 ts = uint256(bytes32(cbdata[0:32]));
+        int256 rawRate = int256(uint256(bytes32(cbdata[32:64])));
+        if (rawRate < type(int96).min || rawRate > type(int96).max) return (0, 0);
+        return (ts, int96(rawRate));
     }
 
     /// @notice Recovers G$ (e.g. sent without a deposit callback) or any other token held by the vault.
