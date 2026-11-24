@@ -5,6 +5,7 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -146,22 +147,29 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit BuyerOperatorAccepted(buyer, nonce);
     }
 
-    function _accountForUsage(address buyer) internal {
-        (uint256 available, uint256 reserved, ) = _deposits().getBuyerBalance(buyer);
-        uint256 currentBalance = available + reserved;
+    /// @dev Principal and bonus left after applying usage since the last snapshot; usage consumes principal first.
+    function _pendingCredits(
+        address buyer
+    ) internal view returns (uint256 principal, uint256 bonus, uint256 available, uint256 currentBalance) {
+        uint256 reserved;
+        (available, reserved, ) = _deposits().getBuyerBalance(buyer);
+        currentBalance = available + reserved;
+        principal = principalRemaining[buyer];
+        bonus = bonusRemaining[buyer];
         uint256 previousBalance = lastAccountedBalance[buyer];
 
         if (previousBalance > currentBalance) {
             uint256 used = previousBalance - currentBalance;
-            uint256 principalUsed = _min(used, principalRemaining[buyer]);
-            principalRemaining[buyer] -= principalUsed;
-            used -= principalUsed;
-
-            if (used > 0) {
-                bonusRemaining[buyer] -= _min(used, bonusRemaining[buyer]);
-            }
+            uint256 principalUsed = _min(used, principal);
+            principal -= principalUsed;
+            bonus -= _min(used - principalUsed, bonus);
         }
+    }
 
+    function _accountForUsage(address buyer) internal {
+        (uint256 principal, uint256 bonus, , uint256 currentBalance) = _pendingCredits(buyer);
+        principalRemaining[buyer] = principal;
+        bonusRemaining[buyer] = bonus;
         lastAccountedBalance[buyer] = currentBalance;
     }
 
@@ -202,6 +210,7 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     }
 
     /// @notice Withdraws principal on behalf of a buyer, authorized by their EIP-712 signature.
+    ///         Forfeits ceil(unusedBonus * amount / principalRemaining) of the unused bonus to this contract.
     /// @param buyer The buyer whose principal is being withdrawn.
     /// @param amount The amount in USDC micro-units to withdraw.
     /// @param recipient The address to receive the withdrawn USDC.
@@ -216,32 +225,41 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
 
         if (amount > withdrawablePrincipal(buyer)) revert InsufficientPrincipal();
 
+        uint256 forfeit = bonusForfeitOnWithdraw(buyer, amount);
+        uint256 total = amount + forfeit;
         uint256 beforeBalance = usdc.balanceOf(address(this));
-        _deposits().withdraw(buyer, amount);
+        _deposits().withdraw(buyer, total);
         uint256 received = usdc.balanceOf(address(this)) - beforeBalance;
-        if (received < amount) revert InvalidAmount();
+        if (received < total) revert InvalidAmount();
 
         principalRemaining[buyer] -= amount;
         totalPrincipalWithdrawn[buyer] += amount;
-        lastAccountedBalance[buyer] -= amount;
+        bonusRemaining[buyer] -= forfeit;
+        totalBonusWithdrawn[buyer] += forfeit;
+        lastAccountedBalance[buyer] -= total;
 
         _safeTransfer(usdc, recipient, amount);
         emit BuyerPrincipalWithdrawn(buyer, recipient, amount);
+        if (forfeit > 0) emit BuyerBonusWithdrawn(buyer, forfeit);
     }
 
     /// @notice Returns the amount of principal a buyer can still withdraw.
+    /// @dev Reserved funds count as principal, so the unused bonus must stay available to be forfeited.
     function withdrawablePrincipal(address buyer) public view returns (uint256) {
-        (uint256 available, uint256 reserved, ) = _deposits().getBuyerBalance(buyer);
-        uint256 remaining = principalRemaining[buyer];
-        uint256 currentBalance = available + reserved;
-        uint256 previousBalance = lastAccountedBalance[buyer];
+        (uint256 principal, uint256 bonus, uint256 available, ) = _pendingCredits(buyer);
+        return available > bonus ? _min(principal, available - bonus) : 0;
+    }
 
-        if (previousBalance > currentBalance) {
-            uint256 used = previousBalance - currentBalance;
-            remaining = used > remaining ? 0 : remaining - used;
-        }
+    /// @notice Returns the buyer's unused principal and bonus, including usage not yet accounted.
+    function remainingCredits(address buyer) external view returns (uint256 principal, uint256 bonus) {
+        (principal, bonus, , ) = _pendingCredits(buyer);
+    }
 
-        return _min(remaining, available);
+    /// @notice Returns the unused bonus forfeited when withdrawing `amount` of principal.
+    function bonusForfeitOnWithdraw(address buyer, uint256 amount) public view returns (uint256) {
+        (uint256 principal, uint256 bonus, , ) = _pendingCredits(buyer);
+        if (principal == 0 || bonus == 0) return 0;
+        return Math.mulDiv(bonus, _min(amount, principal), principal, Math.Rounding.Ceil);
     }
 
     function _withdrawUnusedBonus(address buyer) internal returns (uint256 amount) {

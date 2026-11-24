@@ -58,6 +58,7 @@ GoodDollar AntSeed credits add a GoodDollar-native credit layer:
    - Active G$ streamers receive **+20%** credits.
    - Wallets without GoodID verification receive no bonus.
    - A per-root-account monthly bonus cap applies (`MAX_BONUS_CAP_USD`).
+   - Credits are spent principal first, then bonus. Withdrawing unused principal forfeits a proportional share of the unused bonus (withdrawing all principal forfeits all of it), and forfeited bonus still counts toward the monthly cap.
 
 2. **GoodID-based bonus eligibility**
    - Any wallet can deposit or stream G$ without needing GoodID.

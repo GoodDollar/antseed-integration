@@ -13,8 +13,9 @@ A UUPS-upgradeable contract deployed on Base. It acts as the on-chain operator f
 - accepts the operator role for a buyer via `acceptBuyerOperator(buyer, nonce, sig)` → `deposits.setOperator`
 - `depositFor(buyer, principal, bonus)` — pulls USDC from contract balance, calls `deposits.deposit(buyer, principal + bonus)`
 - `depositForWithId(buyer, principal, bonus, id)` — same but idempotent via `usedDepositIds[keccak256(id)]`; duplicate IDs are silently skipped
-- tracks `totalPrincipalDeposited[buyer]` and `totalBonusDeposited[buyer]` separately; `withdrawablePrincipal(buyer) = totalPrincipalDeposited - totalWithdrawn`
-- `withdrawPrincipal(buyer, amount, recipient, nonce, buyerSig)` — buyer EIP-712 signed principal-only withdrawal using the per-address `usedNonces[buyer]` counter; bonus is not withdrawable by buyer
+- tracks `principalRemaining[buyer]` and `bonusRemaining[buyer]`; usage consumes principal before bonus. `remainingCredits(buyer)` returns both, including usage not yet accounted
+- `withdrawablePrincipal(buyer) = min(principalRemaining, available - bonusRemaining)`: funds reserved in channels count as principal, so the unused bonus always stays available
+- `withdrawPrincipal(buyer, amount, recipient, nonce, buyerSig)` — buyer EIP-712 signed principal withdrawal using the per-address `usedNonces[buyer]` counter. It forfeits `ceil(bonusRemaining * amount / principalRemaining)` of the unused bonus back to the operator contract (quoted by `bonusForfeitOnWithdraw(buyer, amount)`); a full principal withdrawal forfeits all unused bonus
 - `withdrawDepositedFor(buyer, amount, recipient)` — owner-only full withdrawal from deposits
 - `requestClose(channelId)` / `withdrawChannel(channelId)` — callable by owner or the channel's buyer
 - `sweepToken(token, recipient, amount)` — owner-only token rescue
