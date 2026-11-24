@@ -162,17 +162,17 @@ If you stream G$ to the Celo vault through Superfluid, the vault reacts as a Sup
 
 Create or update a Constant Flow Agreement from your wallet to the vault using the G$ SuperToken on Celo.
 
-You **must** pass your AntSeed buyer address as `userData` when creating or updating the flow:
+You **must** pass your AntSeed buyer address as `userData` when creating the flow:
 
 ```text
 sender   = your GoodID wallet
 receiver = CELO_GD_ANTSEED_VAULT
 token    = G$ SuperToken on Celo
 flowRate = token-wei per second
-userData = abi.encode(YOUR_ANTSEED_BUYER_ADDRESS)   ← required
+userData = abi.encode(YOUR_ANTSEED_BUYER_ADDRESS)   ← required on creation
 ```
 
-The vault's SuperApp callback decodes the buyer from `ctx.userData`. A missing or zero buyer, or one whose upper 12 padding bytes are non-zero, causes `MissingBuyerAddress` revert. On stream termination the stored buyer is used automatically; you do not need to re-supply it.
+On stream creation, the vault's SuperApp callback decodes the buyer from `ctx.userData` and stores it on-chain (`streamBuyer[sender]`). A missing or zero buyer, or one whose upper 12 padding bytes are non-zero, causes a `MissingBuyerAddress` revert. On stream updates and termination, the stored buyer is reused automatically (and `ctx.userData` is not re-decoded); you do not need to re-supply it.
 
 When the stream is created or updated, the vault emits `StreamUpdated(account, buyer, flowRate, monthlyGdAmountWei, totalFlowWei)`, where `totalFlowWei = previousFlowRate * secondsSincePreviousUpdate`. Record the stream update through the Worker the same way:
 

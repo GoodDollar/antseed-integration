@@ -4,6 +4,7 @@ import { Interface } from "ethers";
 import {
   encodeVaultEventLog,
   fetchCeloVaultEvents,
+  fetchCeloVaultEventsForAccount,
   fetchCurrentGdPrice,
   fetchGoodIdRoot,
   parseCeloVaultLogs,
@@ -153,6 +154,51 @@ test("parses Celo vault StreamUpdated logs", () => {
     assert.equal(events[0].flowRateWeiPerSecond, flowRate);
     assert.equal(events[0].monthlyGdAmountWei, monthly);
     assert.equal(events[0].totalFlowWei, totalFlow);
+  }
+});
+
+test("parses and logs StreamTerminationIgnored without emitting a credit event and includes its topic in account queries", async () => {
+  const superToken = "0x0000000000000000000000000000000000000ccc";
+  const agreementClass = "0x0000000000000000000000000000000000000ddd";
+  const reason = "0x12345678";
+  const log = encodeVaultEventLog("StreamTerminationIgnored", [account, superToken, agreementClass, reason], vault, txHash, 4);
+
+  const warns: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warns.push(args);
+  };
+  try {
+    const events = parseCeloVaultLogs([log], vault);
+    assert.deepEqual(events, []);
+    const serializedWarns = warns.map((args) => args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+    assert.ok(
+      serializedWarns.some((entry) => entry.includes("celo.events.stream-termination-ignored") && entry.includes(reason)),
+      `expected structured stream-termination-ignored warning, got: ${serializedWarns.join(" | ")}`
+    );
+    assert.ok(
+      !serializedWarns.some((entry) => entry.includes("decodeFailures")),
+      "StreamTerminationIgnored should not be counted as a decode failure"
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const originalFetch = globalThis.fetch;
+  let capturedTopics: unknown;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    capturedTopics = body.params?.[0]?.topics;
+    return Response.json({ jsonrpc: "2.0", id: body.id, result: [log] });
+  }) as typeof fetch;
+  try {
+    const cfg = configFromEnv({ ANTSEED_KV: {} as KVNamespace, CELO_RPC_URL: "https://celo.test", CELO_VAULT_ADDRESS: vault });
+    const events = await fetchCeloVaultEventsForAccount(account, cfg, "0x1");
+    assert.deepEqual(events, []);
+    assert.ok(Array.isArray(capturedTopics) && Array.isArray(capturedTopics[0]));
+    assert.ok(capturedTopics[0].includes(log.topics[0]), "account log filter must include StreamTerminationIgnored topic");
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

@@ -4,7 +4,8 @@ import { errorMessage, logError, logInfo, logWarn, redactAddress, redactHash } f
 
 const VAULT_EVENTS = new Interface([
   "event GdDeposited(address indexed account,address indexed buyer,uint256 gdAmount,bytes data)",
-  "event StreamUpdated(address indexed account,address indexed buyer,int96 flowRate,uint256 monthlyGdAmountWei,uint256 totalFlowWei)"
+  "event StreamUpdated(address indexed account,address indexed buyer,int96 flowRate,uint256 monthlyGdAmountWei,uint256 totalFlowWei)",
+  "event StreamTerminationIgnored(address indexed account,address indexed superToken,address indexed agreementClass,bytes4 reason)"
 ]);
 
 const GOODID_ABI = new Interface(["function getWhitelistedRoot(address account) view returns (address)"]);
@@ -102,7 +103,8 @@ export async function fetchCeloVaultEventsForAccount(
   if (!cfg.CELO_VAULT_ADDRESS) throw new Error("CELO_VAULT_ADDRESS is required to verify Celo vault events");
   const depositEvent = VAULT_EVENTS.getEvent("GdDeposited");
   const streamEvent = VAULT_EVENTS.getEvent("StreamUpdated");
-  if (!depositEvent || !streamEvent) throw new Error("vault event ABI missing");
+  const terminationIgnoredEvent = VAULT_EVENTS.getEvent("StreamTerminationIgnored");
+  if (!depositEvent || !streamEvent || !terminationIgnoredEvent) throw new Error("vault event ABI missing");
   const accountTopic = zeroPadValue(account, 32);
   logInfo("celo.events.fetch.account.start", {
     account: redactAddress(account),
@@ -115,7 +117,7 @@ export async function fetchCeloVaultEventsForAccount(
       address: cfg.CELO_VAULT_ADDRESS,
       fromBlock,
       toBlock,
-      topics: [[depositEvent.topicHash, streamEvent.topicHash], [accountTopic]]
+      topics: [[depositEvent.topicHash, streamEvent.topicHash, terminationIgnoredEvent.topicHash], [accountTopic]]
     }
   ]);
   const parsed = parseCeloVaultLogs(logs, cfg.CELO_VAULT_ADDRESS);
@@ -233,6 +235,17 @@ export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): Parsed
         logIndex: Number(log.logIndex)
       });
     }
+
+    if (decoded.name === "StreamTerminationIgnored") {
+      logWarn("celo.events.stream-termination-ignored", {
+        account: redactAddress(decoded.args.account),
+        superToken: redactAddress(decoded.args.superToken),
+        agreementClass: redactAddress(decoded.args.agreementClass),
+        reason: String(decoded.args.reason),
+        txHash: redactHash(log.transactionHash),
+        logIndex: Number(log.logIndex)
+      });
+    }
   }
 
   if (skippedWrongAddress > 0 || decodeFailures > 0) {
@@ -255,7 +268,7 @@ export function parseCeloVaultLogs(logs: RpcLog[], vaultAddress: string): Parsed
 }
 
 export function encodeVaultEventLog(
-  eventName: "GdDeposited" | "StreamUpdated",
+  eventName: "GdDeposited" | "StreamUpdated" | "StreamTerminationIgnored",
   args: readonly unknown[],
   address: string,
   txHash: string,

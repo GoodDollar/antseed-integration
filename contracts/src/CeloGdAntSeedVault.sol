@@ -103,7 +103,8 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     /// @dev `buyer` is the AntSeed buyer account decoded from Superfluid userdata (abi.encode(buyerAddress)).
     event StreamUpdated(address indexed account, address indexed buyer, int96 flowRate, uint256 monthlyGdAmountWei, uint256 totalFlowWei);
     /// @dev Diagnostic for a termination callback that was ignored instead of reverting (a revert would jail the app).
-    ///      `account` is the stream sender, or address(0) when `agreementData` could not be decoded.
+    ///      `account` is the stream sender, or address(0) when validation rejects before decoding a sender
+    ///      (unsupported token, unsupported agreement class, or malformed `agreementData`).
     ///      `reason` is the selector of the custom error that create/update would have reverted with.
     event StreamTerminationIgnored(address indexed account, address indexed superToken, address indexed agreementClass, bytes4 reason);
 
@@ -304,7 +305,8 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     /// @dev Checks token, agreement class and receiver without reverting. The agreement class is checked before
     ///      `agreementData` is decoded, since non-CFA agreements use a different data layout.
     /// @return rejection Selector of the matching custom error, or zero when the stream is valid.
-    /// @return sender Stream sender; address(0) when `agreementData` could not be decoded.
+    /// @return sender Stream sender; address(0) when rejected before decoding a sender
+    ///         (unsupported token, unsupported agreement class, or malformed `agreementData`).
     function _validateStream(
         address superToken,
         address agreementClass,
