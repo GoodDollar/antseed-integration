@@ -107,6 +107,18 @@ contract MockDeposits is IAntseedDeposits {
         reserved[buyer] += amount;
     }
 
+    function release(address buyer, uint256 amount) external {
+        require(reserved[buyer] >= amount, "INSUFFICIENT");
+        reserved[buyer] -= amount;
+        available[buyer] += amount;
+    }
+
+    function consumeReserved(address buyer, uint256 amount) external {
+        require(reserved[buyer] >= amount, "INSUFFICIENT");
+        reserved[buyer] -= amount;
+        require(token.transfer(address(0xD00D), amount), "TRANSFER");
+    }
+
     function transferOperator(address buyer, address newOperator) external override {
         operators[buyer] = newOperator;
     }
@@ -415,6 +427,8 @@ contract AntseedBuyerOperatorTest {
         require(operator.totalPrincipalWithdrawn(buyerAddr) == 3_000_000, "withdrawn tracked");
         require(operator.withdrawablePrincipal(buyerAddr) == 5_000_000, "remaining withdrawable");
         require(operator.usedNonces(buyerAddr) == nonce1 + 1, "nonce incremented after withdraw");
+        require(operator.bonusRemaining(buyerAddr) == 1_250_000, "proportional bonus forfeited");
+        require(operator.totalBonusWithdrawn(buyerAddr) == 750_000, "forfeit tracked");
 
         // Withdraw rest of principal
         uint256 nonce2 = operator.usedNonces(buyerAddr);
@@ -422,6 +436,8 @@ contract AntseedBuyerOperatorTest {
         operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, nonce2, sig2);
         require(usdc.balanceOf(recipient) == 8_000_000, "recipient received all principal");
         require(operator.withdrawablePrincipal(buyerAddr) == 0, "nothing left");
+        require(operator.bonusRemaining(buyerAddr) == 0, "all bonus forfeited");
+        require(deposits.available(buyerAddr) == 0, "vault emptied");
 
         // Cannot withdraw more than principal (bonus not withdrawable)
         uint256 nonce3 = operator.usedNonces(buyerAddr);
@@ -435,7 +451,7 @@ contract AntseedBuyerOperatorTest {
         require(!ok, "over-withdraw rejected");
     }
 
-    function testWithdrawPrincipalLeavesBonus() public {
+    function testWithdrawPrincipalForfeitsAllBonusOnFullWithdraw() public {
         setUp();
         usdc.mint(address(operator), 100_000_000);
 
@@ -443,19 +459,320 @@ contract AntseedBuyerOperatorTest {
         operator.acceptBuyerOperator(buyerAddr, 1, "");
         operator.depositFor(buyerAddr, 5_000_000, 2_000_000);
 
-        // Total in vault = 7_000_000; only 5_000_000 is principal and thus withdrawable
         require(deposits.available(buyerAddr) == 7_000_000, "full deposit in vault");
         require(operator.withdrawablePrincipal(buyerAddr) == 5_000_000, "only principal withdrawable");
+        require(operator.bonusForfeitOnWithdraw(buyerAddr, 5_000_000) == 2_000_000, "full forfeit quoted");
 
         uint256 nonce = operator.usedNonces(buyerAddr);
         bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, nonce);
         operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, nonce, sig);
 
-        // Recipient received only the principal
         require(usdc.balanceOf(recipient) == 5_000_000, "recipient got principal");
-        // Bonus stays in the deposit vault
-        require(deposits.available(buyerAddr) == 2_000_000, "bonus remains in vault");
-        require(operator.withdrawablePrincipal(buyerAddr) == 0, "nothing left to withdraw");
+        require(deposits.available(buyerAddr) == 0, "bonus removed from vault");
+        require(usdc.balanceOf(address(operator)) == 95_000_000, "bonus returned to operator");
+        require(operator.bonusRemaining(buyerAddr) == 0, "bonus remaining cleared");
+        require(operator.totalBonusWithdrawn(buyerAddr) == 2_000_000, "forfeit tracked");
+        require(operator.lastAccountedBalance(buyerAddr) == 0, "snapshot matches vault");
+    }
+
+    function testWithdrawPrincipalForfeitRoundsUp() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 3_000_000, 1_000_000);
+
+        // 1_000_000 * 1 / 3_000_000 rounds up to 1, so dust withdrawals still forfeit bonus
+        require(operator.bonusForfeitOnWithdraw(buyerAddr, 1) == 1, "dust forfeit rounds up");
+        // 1_000_000 * 1_000_000 / 3_000_000 = 333_333.33 -> 333_334
+        require(operator.bonusForfeitOnWithdraw(buyerAddr, 1_000_000) == 333_334, "forfeit rounds up");
+
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 1_000_000, recipient, 0);
+        operator.withdrawPrincipal(buyerAddr, 1_000_000, recipient, 0, sig);
+
+        (uint256 principal, uint256 bonus) = operator.remainingCredits(buyerAddr);
+        require(principal == 2_000_000, "principal reduced");
+        require(bonus == 666_666, "bonus reduced by rounded-up forfeit");
+        require(deposits.available(buyerAddr) == 2_666_666, "vault matches credits");
+    }
+
+    function testWithdrawPrincipalAfterPartialUsageForfeitsOnlyLockedBonus() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 10_000_000, 2_000_000);
+        deposits.consume(buyerAddr, 6_000_000);
+
+        (uint256 principal, uint256 bonus) = operator.remainingCredits(buyerAddr);
+        (uint256 locked, uint256 earned) = operator.remainingBonusBreakdown(buyerAddr);
+        require(principal == 4_000_000 && bonus == 2_000_000, "usage consumed principal only");
+        require(earned == 1_200_000 && locked == 800_000, "60% of bonus earned by spend");
+        require(operator.withdrawablePrincipal(buyerAddr) == 4_000_000, "remaining principal withdrawable");
+        require(operator.bonusForfeitOnWithdraw(buyerAddr, 2_000_000) == 400_000, "half of locked bonus quoted");
+        require(operator.bonusForfeitOnWithdraw(buyerAddr, 4_000_000) == 800_000, "all locked bonus quoted");
+        require(operator.bonusForfeitOnWithdraw(buyerAddr, 99_000_000) == 800_000, "over-principal clamped to locked bonus");
+
+        // Withdraw half of remaining principal -> forfeits half of locked bonus (400k); earned bonus untouched
+        bytes memory sig1 = _signWithdraw(BUYER_PK, buyerAddr, 2_000_000, recipient, 0);
+        operator.withdrawPrincipal(buyerAddr, 2_000_000, recipient, 0, sig1);
+
+        require(operator.principalRemaining(buyerAddr) == 2_000_000, "principal accounted");
+        require(operator.bonusRemaining(buyerAddr) == 1_600_000, "only half of locked bonus forfeited");
+        require(operator.earnedBonus(buyerAddr) == 1_200_000, "earned bonus preserved");
+        require(deposits.available(buyerAddr) == 3_600_000, "vault matches credits");
+
+        // Withdraw remaining principal -> forfeits remaining locked bonus (400k), keeps 1.2M earned bonus spendable
+        bytes memory sig2 = _signWithdraw(BUYER_PK, buyerAddr, 2_000_000, recipient, 1);
+        operator.withdrawPrincipal(buyerAddr, 2_000_000, recipient, 1, sig2);
+
+        require(operator.principalRemaining(buyerAddr) == 0, "principal emptied");
+        require(operator.bonusRemaining(buyerAddr) == 1_200_000, "earned bonus kept");
+        require(operator.earnedBonus(buyerAddr) == 1_200_000, "earned bonus tracked");
+        require(operator.totalBonusWithdrawn(buyerAddr) == 800_000, "total forfeit equals locked share");
+        require(deposits.available(buyerAddr) == 1_200_000, "earned bonus remains spendable in vault");
+    }
+
+    function testWithdrawAndSpendArePathIndependent() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        // Path A: deposit 10 + 2 -> withdraw 2 -> spend 8
+        uint256 pkA = 0xA11CE;
+        address buyerA = vm.addr(pkA);
+        operator.acceptBuyerOperator(buyerA, 1, "");
+        operator.depositFor(buyerA, 10_000_000, 2_000_000);
+        operator.withdrawPrincipal(buyerA, 2_000_000, recipient, 0, _signWithdraw(pkA, buyerA, 2_000_000, recipient, 0));
+        deposits.consume(buyerA, 8_000_000);
+
+        // Path B: deposit 10 + 2 -> spend 8 -> withdraw 2
+        uint256 pkB = 0xB0B0;
+        address buyerB = vm.addr(pkB);
+        operator.acceptBuyerOperator(buyerB, 1, "");
+        operator.depositFor(buyerB, 10_000_000, 2_000_000);
+        deposits.consume(buyerB, 8_000_000);
+        operator.withdrawPrincipal(buyerB, 2_000_000, recipient, 0, _signWithdraw(pkB, buyerB, 2_000_000, recipient, 0));
+
+        (uint256 principalA, uint256 bonusA) = operator.remainingCredits(buyerA);
+        (uint256 principalB, uint256 bonusB) = operator.remainingCredits(buyerB);
+        require(principalA == 0 && principalB == 0, "both spent all remaining principal");
+        require(bonusA == 1_600_000 && bonusB == 1_600_000, "both keep identical 80% bonus");
+        require(deposits.available(buyerA) == deposits.available(buyerB), "identical vault balances");
+    }
+
+    function testZeroBonusTopUpDoesNotForfeitPreviouslyEarnedBonus() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 10_000_000, 2_000_000);
+        deposits.consume(buyerAddr, 10_000_000);
+
+        // Cap reached -> next deposit carries zero bonus
+        operator.depositFor(buyerAddr, 5_000_000, 0);
+        (uint256 locked, uint256 earned) = operator.remainingBonusBreakdown(buyerAddr);
+        require(locked == 0 && earned == 2_000_000, "earned bonus remains unlocked across zero-bonus deposit");
+        require(operator.bonusForfeitOnWithdraw(buyerAddr, 5_000_000) == 0, "no forfeit on zero-bonus principal");
+
+        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, 0, _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, 0));
+        require(usdc.balanceOf(recipient) == 5_000_000, "recipient paid full top-up");
+        require(operator.bonusRemaining(buyerAddr) == 2_000_000, "previously earned bonus preserved");
+        require(operator.totalBonusWithdrawn(buyerAddr) == 0, "no bonus forfeited");
+        require(deposits.available(buyerAddr) == 2_000_000, "earned bonus remains spendable");
+    }
+
+    function testRevokeOperatorStillReclaimsEarnedBonus() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 10_000_000, 2_000_000);
+        deposits.consume(buyerAddr, 5_000_000);
+
+        // Withdraw remaining principal -> keeps 1M earned bonus spendable in AntSeed
+        operator.withdrawPrincipal(buyerAddr, 5_000_000, recipient, 0, _signWithdraw(BUYER_PK, buyerAddr, 5_000_000, recipient, 0));
+        require(operator.earnedBonus(buyerAddr) == 1_000_000, "50% bonus earned");
+        require(operator.bonusRemaining(buyerAddr) == 1_000_000, "50% bonus remains");
+
+        // Revoking operator still claws back earned bonus so bonus is never cashable as USDC
+        operator.revokeOperator(buyerAddr, 1, _signRevokeOperator(BUYER_PK, buyerAddr, 1));
+        require(deposits.available(buyerAddr) == 0, "earned bonus reclaimed on revoke");
+        require(operator.bonusRemaining(buyerAddr) == 0, "bonus cleared");
+        require(operator.earnedBonus(buyerAddr) == 0, "earned bonus cleared");
+        require(operator.totalBonusWithdrawn(buyerAddr) == 2_000_000, "all bonus reclaimed");
+    }
+
+    function testHeavyUsageWithBonusGreaterThanPrincipalAndRounding() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 3_000_000, 1_000_000);
+
+        // Dust spend of 1 micro-USDC rounds unlock down to 0
+        deposits.consume(buyerAddr, 1);
+        (uint256 locked, uint256 earned) = operator.remainingBonusBreakdown(buyerAddr);
+        require(earned == 0 && locked == 1_000_000, "dust spend unlocks zero");
+
+        // Consume 2_500_000 more -> total spent 2_500_001 -> principal = 499_999 < bonus = 1_000_000
+        deposits.consume(buyerAddr, 2_500_000);
+        (uint256 principal, uint256 bonus) = operator.remainingCredits(buyerAddr);
+        (locked, earned) = operator.remainingBonusBreakdown(buyerAddr);
+        require(principal == 499_999 && bonus == 1_000_000, "bonus exceeds remaining principal");
+        require(earned == 833_333 && locked == 166_667, "unlock floors in protocol favor");
+
+        // Withdraw half of remaining principal
+        uint256 withdrawAmt = 250_000;
+        uint256 expectedForfeit = operator.bonusForfeitOnWithdraw(buyerAddr, withdrawAmt);
+        require(expectedForfeit == 83_334, "forfeit ceils locked share");
+
+        operator.withdrawPrincipal(buyerAddr, withdrawAmt, recipient, 0, _signWithdraw(BUYER_PK, buyerAddr, withdrawAmt, recipient, 0));
+        require(operator.principalRemaining(buyerAddr) == 249_999, "principal updated");
+        require(operator.earnedBonus(buyerAddr) == 833_333, "earned bonus untouched");
+        require(operator.bonusRemaining(buyerAddr) == 1_000_000 - expectedForfeit, "only locked portion forfeited");
+        require(deposits.available(buyerAddr) == 249_999 + 1_000_000 - expectedForfeit, "vault matches credits");
+    }
+
+    function testReservedPartialWithdrawThenSettleAndReleaseLifecycle() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 10_000_000, 2_000_000);
+        deposits.reserve(buyerAddr, 4_000_000);
+
+        // Withdraw all unreserved principal (6M) -> forfeits 60% of 2M = 1.2M
+        operator.withdrawPrincipal(buyerAddr, 6_000_000, recipient, 0, _signWithdraw(BUYER_PK, buyerAddr, 6_000_000, recipient, 0));
+        require(operator.principalRemaining(buyerAddr) == 4_000_000, "reserved principal remains");
+        require(operator.bonusRemaining(buyerAddr) == 800_000, "40% bonus remains locked");
+
+        // Channel settles 2M and releases 2M
+        deposits.consumeReserved(buyerAddr, 2_000_000);
+        deposits.release(buyerAddr, 2_000_000);
+
+        (uint256 locked, uint256 earned) = operator.remainingBonusBreakdown(buyerAddr);
+        require(earned == 400_000 && locked == 400_000, "half of reserved spend vested half of remaining bonus");
+        require(operator.withdrawablePrincipal(buyerAddr) == 2_000_000, "released principal withdrawable");
+
+        operator.withdrawPrincipal(buyerAddr, 2_000_000, recipient, 1, _signWithdraw(BUYER_PK, buyerAddr, 2_000_000, recipient, 1));
+        require(usdc.balanceOf(recipient) == 8_000_000, "total 8M principal returned");
+        require(operator.bonusRemaining(buyerAddr) == 400_000, "20% bonus on 2M spend preserved");
+        require(operator.earnedBonus(buyerAddr) == 400_000, "earned matches remaining bonus");
+        require(deposits.available(buyerAddr) == 400_000, "earned bonus available to spend");
+    }
+
+    function testFuzzProportionalBonusVestingAndWithdrawInvariants(
+        uint64 rawPrincipal,
+        uint64 rawBonus,
+        uint64 rawUsed,
+        uint64 rawReserved,
+        uint64 rawWithdraw
+    ) public {
+        setUp();
+        address buyerAddr = vm.addr(BUYER_PK);
+        {
+            uint256 principal = (uint256(rawPrincipal) % 100_000_000_000) + 1;
+            uint256 bonus = uint256(rawBonus) % 50_000_000_000;
+            uint256 totalDeposit = principal + bonus;
+
+            usdc.mint(address(operator), totalDeposit);
+            operator.acceptBuyerOperator(buyerAddr, 1, "");
+            operator.depositFor(buyerAddr, principal, bonus);
+
+            uint256 used = uint256(rawUsed) % (totalDeposit + 1);
+            if (used > 0) deposits.consume(buyerAddr, used);
+
+            uint256 remainingAfterUse = totalDeposit - used;
+            uint256 reserved = remainingAfterUse > 0 ? uint256(rawReserved) % (remainingAfterUse + 1) : 0;
+            if (reserved > 0) deposits.reserve(buyerAddr, reserved);
+        }
+
+        uint256 withdrawable = operator.withdrawablePrincipal(buyerAddr);
+        (uint256 pBefore, uint256 bBefore) = operator.remainingCredits(buyerAddr);
+        (uint256 lockedBefore, uint256 earnedBefore) = operator.remainingBonusBreakdown(buyerAddr);
+        require(lockedBefore + earnedBefore == bBefore, "breakdown sums to bonus");
+
+        if (withdrawable > 0) {
+            uint256 amt = (uint256(rawWithdraw) % withdrawable) + 1;
+            uint256 quotedForfeit = operator.bonusForfeitOnWithdraw(buyerAddr, amt);
+            require(quotedForfeit <= lockedBefore, "forfeit bounded by locked bonus");
+            require(amt + quotedForfeit <= deposits.available(buyerAddr), "total fits available");
+
+            operator.withdrawPrincipal(buyerAddr, amt, recipient, 0, _signWithdraw(BUYER_PK, buyerAddr, amt, recipient, 0));
+
+            require(operator.principalRemaining(buyerAddr) == pBefore - amt, "principal reduced exactly");
+            require(operator.bonusRemaining(buyerAddr) == bBefore - quotedForfeit, "bonus reduced by forfeit");
+            require(operator.earnedBonus(buyerAddr) == earnedBefore, "earned bonus preserved on withdraw");
+            require(operator.earnedBonus(buyerAddr) <= operator.bonusRemaining(buyerAddr), "earned <= bonus");
+            require(
+                operator.principalRemaining(buyerAddr) + operator.bonusRemaining(buyerAddr) <= operator.lastAccountedBalance(buyerAddr),
+                "credits bounded by snapshot"
+            );
+            require(deposits.available(buyerAddr) >= operator.bonusRemaining(buyerAddr), "available covers remaining bonus");
+        }
+    }
+
+    function testWithdrawPrincipalTreatsReservedAsPrincipal() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 10_000_000, 2_000_000);
+        deposits.reserve(buyerAddr, 2_000_000);
+
+        require(operator.withdrawablePrincipal(buyerAddr) == 8_000_000, "reserved principal not withdrawable");
+
+        bytes memory overSig = _signWithdraw(BUYER_PK, buyerAddr, 8_000_001, recipient, 0);
+        (bool ok, ) = address(operator).call(abi.encodeCall(AntseedBuyerOperator.withdrawPrincipal, (buyerAddr, 8_000_001, recipient, 0, overSig)));
+        require(!ok, "withdrawing reserved principal rejected");
+
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 8_000_000, recipient, 0);
+        operator.withdrawPrincipal(buyerAddr, 8_000_000, recipient, 0, sig);
+
+        require(usdc.balanceOf(recipient) == 8_000_000, "recipient paid");
+        require(operator.principalRemaining(buyerAddr) == 2_000_000, "reserved principal remains");
+        require(operator.bonusRemaining(buyerAddr) == 400_000, "bonus forfeited proportionally");
+        require(deposits.available(buyerAddr) == 400_000, "remaining bonus available");
+        require(deposits.reserved(buyerAddr) == 2_000_000, "reserve untouched");
+    }
+
+    function testWithdrawablePrincipalZeroWhenReservedExceedsPrincipal() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 4_000_000, 2_000_000);
+        deposits.reserve(buyerAddr, 5_000_000);
+
+        require(operator.withdrawablePrincipal(buyerAddr) == 0, "nothing withdrawable");
+
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 1, recipient, 0);
+        (bool ok, ) = address(operator).call(abi.encodeCall(AntseedBuyerOperator.withdrawPrincipal, (buyerAddr, 1, recipient, 0, sig)));
+        require(!ok, "withdraw rejected");
+    }
+
+    function testWithdrawPrincipalWithoutBonusForfeitsNothing() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+
+        address buyerAddr = vm.addr(BUYER_PK);
+        operator.acceptBuyerOperator(buyerAddr, 1, "");
+        operator.depositFor(buyerAddr, 4_000_000, 0);
+
+        bytes memory sig = _signWithdraw(BUYER_PK, buyerAddr, 4_000_000, recipient, 0);
+        operator.withdrawPrincipal(buyerAddr, 4_000_000, recipient, 0, sig);
+
+        require(usdc.balanceOf(recipient) == 4_000_000, "recipient paid");
+        require(operator.totalBonusWithdrawn(buyerAddr) == 0, "no forfeit");
+        require(deposits.available(buyerAddr) == 0, "vault emptied");
     }
 
     function testUsageConsumesPrincipalBeforeBonusAcrossNewDeposits() public {
@@ -927,6 +1244,7 @@ contract AntseedBuyerOperatorTest {
 
         require(usdc.balanceOf(recipient) == 2_000_000, "recipient paid");
         require(operator.usedNonces(wallet) == 1, "nonce consumed");
+        require(operator.bonusRemaining(wallet) == 600_000, "bonus forfeited proportionally");
 
         (bool ok, ) = address(operator).call(abi.encodeCall(AntseedBuyerOperator.withdrawPrincipal, (wallet, 2_000_000, recipient, 0, sig)));
         require(!ok, "replay rejected");

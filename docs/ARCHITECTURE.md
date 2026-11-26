@@ -13,9 +13,9 @@ A UUPS-upgradeable contract deployed on Base. It acts as the on-chain operator f
 - accepts the operator role for a buyer via `acceptBuyerOperator(buyer, nonce, sig)` → `deposits.setOperator`
 - `depositFor(buyer, principal, bonus)` — pulls USDC from contract balance, calls `deposits.deposit(buyer, principal + bonus)`
 - `depositForWithId(buyer, principal, bonus, id)` — same but idempotent via `usedDepositIds[keccak256(id)]`; duplicate IDs are silently skipped
-- tracks `totalPrincipalDeposited[buyer]` and `totalBonusDeposited[buyer]` separately; `withdrawablePrincipal(buyer) = totalPrincipalDeposited - totalWithdrawn`
-- `withdrawPrincipal(buyer, amount, recipient, nonce, buyerSig)` — buyer EIP-712 signed principal-only withdrawal using the per-address `usedNonces[buyer]` counter; bonus is not withdrawable by buyer
-- `withdrawDepositedFor(buyer, amount, recipient)` — owner-only full withdrawal from deposits
+- tracks `principalRemaining[buyer]`, `bonusRemaining[buyer]`, and `earnedBonus[buyer]`; usage consumes principal before bonus and vests locked bonus (`bonusRemaining - earnedBonus`) into `earnedBonus` proportionally to principal spent (rounded down). `remainingCredits(buyer)` returns `(principal, bonus)` and `remainingBonusBreakdown(buyer)` returns `(locked, earned)`, both including usage not yet accounted
+- `withdrawablePrincipal(buyer) = available > bonusRemaining ? min(principalRemaining, available - bonusRemaining) : 0`: funds reserved in channels count as principal, so the unused bonus always stays available
+- `withdrawPrincipal(buyer, amount, recipient, nonce, buyerSig)` — buyer EIP-712 signed principal withdrawal using the per-address `usedNonces[buyer]` counter. It forfeits `ceil(lockedBonus * amount / principalRemaining)` of the unearned bonus back to the operator contract (quoted by `bonusForfeitOnWithdraw(buyer, amount)`); bonus already earned via principal spend stays spendable in AntSeed (but is still reclaimed on `revokeOperator` so bonus is never cashable as USDC)
 - `requestClose(channelId)` / `withdrawChannel(channelId)` — callable by owner or the channel's buyer
 - `sweepToken(token, recipient, amount)` — owner-only token rescue
 - `approveCurrentDeposits()` — re-approves USDC to deposits contract (used if deposits contract address changes)
