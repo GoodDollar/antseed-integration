@@ -307,11 +307,7 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
     /// @return rejection Selector of the matching custom error, or zero when the stream is valid.
     /// @return sender Stream sender; address(0) when rejected before decoding a sender
     ///         (unsupported token, unsupported agreement class, or malformed `agreementData`).
-    function _validateStream(
-        address superToken,
-        address agreementClass,
-        bytes calldata agreementData
-    ) private view returns (bytes4 rejection, address sender) {
+    function _validateStream(address superToken, address agreementClass, bytes calldata agreementData) private view returns (bytes4 rejection, address sender) {
         if (superToken != address(gdToken)) return (UnsupportedToken.selector, address(0));
         if (agreementClass != cfaV1) return (UnsupportedAgreement.selector, address(0));
         (bool decoded, address flowSender, address receiver) = _decodeFlowParties(agreementData);
@@ -446,7 +442,13 @@ contract CeloGdAntSeedVault is Initializable, UUPSUpgradeable {
         address cusd = staticOracleCusd;
         if (oracle != address(0) && cusd != address(0)) {
             (bool ok, bytes memory data) = oracle.staticcall(
-                abi.encodeWithSelector(IStaticOracleLike.quoteAllAvailablePoolsWithTimePeriod.selector, uint128(amount), address(gdToken), cusd, uint32(60))
+                abi.encodeWithSelector(
+                    IStaticOracleLike.quoteAllAvailablePoolsWithTimePeriod.selector,
+                    uint128(amount),
+                    address(gdToken),
+                    cusd,
+                    uint32(60 * 60)
+                )
             );
             if (ok && data.length >= 32) {
                 uint256 quoteAmount;
