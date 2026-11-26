@@ -29,7 +29,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 
 `GET /v1/accounts/:account/profile` returns the wallet `UserCreditProfile` only.
 
-`POST /v1/accounts/:account/withdraw` relays a buyer-signed `withdrawPrincipal`. On-chain, the withdrawal also forfeits `ceil(bonusRemaining * amount / principalRemaining)` of the unused bonus to the operator contract, and principal reserved in open channels is not withdrawable.
+`POST /v1/accounts/:account/withdraw` relays a buyer-signed `withdrawPrincipal`. On-chain, spending principal vests locked bonus proportionally (`floor(lockedBonus * principalUsed / principalRemaining)`), withdrawing principal forfeits `ceil(lockedBonus * amount / principalRemaining)` of the unvested bonus to the operator contract (leaving earned bonus spendable in AntSeed), and principal reserved in open channels is not withdrawable.
 
 `GET /v1/accounts/:account/credit-history` returns paginated `GdCreditEntry` history (newest first):
 

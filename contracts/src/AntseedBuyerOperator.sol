@@ -42,8 +42,9 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     /// @dev Slot kept for upgrade-safe storage layout; the accounting migration was removed.
     mapping(address => bool) private _deprecatedBuyerAccountingMigrated;
     mapping(address => uint256) public usedNonces;
+    mapping(address => uint256) public earnedBonus;
 
-    uint256[50] private __gap;
+    uint256[49] private __gap;
 
     bytes32 public constant WITHDRAW_TYPEHASH = keccak256("WithdrawPrincipal(address buyer,uint256 amount,address recipient,uint256 nonce)");
     bytes32 public constant REQUEST_CLOSE_TYPEHASH = keccak256("RequestClose(bytes32 channelId,uint256 nonce)");
@@ -147,29 +148,39 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit BuyerOperatorAccepted(buyer, nonce);
     }
 
-    /// @dev Principal and bonus left after applying usage since the last snapshot; usage consumes principal first.
+    /// @dev Principal, bonus, and earned (non-forfeitable on withdraw) bonus left after applying usage since the last snapshot.
+    ///      Usage consumes principal first and vests locked bonus proportionally to principal spent (rounded down).
     function _pendingCredits(
         address buyer
-    ) internal view returns (uint256 principal, uint256 bonus, uint256 available, uint256 currentBalance) {
+    ) internal view returns (uint256 principal, uint256 bonus, uint256 earned, uint256 available, uint256 currentBalance) {
         uint256 reserved;
         (available, reserved, ) = _deposits().getBuyerBalance(buyer);
         currentBalance = available + reserved;
         principal = principalRemaining[buyer];
         bonus = bonusRemaining[buyer];
+        earned = _min(earnedBonus[buyer], bonus);
         uint256 previousBalance = lastAccountedBalance[buyer];
 
         if (previousBalance > currentBalance) {
             uint256 used = previousBalance - currentBalance;
             uint256 principalUsed = _min(used, principal);
-            principal -= principalUsed;
-            bonus -= _min(used - principalUsed, bonus);
+            if (principalUsed > 0) {
+                uint256 lockedBonus = bonus - earned;
+                earned += Math.mulDiv(lockedBonus, principalUsed, principal, Math.Rounding.Floor);
+                principal -= principalUsed;
+            }
+            uint256 bonusUsed = _min(used - principalUsed, bonus);
+            bonus -= bonusUsed;
+            if (earned > bonus) earned = bonus;
         }
     }
 
-    function _accountForUsage(address buyer) internal {
-        (uint256 principal, uint256 bonus, , uint256 currentBalance) = _pendingCredits(buyer);
+    function _accountForUsage(address buyer) internal returns (uint256 principal, uint256 bonus, uint256 earned, uint256 available) {
+        uint256 currentBalance;
+        (principal, bonus, earned, available, currentBalance) = _pendingCredits(buyer);
         principalRemaining[buyer] = principal;
         bonusRemaining[buyer] = bonus;
+        earnedBonus[buyer] = earned;
         lastAccountedBalance[buyer] = currentBalance;
     }
 
@@ -210,7 +221,8 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     }
 
     /// @notice Withdraws principal on behalf of a buyer, authorized by their EIP-712 signature.
-    ///         Forfeits ceil(unusedBonus * amount / principalRemaining) of the unused bonus to this contract.
+    ///         Forfeits ceil(lockedBonus * amount / principalRemaining) of the unearned bonus to this contract;
+    ///         bonus already earned via prior principal spend remains spendable in AntSeed.
     /// @param buyer The buyer whose principal is being withdrawn.
     /// @param amount The amount in USDC micro-units to withdraw.
     /// @param recipient The address to receive the withdrawn USDC.
@@ -221,65 +233,74 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         _useBuyerSig(buyer, nonce, keccak256(abi.encode(WITHDRAW_TYPEHASH, buyer, amount, recipient, nonce)), buyerSig);
 
         _requireDepositsOperator(buyer);
-        _accountForUsage(buyer);
-
-        if (amount > withdrawablePrincipal(buyer)) revert InsufficientPrincipal();
-
-        uint256 forfeit = bonusForfeitOnWithdraw(buyer, amount);
-        uint256 total = amount + forfeit;
-        uint256 beforeBalance = usdc.balanceOf(address(this));
-        _deposits().withdraw(buyer, total);
-        uint256 received = usdc.balanceOf(address(this)) - beforeBalance;
-        if (received < total) revert InvalidAmount();
-
-        principalRemaining[buyer] -= amount;
+        uint256 forfeit;
+        uint256 total;
+        {
+            (uint256 principal, uint256 bonus, uint256 earned, uint256 available) = _accountForUsage(buyer);
+            if (amount > _withdrawablePrincipal(principal, bonus, available)) revert InsufficientPrincipal();
+            forfeit = _bonusForfeit(principal, bonus - earned, amount);
+            total = amount + forfeit;
+            principalRemaining[buyer] = principal - amount;
+            bonusRemaining[buyer] = bonus - forfeit;
+        }
         totalPrincipalWithdrawn[buyer] += amount;
-        bonusRemaining[buyer] -= forfeit;
         totalBonusWithdrawn[buyer] += forfeit;
         lastAccountedBalance[buyer] -= total;
 
+        _withdrawFromDeposits(buyer, total);
         _safeTransfer(usdc, recipient, amount);
         emit BuyerPrincipalWithdrawn(buyer, recipient, amount);
         if (forfeit > 0) emit BuyerBonusWithdrawn(buyer, forfeit);
     }
 
     /// @notice Returns the amount of principal a buyer can still withdraw.
-    /// @dev Reserved funds count as principal, so the unused bonus must stay available to be forfeited.
+    /// @dev Reserved funds count as principal, so the unused bonus must stay available in deposits.
     function withdrawablePrincipal(address buyer) public view returns (uint256) {
-        (uint256 principal, uint256 bonus, uint256 available, ) = _pendingCredits(buyer);
-        return available > bonus ? _min(principal, available - bonus) : 0;
+        (uint256 principal, uint256 bonus, , uint256 available, ) = _pendingCredits(buyer);
+        return _withdrawablePrincipal(principal, bonus, available);
     }
 
     /// @notice Returns the buyer's unused principal and bonus, including usage not yet accounted.
     function remainingCredits(address buyer) external view returns (uint256 principal, uint256 bonus) {
-        (principal, bonus, , ) = _pendingCredits(buyer);
+        (principal, bonus, , , ) = _pendingCredits(buyer);
     }
 
-    /// @notice Returns the unused bonus forfeited when withdrawing `amount` of principal.
+    /// @notice Returns the buyer's unused bonus split into locked (forfeitable on withdraw) and earned (vested by spend),
+    ///         including usage not yet accounted.
+    function remainingBonusBreakdown(address buyer) external view returns (uint256 lockedBonus, uint256 earned) {
+        (, uint256 bonus, uint256 earned_, , ) = _pendingCredits(buyer);
+        return (bonus - earned_, earned_);
+    }
+
+    /// @notice Returns the locked (unearned) bonus forfeited when withdrawing `amount` of principal.
+    /// @dev Preview helper: silently clamps `amount` to `principalRemaining` and does not enforce `withdrawablePrincipal`
+    ///      (callers should validate `amount <= withdrawablePrincipal(buyer)` separately).
     function bonusForfeitOnWithdraw(address buyer, uint256 amount) public view returns (uint256) {
-        (uint256 principal, uint256 bonus, , ) = _pendingCredits(buyer);
-        if (principal == 0 || bonus == 0) return 0;
-        return Math.mulDiv(bonus, _min(amount, principal), principal, Math.Rounding.Ceil);
+        (uint256 principal, uint256 bonus, uint256 earned, , ) = _pendingCredits(buyer);
+        return _bonusForfeit(principal, bonus - earned, amount);
     }
 
     function _withdrawUnusedBonus(address buyer) internal returns (uint256 amount) {
-        _accountForUsage(buyer);
-        (uint256 available, , ) = _deposits().getBuyerBalance(buyer);
-        if (available <= principalRemaining[buyer]) return 0;
+        (uint256 principal, uint256 bonus, uint256 earned, uint256 available) = _accountForUsage(buyer);
+        if (available <= principal) return 0;
 
-        amount = _min(available - principalRemaining[buyer], bonusRemaining[buyer]);
+        amount = _min(available - principal, bonus);
         if (amount == 0) return 0;
 
-        uint256 beforeBalance = usdc.balanceOf(address(this));
-        _deposits().withdraw(buyer, amount);
-        uint256 received = usdc.balanceOf(address(this)) - beforeBalance;
-        if (received < amount) revert InvalidAmount();
-
-        bonusRemaining[buyer] -= amount;
+        uint256 newBonus = bonus - amount;
+        bonusRemaining[buyer] = newBonus;
+        if (earned > newBonus) earnedBonus[buyer] = newBonus;
         totalBonusWithdrawn[buyer] += amount;
         lastAccountedBalance[buyer] -= amount;
 
+        _withdrawFromDeposits(buyer, amount);
         emit BuyerBonusWithdrawn(buyer, amount);
+    }
+
+    function _withdrawFromDeposits(address buyer, uint256 amount) internal {
+        uint256 beforeBalance = usdc.balanceOf(address(this));
+        _deposits().withdraw(buyer, amount);
+        if (usdc.balanceOf(address(this)) - beforeBalance < amount) revert InvalidAmount();
     }
 
     function _revokeOperator(address buyer) internal {
@@ -400,6 +421,15 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
     function _forceApprove(IERC20 token, address spender, uint256 amount) private {
         _safeApprove(token, spender, 0);
         _safeApprove(token, spender, amount);
+    }
+
+    function _withdrawablePrincipal(uint256 principal, uint256 bonus, uint256 available) private pure returns (uint256) {
+        return available > bonus ? _min(principal, available - bonus) : 0;
+    }
+
+    function _bonusForfeit(uint256 principal, uint256 lockedBonus, uint256 amount) private pure returns (uint256) {
+        if (principal == 0 || lockedBonus == 0) return 0;
+        return Math.mulDiv(lockedBonus, _min(amount, principal), principal, Math.Rounding.Ceil);
     }
 
     function _min(uint256 a, uint256 b) private pure returns (uint256) {
